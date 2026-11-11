@@ -1,0 +1,14 @@
+# Archivos que el host NO permite modificar a la IA (una ruta por linea).
+# Se suman a la lista por defecto de ejecutar.py.
+src/core/pmm.c
+src/core/pmm.h
+src/core/vmm.c
+src/core/vmm.h
+src/core/mem.c
+src/core/mem.h
+src/core/thread.c
+src/core/thread.h
+src/core/switch.s
+src/core/mutex.c
+src/core/mutex.h
+src/core/arch.h

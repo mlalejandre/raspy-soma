@@ -1,0 +1,39 @@
+build/
+isodir/
+*.o
+*.elf
+*.iso
+*.bin
+*.pcap
+*.log
+qemu.log
+__pycache__/
+*.py[cod]
+.DS_Store
+._*
+.vscode/
+.idea/
+*.swp
+*~
+estructura_proyecto.txt
+build_backup_src/
+.parche_backup/
+.backup_*/
+.parches_backup/
+snapshots/
+hdd.img.checkpoint*
+*.checkpoint_*
+   sd.img
+   usb.img
+   soma_pi5_sd.img
+   tools/pi5/firmware/
+   tools/pi5/*.img
+   *.img
+*.avi
+estructuranotepad.txt
+tools/pi5/firmware/
+# Binarios y generados (no se suben)
+*.img
+*.avi
+estructuranotepad.txt
+tools/pi5/firmware/

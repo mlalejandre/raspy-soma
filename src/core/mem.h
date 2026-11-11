@@ -1,0 +1,43 @@
+#ifndef MYOS_MEM_H
+#define MYOS_MEM_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+void *memcpy(void *dst, const void *src, size_t n);
+void *memmove(void *dst, const void *src, size_t n);
+void *memset(void *dst, int value, size_t n);
+int   memcmp(const void *a, const void *b, size_t n);
+
+/* Inicializacion del Heap Dinamico VMM */
+void  kheap_init(void);
+
+/* Asignador y liberador alineados estrictamente a 16 bytes */
+void *kmalloc(size_t size);
+void  kfree(void *ptr);
+
+/* Telemetria y estadisticas de memoria dinamica */
+void  kheap_stats(size_t *used, size_t *free_bytes);
+void  kheap_dump_stats(void);
+
+/* SOMA_PARCHE_005_HEAP: contadores y verificacion de integridad */
+struct kheap_counters {
+    uint64_t alloc_calls;      /* kmalloc con tamano > 0 */
+    uint64_t free_calls;       /* kfree con puntero no nulo */
+    uint64_t failed_allocs;    /* kmalloc que devolvieron NULL */
+    uint64_t rejected_frees;   /* kfree rechazados (fuera del heap, double free, ...) */
+    uint64_t corruptions;      /* corrupciones detectadas desde el arranque */
+    uint64_t live_blocks;      /* bloques asignados ahora mismo */
+    uint64_t used_bytes;       /* bytes asignados (incluye cabeceras) */
+    uint64_t peak_used_bytes;  /* maximo historico de used_bytes */
+    uint64_t mapped_bytes;     /* bytes de heap mapeados */
+};
+void  kheap_get_counters(struct kheap_counters *out);
+
+/* Recorre todo el heap: devuelve el numero de problemas (0 = sano). */
+int   kheap_check(void);
+
+/* Auto-test con prueba de expansion dinamica en vivo (>16 KiB) */
+int   kheap_test_self(void);
+
+#endif

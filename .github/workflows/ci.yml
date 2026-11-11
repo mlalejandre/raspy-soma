@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host-tests:
+    name: Pruebas en host (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: make ci (tests con ASan/UBSan, -Werror y auditoria estricta)
+        run: make ci
+
+  kernel-boot:
+    name: Compilar y arrancar (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc make binutils grub-pc-bin grub-common xorriso mtools \
+            qemu-system-x86 qemu-system-arm gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+      - name: Compilar
+        run: make ARCH=${{ matrix.arch }}
+      - name: Arranque en QEMU
+        run: make ARCH=${{ matrix.arch }} boot-smoke
+      - name: Consumo de CPU en reposo (solo x86_64)
+        if: matrix.arch == 'x86_64'
+        run: make ARCH=x86_64 idle-check
+      - name: Panic con backtrace y vigilante (solo x86_64)
+        if: matrix.arch == 'x86_64'
+        run: make ARCH=x86_64 fault-check

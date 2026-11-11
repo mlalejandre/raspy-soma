@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><title>SOMA - Raspberry Pi 5 (emulada)</title>
+<style>html,body{margin:0;height:100%;background:#0b0f14;color:#9fb3c8;font:14px system-ui,sans-serif}#s{width:100vw;height:calc(100vh - 28px)}#m{height:28px;line-height:28px;padding:0 12px}</style></head>
+<body><div id="s"></div><div id="m">Conectando...</div>
+<script type="module">
+import RFB from './core/rfb.js';
+const q = new URLSearchParams(location.search), port = q.get('port') || '5700', m = document.getElementById('m');
+function go() {
+  const r = new RFB(document.getElementById('s'), 'ws://' + location.hostname + ':' + port, {});
+  r.scaleViewport = true; r.focusOnClick = true;
+  r.addEventListener('connect', () => { m.textContent = 'Conectado. Haz clic en la pantalla para usar teclado y raton (tecla x = iconos).'; });
+  r.addEventListener('disconnect', () => { m.textContent = 'Sin conexion con el emulador; reintentando...'; setTimeout(go, 2000); });
+}
+go();
+</script></body></html>
