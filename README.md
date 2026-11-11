@@ -2,6 +2,8 @@
 
 SOMA (Sistema Operativo Multi-Agente) es un sistema operativo experimental de 64 bits para arquitecturas x86_64 y AArch64 desarrollado desde cero en C freestanding y ensamblador, sin Linux, sin glibc ni dependencias externas.
 
+> **🍓 Primera versión que arranca en una Raspberry Pi 5 real.** Probada en placa: consola de texto y escritorio gráfico por HDMI a la resolución del monitor, teclado y ratón USB en los cuatro puertos y ventilador activo. También se puede probar sin placa en una Pi 5 emulada (QEMU `raspi5b`).
+
 Diseñado desde el hardware como entorno nativo para agentes de Inteligencia Artificial, SOMA integra un escritorio gráfico TrueColor acelerado en Ring 0, multitarea multiventana, pila de red TCP/IP y almacenamiento persistente.
 
 ---
@@ -76,24 +78,88 @@ SOMA ejecuta un bucle cognitivo ReAct (Reason + Act) con agentes especializados:
 
 ---
 
+## 🍓 Raspberry Pi 5 (BCM2712 + RP1)
+
+| Componente | Estado | Probado en placa |
+|---|---|---|
+| Arranque (EL2 → EL1, MMU y cachés, GIC-400, temporizador 1 kHz) | ✅ | Sí |
+| HDMI: consola de texto desde el arranque y escritorio `vsoma` a la resolución del monitor | ✅ | Sí |
+| USB (los dos xHCI del RP1): teclado, ratón, hubs, discos USB | ✅ | Sí |
+| Ventilador (GPIO45 del RP1) | ✅ (al 100 %, sin regulación) | Sí |
+| Tarjeta SD (SDHCI) con FAT16/FAT32 | ✅ | Sí |
+| PCIe (Broadcom STB), enlace con el RP1 | ✅ | Sí |
+| Ethernet (Cadence GEM del RP1) con negociación del PHY | ✅ en emulador | No |
+| GPIO 0..27 (comando `gpio`) | ✅ en emulador | No |
+| LED verde de actividad (latido) | ⚠️ dirección sin verificar | No |
+
+Detalles técnicos y la historia de cada corrección en [`docs/ESTABILIDAD.md`](docs/ESTABILIDAD.md) (parches 058-078). Nota sobre el vídeo: el firmware de la Pi 5 da una pantalla de 16 bits (RGB565) y contesta con el modo pedido aunque no lo aplique; SOMA calcula la geometría real con la pitch y el tamaño del buffer.
+
+---
+
 ## 🚀 Puesta en Marcha
 
+Requisitos en el equipo anfitrión: Python 3, Docker y QEMU (`qemu-system-x86_64` y/o `qemu-system-aarch64`). La compilación se hace en contenedores Docker (`soma-toolchain`), no hace falta instalar compiladores.
+
 1. Clonar el repositorio:
-    git clone https://github.com/tu-usuario/soma.git
-    cd soma
 
-2. Compilar y arrancar el entorno gráfico:
-    python3 ejecutar.py
+        git clone https://github.com/mlalejandre/raspy-soma.git
+        cd raspy-soma
 
-   (Para arquitectura ARM64 añadir: python3 ejecutar.py --arch aarch64)
+2. Elegir destino con el menú o con `-t`:
 
-3. Dashboard Web:
-    Abrir en el navegador del host: http://localhost:8090/
+        python3 ejecutar.py                  # menú interactivo
+        python3 ejecutar.py -t x86_64        # PC x86_64 en QEMU (por defecto)
+        python3 ejecutar.py -t virt          # ARM64 en QEMU virt
+
+   | Destino | Qué hace |
+   |---|---|
+   | `x86_64` | Compila y arranca en QEMU x86_64 |
+   | `virt` | Compila y arranca en QEMU ARM64 `virt` |
+   | `pi5-qemu` | Construye la Pi 5 emulada (imagen Docker, una vez, ~20-40 min) |
+   | `pi5` | Arranca en la Pi 5 emulada (USB en PCIe1) |
+   | `pi5-rp1` | Pi 5 emulada con RP1 simulado: USB, Ethernet y GPIO como en la placa |
+   | `pi5-img` | Solo compila `build/aarch64/kernel_2712.img` |
+   | `pi5-sd` | Genera `soma_pi5_sd.img` para una Pi 5 real |
+
+   `-a x86_64|aarch64` sigue funcionando por compatibilidad.
+
+3. Dashboard web (x86_64 y `pi5-rp1`): http://localhost:8090/
 
 4. Controles básicos de la interfaz:
     - Escribir en cualquier momento: el orquestador captura el texto directamente.
     - Tecla X: alterna la visibilidad del dock orbital de iconos.
     - ESC: cierra o minimiza la ventana activa hacia el escritorio cósmico.
+
+### En una Raspberry Pi 5 real
+
+1. Generar la imagen (descarga el DTB oficial de la Pi 5 la primera vez):
+
+        python3 ejecutar.py -t pi5-sd
+
+2. Grabar `soma_pi5_sd.img` en una microSD con Raspberry Pi Imager ("Usar personalizada") o balenaEtcher.
+3. Conectar monitor por micro-HDMI, teclado y ratón USB, y encender. El arranque se ve en pantalla.
+4. En la consola, `vsoma` abre el escritorio gráfico.
+
+Comandos útiles en la placa:
+
+| Comando | Para qué |
+|---|---|
+| `vsoma` | Abrir el escritorio gráfico |
+| `hdmi` / `hdmi swap` | Ver el modo de pantalla / intercambiar rojo y azul |
+| `usb`, `blk`, `fat ls sd0` | Dispositivos USB, discos y ficheros de la SD |
+| `fan on`, `fan off`, `fan inv` | Ventilador |
+| `eth`, `ping 10.0.2.2` | Ethernet (verificada en emulador) |
+| `gpio`, `gpio N out`, `gpio N 1` | Pines GPIO del RP1 |
+| `pci`, `threads` | Bus PCIe y planificador |
+
+Consola serie opcional: conector UART de depuración, 115200 8N1.
+
+### Pi 5 emulada (sin placa)
+
+    python3 ejecutar.py -t pi5-qemu      # una vez
+    python3 ejecutar.py -t pi5-rp1
+
+La pantalla se abre en el navegador (http://localhost:6080/) y la consola serie queda en el terminal (salir: Ctrl+A y X). Variables: `SOMA_PI5_RAM`, `SOMA_PI5_CPUS`, `SOMA_PI5_GUI=0`, `SOMA_PI5_USB=0|kbd`, `SOMA_PI5_NET=0`.
 
 ---
 
@@ -105,7 +171,7 @@ SOMA ejecuta un bucle cognitivo ReAct (Reason + Act) con agentes especializados:
     ├── ejecutar.py         # Runner maestro con soporte multi-arquitectura
     ├── grub/               # Configuración de arranque GRUB Multiboot
     ├── src/
-    │   ├── arch/           # HAL: arranque, IDT, VMM (paginación), PMM
+    │   ├── arch/           # HAL: arranque, IDT/GIC, MMU, PMM; aarch64: PCIe, RP1, xHCI, GEM, SDHCI, HDMI
     │   ├── core/           # Kernel, planificador KThreads, mutex, heap
     │   ├── drivers/        # VirtIO-NET, VirtIO-BLK, Framebuffer BGA, Ratón
     │   ├── fs/             # SOMAFS02, VFS virtual, BM25 y SRCFS
@@ -114,7 +180,9 @@ SOMA ejecuta un bucle cognitivo ReAct (Reason + Act) con agentes especializados:
     │   ├── apps/           # Browser, Paint, Notepad, File Manager, MemView, Layout
     │   ├── fonts/          # Rasterizador vectorial TrueType e iconos
     │   └── agent/          # Agentes ReAct, integración LLM y shell
-    └── docs/               # Especificaciones y diseño del sistema
+    ├── tools/pi5/          # Pi 5 emulada (QEMU raspi5b + RP1 simulado) y generador de la SD
+    ├── tests/              # Pruebas en el host (ASAN/UBSAN) de las capas puras
+    └── docs/               # ESTABILIDAD.md (historial de parches), navegador, diseño
 
 ---
 
