@@ -587,7 +587,411 @@ azulados) cuadra con SOMA creyendo 800x600 a 32 bits sobre una pantalla real de 
   firmware (pantalla real 1280x720 a 16 bits, respuesta con el tamano pedido y 32 bits): consola y escritorio correctos a 1280x720.
 * Sin verificar en placa: el orden de canales de RGB565 (`hdmi swap` lo intercambia) y lo que devuelve GET del tamano fisico.
 
+## Parche 079: Wi-Fi de la Pi 5, fase 1 (bus SDIO y arranque del firmware del chip)
+
+Objetivo final: escanear y conectarse por Wi-Fi (WPA2-PSK) desde SOMA. El chip es un Cypress/Broadcom CYW43455 conectado por SDIO al segundo controlador SDHCI de la
+BCM2712 (SDIO2, 0x1001100000), alimentado por WL_ON (pin 28 del GPIO de la BCM2712). No se puede emular: QEMU tiene el SDHCI pero no el chip.
+
+* **Placa** (`placa`, tambien al arrancar): revision por el mailbox (etiqueta 0x00010002): modelo, memoria, version y fabricante. El Wi-Fi solo se intenta en modelos que lo llevan.
+* **Parte pura** `src/core/sdio_proto.c` (tests/test_sdio.c): CMD52/CMD53, R4/R5, CIS (fabricante), ventana del bus interno, identificador del chip, EROM (direcciones de
+  nucleos y envoltorios), tamano de los bancos de RAM del ARM CR4, base de RAM por modelo (0x198000 en el 43455), NVRAM de texto a binario (probada con el fichero real
+  de Raspberry Pi OS: 2074 -> 1748 bytes), estructura compartida del firmware y codigo de revision de la placa.
+* **Controlador** `src/arch/aarch64/wifi.c`: SDHCI por sondeo (1 bit, 400 kHz y luego 25 MHz), deteccion de tarjeta forzada, CMD0/CMD5/CMD3/CMD7, CCCR y CIS, funcion 1
+  y tamanos de bloque, reloj ALP, chip id, EROM, reinicio de nucleos por el envoltorio AI (ARM CR4 detenido, D11 en reinicio), firmware a la RAM del chip en trozos de 64
+  bytes con comprobacion de principio y final, NVRAM al final de la RAM, vector de arranque en 0, ARM en marcha, reloj HT, funcion 2 lista y estructura compartida (version,
+  fallos) y lectura de la consola interna del firmware (`wifi log`, muestra la version del firmware).
+* **Pines**: si el chip no contesta y los pines 30-35 estan como GPIO, se prueban las funciones 1..8 (disposicion de registros de la BCM2712 C1, con resistencias de
+  subida) y se restauran si ninguna sirve. `wifi mux` muestra y cambia esas funciones a mano.
+* **Firmware**: `pi5.py sd` descarga de RPi-Distro/firmware-nonfree (los mismos de Raspberry Pi OS) `brcmfmac43455-sdio.bin`, `.txt` y `.clm_blob` a
+  `tools/pi5/firmware/wifi/` (fuera del repositorio: licencia de Cypress redistribuible pero no libre) y los copia a `/wifi` en la SD. `SOMA_WIFI_FW=0` lo omite.
+* Ordenes: `wifi` (estado), `wifi prueba` (todo seguido, para la foto), `wifi sondear`, `wifi nucleos`, `wifi firmware`, `wifi log`, `wifi mux [n]`, `wifi rd/wr` (bus interno).
+* Emulador: `placa` y `wifi prueba` terminan con "el chip Wi-Fi no contesta a CMD5" sin colgar nada. Sin verificar en placa: todo lo que va despues de CMD5.
+* Fase 2 (siguiente): protocolo de control del firmware (SDPCM + BCDC sobre la funcion 2), carga del CLM, `wifi scan`; fase 3: WPA2-PSK y enganche a la pila IP
+  como tercer dispositivo de red (junto a virtio-net y la Ethernet del RP1); fase 4: icono de red y redes guardadas.
+
+## Parche 080: Wi-Fi sin placa - criptografia WPA2, saludo de 4 pasos, escaneo e interfaces de red
+
+Todo lo del Wi-Fi que no depende del chip, verificado del todo en el host y en el emulador, para que las fases 2 y 3 en placa solo tengan que enchufarlo.
+
+* **Criptografia** `src/core/crypto.c`: SHA-1, HMAC-SHA1, PBKDF2 (contrasena + SSID -> PMK), PRF de 802.11, AES-128 (cifrar y descifrar) y AES Key Wrap.
+  Vectores oficiales: FIPS 180 (incluido el millon de 'a'), RFC 2202, IEEE 802.11i anexo H (PBKDF2 y PRF), FIPS 197 y RFC 3394.
+* **Suplicante WPA2-PSK** `src/core/wpa.c`: mensajes 1-4 del saludo EAPOL-Key con CCMP (PTK, MIC HMAC-SHA1, clave de grupo desenvuelta con AES y su KDE),
+  renovacion de la clave de grupo, contador de repeticion, ANonce, MIC erroneo = contrasena equivocada. Probado con un saludo completo generado por una
+  referencia independiente (Python con hashlib, hmac y cryptography: `tests/wpa_vectors_gen.py`): los mensajes 2 y 4 salen identicos byte a byte. Tambien
+  tramas cortadas en cada posicion (ASan/UBSan).
+* **Escaneo**: resultados "escan" del firmware Broadcom (bss_info): SSID, BSSID, senal, canal y banda (chanspec 802.11ac), seguridad (abierta, WEP, WPA,
+  WPA2, WPA3, mixta, Enterprise) a partir de los IE RSN/WPA; fusion por BSSID y orden por senal. Como la disposicion exacta de bss_info en memoria no esta
+  confirmada, se aceptan la alineada y la empaquetada (se elige la que cuadra con la longitud).
+* **Interfaces de red** `src/net/netif.c`: la pila IP sigue llamando a virtio_net_*, que ahora reenvian al dispositivo activo. Registradas por preferencia:
+  Pi 5: eth0 (GEM del RP1), wlan0 (Wi-Fi, no arranca hasta la fase 3), virtio0; resto: virtio0. `netif` las lista; `netif usar <nombre>` cambia en caliente.
+* Ordenes: `wpa` (autoprueba en la propia maquina, PBKDF2 ~50 ms en el emulador), `wpa psk <ssid> <clave>` (PMK, como wpa_passphrase), `netif`.
+* Emulador Pi 5: eth0 operativa, ping a la pasarela antes y despues de `netif usar`; la PMK calculada en SOMA coincide con la de Python.
+* Nota: en el QEMU de la maquina de desarrollo, virtio-net de aarch64 virt ya fallaba antes del parche ("RX queue failed", igual en el arbol del 079);
+  el camino virtio no cambia de logica.
+
+## Parche 081: Wi-Fi, fases 2 y 3 escritas (escaneo, conexion WPA2, wlan0) y cliente DHCP
+
+Todo el camino desde el firmware en marcha hasta navegar por Wi-Fi, para probarlo de una vez cuando haya placa. La parte pura esta probada; la que habla con
+el chip esta escrita sin hardware (QEMU no tiene el chip) y se ajustara con la primera foto.
+
+* **Protocolo del firmware** `src/core/brcm_proto.c` (tests/test_brcm.c): cabecera SDPCM (longitud y complemento, secuencia, canal, credito), ordenes BCDC
+  (id, SET, error) y cabecera de datos, iovars, parametros de "escan", SSID, clave para el chip (WLC_SET_KEY, AES-CCM), trozos de descarga del CLM,
+  mascara de eventos y eventos del firmware (tipo 0x886C: tipo, estado, motivo, direccion, datos).
+* **Controlador** (wifi.c): tramas por la funcion 2 (lectura de 64 bytes y el resto, escritura en un bloque), sondeo del registro intstatus del nucleo SDIO,
+  credito de envio, ordenes con espera de respuesta por id, eventos y datos. `wifi_up`: MAC, version del firmware, carga del CLM (/wifi/...clm_blob), eventos,
+  WLC_UP y sin ahorro de energia. `wifi scan`: lista ordenada por senal (barras, dBm, canal, banda, seguridad, nombre).
+  `wifi conectar <red> <clave>` (nombre con espacios entre comillas): escaneo para saber la seguridad, PMK, wsec/wpa_auth/wpaie, SET_SSID, espera del evento,
+  saludo de 4 pasos con el suplicante del parche 080 (EAPOL por el canal de datos), claves par y de grupo al chip, wlan0 como interfaz activa y DHCP.
+  `wifi desconectar` devuelve la red a eth0. Solo redes abiertas y WPA2-PSK (WPA3, WEP, WPA1 y Enterprise se rechazan con un aviso).
+* **DHCP** `src/net/dhcp*.c`: DISCOVER/OFFER/REQUEST/ACK (y NAK), aplica IP, mascara, puerta de enlace y DNS. La mascara ya no es fija (/24): la da el router.
+  IP acepta UDP de difusion (y cualquier UDP mientras no hay direccion) y envia a 255.255.255.255 sin ARP. Orden `dhcp` (vale tambien para la Ethernet).
+  Probado en la Pi 5 emulada con un servidor DHCP de prueba: IP 192.168.7.42/24, puerta 192.168.7.1, DNS 1.1.1.1 y ping a la nueva puerta de enlace.
+* Puntos a confirmar en placa (los primeros sospechosos si algo falla): direccion de la FIFO de la funcion 2 (0x8000 con la ventana en chipcommon),
+  lectura en dos partes, credito inicial, orden de las claves y el IE RSN que acepta el AP.
+
+## Parche 082: los 4 nucleos (aarch64: Pi 5 real, Pi 5 emulada y QEMU virt)
+
+Hasta ahora SOMA usaba un solo nucleo. El resto del sistema (hilos, red, sistema de ficheros, escritorio) no tiene cerrojos pensados para varios
+nucleos a la vez, asi que se ha elegido un modelo asimetrico que no puede romper nada de lo que ya funciona:
+
+* El nucleo 0 sigue llevando todo el sistema igual que antes. Los nucleos 1-3 arrancan por PSCI CPU_ON y quedan dormidos (wfe), sin interrupciones,
+  esperando trabajos de calculo puro que les manda el nucleo 0 (`smp_parallel`, `src/core/smp.h`). Un trabajo no imprime, no pide memoria ni toca dispositivos.
+* Arranque (`boot.s`, `src/arch/aarch64/smp.c`): SMC si el firmware deja el sistema en EL2 o es la Pi 5 (TF-A), HVC en QEMU virt sin EL2. Numero de nucleo
+  en MPIDR.Aff1 (Cortex-A76 de la Pi 5, bit MT) o Aff0 (QEMU virt). El secundario baja a EL1 si hace falta, activa la MMU con las mismas tablas
+  (valores escritos hasta la RAM por el nucleo 0, porque el secundario arranca con las caches apagadas) y usa su propia pila de 64 KiB.
+* Usos reales: (1) el volcado de pantalla de rectangulos grandes se reparte por filas (sobre todo la conversion a 16 bits de la Pi 5 real);
+  (2) PBKDF2 calcula sus bloques en paralelo (la clave de WPA2 son 2 bloques: casi la mitad de tiempo); probado en el host que da lo mismo.
+* Orden `cpus` (nucleos, MPIDR, trabajos, tiempo ocupado, volcados repartidos), `cpus prueba` (SHA-1 de 6 MiB con 1 y con N nucleos),
+  `cpus 1` / `cpus todos` (apaga o enciende el reparto).
+* Emulador: QEMU virt -smp 4: 4 nucleos por HVC, x2,9 en la prueba; Pi 5 emulada -smp 4: 4 nucleos por SMC (MPIDR 0x81000000..0x81000300),
+  x2,1; PMK de WPA2 de ~47 a ~35 ms; escritorio a 16 bits correcto con el volcado repartido. x86_64 sigue con un nucleo (`smp_cpus() = 1`).
+* Siguiente paso posible: planificador simetrico (hilos en cualquier nucleo), que exige cerrojos de verdad en red, ficheros, memoria y escritorio.
+
+## Parche 083: Paint renovado (estetica del explorador de archivos) y guardado PNG
+
+* **Aspecto**: tema oscuro del explorador, texto suavizado, iconos vectoriales con antialias, esquinas redondeadas. Barra superior (nuevo, abrir, guardar,
+  deshacer, rehacer, zoom -/+, porcentaje, ajustar, ruta), rail de herramientas, area de trabajo con sombra bajo el lienzo, panel de propiedades
+  (color con codigo #RRGGBB y RGB, selector de saturacion/brillo, barra de tono, paleta de 24, recientes, grosor con deslizador) y barra de estado
+  (herramienta, grosor, mensajes, posicion, tamano). El panel se adapta a la altura; en ventanas estrechas queda una tira de colores.
+* **Lienzo**: 320x240 por defecto (antes 80x60), 480x360 o 640x480; zoom 25 %..800 % o ajustado; rejilla de pixeles a partir de 600 %; mano para moverse.
+* **Herramientas**: lapiz, pincel redondo, aerografo, goma, cubo (relleno por tramos), cuentagotas (vuelve a la herramienta anterior), linea, rectangulo
+  y elipse (contorno con grosor o rellenos) con vista previa exacta, mano. Grosor 1..32.
+* **Deshacer/rehacer** de 12 pasos (incluye cambios de tamano de lienzo, abrir, pegar y cortar). Atajos: Ctrl+Z/Y/S/O/N, [ ] grosor, + - 0 zoom y letras
+  de herramienta (p b a e g i l r f o u h).
+* **PNG** `src/core/png_enc.c`: deflate propio (LZ77 con ventana de 32 KiB y cadenas hash, Huffman fijo) y filtro por fila. Un dibujo de 320x240 ocupa
+  2-4 KiB y cabe en RamFS (16 KiB por archivo). Comprobado con zlib y PIL de Python (tests/check_png.py) y con el propio decodificador de SOMA (abrir lo
+  guardado). Abre PNG, BMP, JPEG y GIF (lo transparente sobre blanco; lo grande se reduce a 640x480). BMP se sigue pudiendo guardar si cabe.
+* **Arreglos de paso**: la orden `paint` abria la GUI sin la ventana (ahora usa la app pendiente como el terminal); reabrir Paint conserva el dibujo;
+  RamFS sin disco virtio (Pi 5) devolvia error en cada escritura aunque el archivo quedaba en memoria: ahora es solo memoria y no falla.
+* Verificado en la Pi 5 emulada con raton USB: pincel, elipse rellena, rectangulo de 13 px, cubo, linea, deshacer/rehacer, Ctrl+S (4 KiB), Ctrl+N y Ctrl+O.
+
+## Parche 084: el Maquetador entiende y dibuja LaTeX
+
+* **Motor** `src/apps/tex.c` (puro, sin memoria dinamica; mide el texto por una interfaz): lee el .tex y produce operaciones de dibujo
+  (texto, rectangulos, lineas, imagenes) en coordenadas de pagina. Documento: titulo/autor/fecha y \maketitle, resumen, secciones numeradas
+  (1, 1.1, 1.1.1, con *), \paragraph, \label/\ref/\eqref (dos pasadas: referencias hacia delante), itemize/enumerate/description anidadas,
+  quote, center, verbatim/lstlisting, tabular con | y \hline (y booktabs), figure/table con \includegraphics y \caption numerado, notas al pie
+  al final, negrita, cursiva, mono, subrayado, color, enlaces, tamanos, acentos, guiones y comillas tipograficas; parrafos justificados.
+  Matematicas al estilo TeX: atomos con clase y su espaciado, cursiva para variables, \frac/\dfrac/\binom, \sqrt[n], indices, \sum \int
+  \prod \lim con limites en modo display, \left\right con delimitadores que crecen, matrices (pmatrix, bmatrix, vmatrix, cases, aligned),
+  acentos, \text, \mathbf, \mathbb, griego y ~120 simbolos; equation numerada y align con alineacion en & y \nonumber.
+  Lo desconocido se muestra en rojo y se cuenta (barra de estado).
+* **Maquetador** (`src/apps/layout.c`) con la estetica del explorador: barra (abrir, recargar, editar en el Bloc de notas, Documento/Fuente,
+  tamano de letra, ruta), hoja blanca con sombra, rueda y barra de desplazamiento, vista Fuente con colores y numeros de linea, peticion a la
+  IA abajo (el subagente "maquetador" ahora escribe LaTeX completo y se guarda en /workspace/documento.tex), estado con secciones/ecuaciones.
+  Los documentos #SOMA-LAYOUT v1 antiguos se convierten a LaTeX al cargarlos.
+* Integracion: doble clic en un .tex en el explorador, orden `latex [archivo.tex]`, y escritura en vivo de un .tex por el agente.
+  La orden de abrir el maquetador usa la app pendiente (antes abria la GUI sin la ventana).
+* Pruebas: tests/test_tex.c (estructura, numeracion, referencias, align, tabla, figura, desconocidos, desbordamiento; cortes del documento en cada
+  posicion y 3000 mutaciones al azar con ASan/UBSan; se encontraron y arreglaron un bucle sin fin con texto cortado y dos accesos fuera de rango).
+  Revision visual con DejaVu real en el host y en la Pi 5 emulada (rueda, vista Fuente).
+
+## Parche 085 — Ajustes de la interfaz, punteros nuevos y "Guardar imagen como"
+
+* **Ajustes** (`src/apps/settings.c`, orden `ajustes`, icono en el dock): transparencia de las ventanas (40-100 %, con opcion de mantener
+  opaca la activa y vista previa) y fuente de la interfaz (DejaVu Sans o Sans Mono, cuatro tamanos). Se aplica al momento y se guarda en
+  /etc/ui.conf; se carga al arrancar el escritorio. La fuente de la interfaz no cambia el contenido de las paginas web (WF_RAW).
+* **Transparencia** (`fb.c`): la ventana de arriba se mezcla en la presentacion con lo que hay debajo comparando cada pixel con el ultimo
+  mezclado (sin desvanecerse frame a frame); las de detras se mezclan al redibujar. Menus y dialogos se excluyen y quedan opacos.
+* **Punteros** (`mouse.c`): dibujados como vectores 24x24 con suavizado 4x4, borde negro y sombra: flecha de cola recta, redimension
+  horizontal, vertical y diagonales segun el borde, mover al arrastrar una ventana, barra de texto. Punto caliente por cursor.
+* **Navegador**: boton derecho abre un menu (Guardar imagen como..., Copiar imagen, Copiar direccion de la imagen/enlace, Atras,
+  Adelante, Recargar). El dialogo **Guardar imagen como** (`src/apps/savedlg.c`) deja elegir nombre, carpeta (con atajos a las existentes y
+  a big:/imagenes si hay disco), formato PNG o BMP y escala 100/75/50/25 %, y avisa si no cabe en RamFS (16 KiB por archivo).
+* Orden `navegador [url]`. Probado en la Pi 5 emulada: ajustes, menu sobre la imagen de la demo y guardado.
+
+## Parche 086 — Imagenes del navegador: memoria, JPEG reducidos al decodificar, CMYK
+
+* Diagnostico: los "PNG/JPEG no decodificable" de paginas pesadas (p. ej. 20minutos) eran en realidad **falta de memoria**: el heap del
+  kernel tenia un tope fijo de 64 MiB y una pagina de noticias (DOM, estilos, 20 MiB de imagenes, pantalla 1920x1080) lo agotaba; el
+  decodificador fallaba al reservar y se informaba como imagen danada. Las mismas imagenes servidas en local se ven bien.
+* `mem.c`: en x86_64 el tope del heap es la mitad de la RAM (hasta 256 MiB) cuando la RAM queda por debajo de la ventana del heap;
+  `ejecutar.py` arranca x86_64 con 512 MiB (`SOMA_MEM` para cambiarlo). El arranque dice el tope ("hasta N MiB").
+* `web_img.c`/`web_jpeg.c`: las reservas fallidas se anotan (`wi_oom`); `wi_decode_fit` decodifica los JPEG ya reducidos 1/2, 1/4 u 1/8
+  en el dominio DCT cuando se van a mostrar mas pequenos (menos memoria y mas rapido). Si aun falta memoria, el navegador libera imagenes
+  lejanas y reintenta mas pequena; solo si no hay manera dice "sin memoria para decodificarla".
+* JPEG CMYK e YCCK (Adobe, base y progresivo) decodificados en SOMA; croma con interpolacion bilineal (antes, bordes en escalera) para las
+  fotos normales. Fuzzing ampliado con semillas CMYK y decodificacion reducida.
+* Transparencia: con opacidad 100 % se liberan las dos capas de pantalla (16 MiB a 1920x1080).
+* Navegador: abre grande (2/3 del ancho, 85 % del alto); `navegador URL` y abrir el explorador desde la consola abrian el escritorio sin la
+  ventana (faltaba la app pendiente).
+
+## Parche 087 — Fuera el limite de 16 KiB por archivo
+
+* **RamFS** (`src/fs/fs.c`): cada archivo reserva en memoria lo que mide (antes 16 KiB fijos aunque tuviera 10 bytes) y puede llegar a
+  32 MiB (`FS_FILE_MAX`); caben 256 archivos (antes 64).
+* **Disco, compatible con lo que ya hay**: los archivos de menos de 16 KiB siguen en su ranura de SOMAFS02; los mayores, y los que pasan
+  de las 64 ranuras, se guardan solos en el almacen BIGFS como `/.ramfs/NNN` (cabecera "RFS1" + contenido). La cabecera de la ranura
+  lleva la marca 'B'. Si la region BIGFS esta en blanco se formatea sola la primera vez; si tiene otra cosa no se toca y el archivo
+  grande queda solo en memoria (se avisa una vez). Sin disco (Pi 5) todo vive en memoria, como antes.
+* API nueva: `vfs_size()`, `vfs_read_alloc()` (el archivo entero en un bufer nuevo) y `vfs_big_persist()`.
+* Adaptados a archivos grandes: explorador (tamanos reales, copiar/mover entre RamFS y BIGFS enteros, abrir copias de hasta 16 MiB; antes
+  `fm_read_head` perdia el ultimo byte), `cp`/`mv` (copiaban solo 4 KiB), `stat`, `du`, `fat get`, `big put/get`, `exec`, lectores por
+  tuberia, navegador `file://`, visor de imagenes (tope de 64 KiB), Maquetador (imagenes y documentos de 32 KiB), Paint (PNG/BMP sin tope),
+  Bloc de notas (128 KiB), lenguaje SOMA y el dialogo "Guardar imagen como" (ya no reduce la imagen ni avisa de 16 KiB).
+* Ordenes nuevas: `descargar <url> [archivo]` (guarda una URL entera en un archivo) y `suma <archivo>` (tamano y CRC-32).
+* Pruebas: test_fs con archivo de 300 KB, encoger por debajo de una ranura, tope de 32 MiB, 256 archivos, y persistencia entre procesos de un
+  archivo de 200 KB y 90 archivos mas alla de las 64 ranuras. En x86 emulado: descargas de 573 KB y 3 MB, reinicio, CRC-32 identico.
+
+## Parche 088 — Lector de PDF y visor de imagenes nuevo
+
+* **Motor PDF propio** (`src/apps/pdf.c`, solo enteros: coma fija 16.16): xref clasica y en flujo (PDF 1.5), flujos de objetos,
+  actualizaciones incrementales, reconstruccion si la xref esta rota; FlateDecode con predictores PNG, LZW, ASCII85, ASCIIHex, DCT (JPEG).
+  Arbol de paginas con herencia (MediaBox/CropBox, Resources, Rotate). Contenido: estado grafico, cm, colores gris/RGB/CMYK, trayectos con
+  curvas, rellenos par-impar y distinto de cero, trazos, texto (Tf, Td, TD, Tm, T*, Tj, TJ, ', ", Tc, Tw, Tz, TL, Ts, Tr), XObjects de
+  imagen (RGB, gris, CMYK, Indexed, ICC, mascaras, SMask) y de formulario. Texto a Unicode por ToUnicode, WinAnsi, MacRoman, Standard,
+  /Differences con nombres de glifo y las codificaciones de Computer Modern (TeX). Las letras salen con DejaVu en su posicion exacta (los
+  anchos son los del PDF); cada fuente se escala igual para ocupar su sitio. No soporta: PDF cifrado, JBIG2/CCITT/JPX, sombreados, recortes.
+* **Lector PDF** (`src/apps/pdfview.c`, icono "PDF" en el dock, orden `pdf [archivo]`, doble clic en un .pdf en el explorador): barra con
+  Abrir (selector de los PDF de RamFS), paginas, zoom, ajustar al ancho / pagina, miniaturas y "Copiar texto"; hoja con sombra, rueda
+  (al llegar al final pasa de pagina), arrastre y teclas (AvPag/RePag, flechas, +/-, w, f, t, c, o). La pagina se dibuja una vez en un bufer
+  (`fb_target_begin/end`: las primitivas de siempre sobre un bufer propio) y desplazarse solo copia.
+* **Visor de imagenes rehecho** (`src/apps/imgview.c`, orden `imagen [archivo]`): PNG, JPEG (base, progresivo, CMYK), GIF y BMP de
+  cualquier tamano (antes solo BMP de hasta 64 KiB y una galeria de 16 rutas de 64 caracteres), galeria de todas las imagenes de RamFS con
+  miniaturas, zoom con la rueda hacia el puntero, arrastre, ajustar / 1:1, giro, fondo (cuadros, claro, oscuro), copiar y pegar.
+  Reduccion con mipmaps y bilineal (sin dientes); al ampliar, pixeles nitidos.
+* Al abrir desde la consola (`navegador`, `imagen`, `pdf`) la ventana sale de verdad (app pendiente).
+* Pruebas: `tests/test_pdf.c` (volcado de operaciones, comprobacion de los PDF de `tests/pdf_seeds.py` con xref clasica y en flujo,
+  y `make fuzz-pdf` con ASAN/UBSAN). Revisado contra pdftoppm con PDF de ReportLab, pdfLaTeX, LibreOffice y matplotlib; el fuzzing
+  encontro un fallo real (el arbol de paginas no se leia si estaba en un flujo de objetos) que queda arreglado.
+
+## Parche 089 — Monitor del sistema
+
+* **Monitor del sistema** (`src/apps/sysmon.c`, icono "MONITOR" en el dock, orden `monitor`): Resumen (tarjetas con grafica de CPU,
+  memoria, red y pantalla; lo que mas consume; equipo), Procesos (aplicaciones y servicios con CPU y memoria, o hilos con su CPU,
+  estado y pila; ordenar por CPU/memoria/nombre; cerrar una aplicacion o terminar un proceso de usuario), Memoria (anillo con el reparto,
+  historial, heap por aplicacion), CPU (uso total y por nucleo, modelo, frecuencia, caches, extensiones, temperatura), Graficos (fps,
+  resolucion, controlador, memoria de pantalla; en la Pi 5 frecuencias de la VideoCore VII), Almacenamiento (RamFS, BIGFS, discos), Red
+  (bajada/subida, interfaces) y Hardware (placa, firmware, serie, dispositivos PCI con nombre). Una muestra por segundo, 2 minutos de historial.
+* **Contabilidad** (`src/core/acct.h`): cada hilo tiene un dueno; el planificador cuenta los ciclos de CPU por hilo y por dueno, y el heap
+  guarda el dueno de cada bloque (byte alto de `req`). La GUI cambia de dueno al dibujar cada ventana y al dar los eventos a la activa:
+  asi se ve la CPU y la memoria de cada aplicacion aunque todas compartan el hilo de la GUI. RamFS y la pantalla tienen dueno propio.
+* **Datos de hardware** (`src/arch/*/hwmon.c`): x86_64 por CPUID (marca, familia, caches, extensiones, hipervisor) y PCI; en la Pi 5 por el
+  buzon del firmware (modelo, revision, serie, temperatura, tension, frecuencias ARM/GPU, memoria de la GPU).
+* **La GUI ya no gira sin parar**: si no hay tecla ni fotograma pendiente cede la CPU 1 ms (el hilo inactivo para el procesador). Antes el
+  bucle consumia el 100 % siempre (y un nucleo entero del anfitrion en QEMU).
+* Fallo corregido: en x86_64 `src/arch/x86_64/sysinfo.h` ordenaba los campos distinto que `src/core/sysinfo.h`; quien leia la IP con
+  `sysinfo_get` fuera de sysinfo.c recibia la MAC.
+
+## Parche 090 — El Monitor se actualiza en segundo plano
+
+* Antes solo tomaba muestras y se repintaba cuando era la ventana activa. Ahora el bucle de la GUI busca la ventana del Monitor en cada
+  segundo, toma la muestra y la repinta aunque este detras: si ninguna ventana de encima la tapa (y no hay transparencia) solo se dibuja su
+  contenido; si alguna la tapa, se recompone el escritorio entero para no pintar encima de la otra ventana.
+
+## Parche 091 — El agente SOMA ya no congela el escritorio
+- La mision se ejecuta en un hilo propio (`soma_agente`); el bucle de la GUI sigue moviendo, arrastrando y redibujando ventanas.
+- Cuando el agente necesita la pantalla (abrir el bloc de notas, el maquetador, escribir en vivo) pide turno al bucle principal (`gui_enter/gui_leave`), que se lo concede en un punto seguro.
+- "soma <mision>" desde la Terminal tambien va en segundo plano. Solo una mision a la vez.
+- El despachador de ordenes del shell queda protegido por un cerrojo: la Terminal avisa en vez de bloquearse si el agente lo esta usando.
+- Pilas de hilo de 32 KiB a 60 KiB.
+
+## Parche 092 — Nombre editable de verdad en "Guardar imagen como"
+- Los campos NOMBRE y CARPETA tienen cursor: flechas, Inicio/Fin, Retroceso, Supr, clic para colocar el cursor, tildes y enes (UTF-8).
+- Al abrir el dialogo el nombre (sin extension) queda seleccionado: lo que escribas lo sustituye.
+- Si borras la extension se anade la del formato elegido al guardar; se rechazan nombres vacios o con caracteres no validos (/ \ : * ? " < > |).
+
+## Parche 093 — SOMA Studio: editor de codigo profesional
+- Nueva pestana EDITOR (la primera) en el Coder: explorador de archivos .soma, pestana del archivo, numeros de linea,
+  resaltado de sintaxis, guias de sangria, linea actual, parejas de llaves, barra de desplazamiento y barra de estado.
+- Edicion: cursor y seleccion con raton (arrastre, doble clic palabra, triple clic linea) y Mayus+flechas; Inicio inteligente,
+  RePag/AvPag, autoindentado, Tab/Mayus+Tab por bloques, Ctrl+K comentar, Ctrl+D duplicar, Ctrl+L linea, deshacer/rehacer
+  (Ctrl+Z / Ctrl+R) y portapapeles del sistema.
+- Ctrl+F buscar (incremental, con contador), Ctrl+H reemplazar (uno/todo), Ctrl+G ir a linea, Ctrl+O abrir, Ctrl+N nuevo,
+  Ctrl+S guardar, Ctrl+B verificar (compilador + lint; la linea con error se marca en el texto y en el panel de problemas),
+  Ctrl+E ejecutar.
+- Barra "SOMA IA": pide un cambio sobre el archivo abierto; mientras trabaja el editor queda en solo lectura y al terminar el
+  resultado entra como una edicion mas (Ctrl+Z la deshace).
+- Orden de shell `studio [archivo]`; la ventana del Coder abierta desde la shell ya aparece al arrancar el escritorio.
+
+## Parche 094 — SOMA Studio: nuevo aspecto visual
+- Toda la interfaz del Coder usa la fuente antialiasada del sistema; rotulos en versalitas espaciadas.
+- Pestanas de tipo subrayado sin caja y sin hueco bajo el titulo; insignia de estado de SOMA-LANG.
+- Botones planos redondeados; Verificar y Ejecutar (con icono de reproducir) a la derecha de la barra.
+- Explorador, editor, panel de problemas, barra de SOMA IA y barra de estado como tarjetas redondeadas; iconos de archivo,
+  contadores en pildoras, pastilla de estado (sin errores / con errores / sin verificar).
+- El explorador ya no repite archivos y, si dos se llaman igual, muestra su carpeta.
+- La ventana del Coder se abre grande.
+- Teclado: cada pulsacion guarda si Ctrl/Mayus estaban pulsadas; los atajos (Ctrl+F, Ctrl+A, Ctrl+D...) ya no fallan
+  cuando la tecla se procesa un instante despues de soltar Ctrl.
+
+## Parche 095 — La Pi 5 emulada a 1920x1080, como la placa real
+- El VideoCore del emulador solo tenia 4 MiB de memoria de video: el escritorio caia a 1024x768. tools/pi5/build_qemu.sh
+  la sube a 12 MiB (ventana hasta 1 GiB) y la Pi 5 emulada da 1920x1080, igual que la Pi real con su monitor HDMI.
+- Hay que reconstruir la imagen del emulador una vez:  python3 tools/pi5/pi5.py qemu  (~20-40 min).
+
+## Parche 096 — Programador con IA: nucleo agentico nuevo (src/apps/coder_core.c)
+- Antes: el Coder delegaba en el agente generico (JSON con el programa escapado dentro de un comando write), escribia el archivo
+  en cada intento y reparaba con un mensaje corto. Ahora un bucle propio guiado por el compilador:
+  1. Contexto anclado: ficha de SOMA-LANG comprobada con el compilador real (una ventana sin manejador, rand(min,max), sin ++/var...),
+     ejemplo verificado segun la tarea (ventana o consola), lecciones aprendidas y, al modificar, el programa actual completo.
+  2. Plan breve con criterio de aceptacion (solo si la tarea lo merece).
+  3. Salida en bloque ```soma``` y extraccion robusta (<think>, prosa, bloques sin cerrar).
+  4. Normalizador determinista: elif, True/False/None/null, var/const, function, console.log, x++, .length, # comentarios,
+     plantillas `${}`, comillas tipograficas, tabuladores, rand(n) y el manejador de ventana (win.clear(w, ...)) se corrigen sin
+     gastar llamadas.
+  5. Verificacion: compilador + lint + comprobaciones de la tarea (ventana pedida y no creada, falta win.present / win.active,
+     programa cortado, modificacion identica al original).
+  6. Reparacion con la linea exacta, contexto numerado, pista por tipo de error y el archivo completo; mejor candidato conservado;
+     regeneracion desde cero si dos rondas no mejoran; parada si el modelo repite la misma respuesta; presupuesto de 7 llamadas.
+  7. Revision critica final (aceptada solo si sigue compilando).
+  8. El archivo se escribe UNA vez y solo si el resultado es correcto: un fallo o una cancelacion no tocan el disco.
+  9. Lecciones: cada error reparado se guarda en /agent/coder_lessons.txt y se ofrece en los siguientes trabajos.
+- tests/test_coder_sim.c (en `make test`): 14 casos de uso con un LLM simulado (perfecto, Python, JavaScript, prosa, manejador de
+  ventana, error y reparacion, respuesta cortada, testarudo, modificacion sin cambios, olvida la ventana, desconectado, cancelado,
+  revisor que mejora, comillas tipograficas). Los programas de consola resultantes se EJECUTAN y se compara su salida.
+
+## Parche 097 — El programador se usa SIEMPRE y se ve lo que hace
+- Fallo real: las misiones a SOMA ("crea una app...") no pasaban por el programador nuevo; el agente generico escribia el archivo y
+  compilaba texto del razonamiento del modelo ("check the constraints" -> [COMPILER ERROR L2]).
+- Ahora toda mision de programacion (barra de SOMA, terminal, delegacion al agente coder) va a coder_core: deteccion de intencion,
+  eleccion del archivo (ruta .soma de la mision, el ultimo programa si se pide modificar, o un nombre sacado de la mision) y al
+  terminar se abre en SOMA Studio.
+- Extraccion a prueba de modelos con razonamiento: los ``` solo cuentan al principio de linea, se prueban TODOS los bloques (y el
+  texto sin bloques) y gana el que mejor verifica; si la respuesta es prosa se detecta ("es TEXTO, no un programa") y se pide el
+  codigo. Las preguntas llevan /no_think.
+- Visibilidad: cada paso sale en la terminal con [PROGRAMADOR]; la orden `coderlog` resume el ultimo trabajo y `coderlog todo`
+  muestra tambien lo que respondio el modelo; todo queda en /agent/coder_ultimo.txt.
+- Orden nueva `programa [archivo.soma] <mision>`.
+- Simulador: 16 casos (nuevos: razonamiento que escribe ``` dentro del pensamiento, y respuesta solo con razonamiento).
+
+## Parche 098 — Las apps creadas ya no tumban el sistema
+- Causa: el Coder ejecutaba la app DENTRO del hilo del escritorio (dispatch_command sin bufer de salida): el bucle del juego
+  congelaba todo y la ventana quedaba vacia porque nadie la componia. Ademas, el cerrojo del shell del parche 091 lo retenia la
+  orden "vsoma" durante toda la sesion, asi que una app lanzada en segundo plano esperaba para siempre.
+- Ahora: las apps se lanzan siempre en su propio hilo; "vsoma"/"gui" no toman el cerrojo; la app dibuja en su superficie y es el
+  bucle del escritorio quien abre, compone (cada win.present) y cierra su ventana; las teclas le llegan por su cola.
+- La VM cede la CPU cada 4096 instrucciones: un programa sin pausas tampoco congela el escritorio.
+- El programador anade sys.sleep(16) a un bucle while (win.active()) que no tenga pausa.
+- "Crear con IA" ya no reutiliza calc.soma: el nombre sale de la mision (snake.soma) y nunca pisa un programa existente
+  (snake_2.soma...); crear es crear desde cero, no modificar el archivo que hubiera.
+
+## Parche 099 — SOMA Studio: campos de texto de verdad y pestanas rehechas
+- src/ui/textfield.c: campo reutilizable (una linea o multilinea con ajuste): cursor, seleccion con raton (clic, arrastre, doble
+  clic = palabra, triple = todo, Mayus+clic), Mayus+flechas, Ctrl+A, Ctrl+Retroceso, Inicio/Fin, Supr, UTF-8, portapapeles.
+- Lo usan: la descripcion y el archivo de CREAR CON IA, la busqueda y el renombrado de PROYECTOS, la barra SOMA IA del editor y
+  las barras Buscar/Reemplazar, Abrir y Guardar como (que selecciona solo el nombre para cambiarlo directamente).
+- Clics fiables: cada boton se registra al pintarlo y el clic se comprueba contra lo pintado (antes las zonas eran coordenadas
+  fijas que no coincidian con los botones redimensionados por la fuente nueva).
+- CREAR CON IA: descripcion multilinea, 8 ideas, archivo automatico (boton Auto), Generar/Cancelar/Probar/Abrir en el editor,
+  tarjeta de progreso con pasos numerados, plan, pensamiento en vivo y bitacora, y consejos.
+- PROYECTOS: buscador, lista con iconos y ruta, rueda, detalle con Ejecutar / Abrir en el editor / Abrir en Notas / Duplicar,
+  Renombrar o mover (editando la ruta) y borrado con confirmacion.
+- REGISTRO: bitacora de hasta 40 entradas coloreada, con rueda, Copiar y Traza completa (/agent/coder_ultimo.txt en Notas);
+  analisis estatico abajo.
+
+## Parche 100 — Programador: sin panico, sin palabras reservadas, sin "main" olvidado
+- KERNEL PANIC (RIP=0xCCCCCCCD, hilo coder_bg): la estructura de entorno del nucleo se creaba sin poner a cero y env.trace quedaba
+  con basura de la pila; al llamarla, salto a una direccion invalida. Ahora se inicializa entera (y force_new se pasa de verdad).
+- Palabras reservadas como nombre (fn spawn(), let loop...): el normalizador las renombra (spawn_) y la ficha del lenguaje las lista.
+- Programas que "terminan con exito" sin hacer nada: si la funcion que contiene el bucle de ventana (o run/start/juego...) no se
+  llama nunca, se anade la llamada al final; "main();" se elimina porque fn main() se ejecuta sola y llamarla es un error.
+- La verificacion de candidatos ya no llena la terminal de [COMPILER ERROR] (lang_diag_quiet); el detalle sigue en coderlog/REGISTRO.
+- Una llamada lenta menos: el plan aparte solo se pide en encargos largos.
+- Cerrojo del shell por propietario: el escritorio lo suelta al arrancar sea cual sea la orden que lo abrio (antes, abierto con
+  "studio", las apps en segundo plano no arrancaban).
+
+## Parche 101 — Explorador del editor fiable y SOMA-LANG con funciones basicas
+- Explorador del editor: el dibujo ponia las filas cada 26 px desde y+34 pero el clic las calculaba cada 22 px desde y+28, asi que a
+  partir de la segunda fila el clic caia en otro archivo. Ahora clic y dibujo usan la misma geometria; ademas hay resaltado al pasar
+  el raton, rueda para desplazar la lista y la cabecera ya no abre nada al pulsarla.
+- SOMA-LANG: nuevas funciones enteras abs(x), min(a,b), max(a,b), clamp(x,lo,hi), sqrt(x); de texto find(s,trozo), chr(n), ord(s,i);
+  alias win.key() (= sys.key()) y win.fill()/win.fill_rect() (= win.rect()). Una funcion propia con el mismo nombre manda sobre la del sistema.
+- La ficha de lenguaje que recibe el modelo las incluye (y avisa de que no hay decimales ni math.*), para que deje de inventarlas.
+- Pruebas: test_lang cubre las funciones nuevas (76 comprobaciones).
+
+## Parche 102 — Fase 1 (seguridad), paso 2: validacion de punteros de usuario comprobable
+- Contexto: los pasos 0 y 1 de la Fase 1 (inventario y mapa de superficies) senalaron `usermode.c`, `idt.c`, `apic.c`, `vmm.c`, `shell.c`
+  y `kernel.c`. La revision manual de `usermode.c` no encontro un fallo explotable: ya hay comprobacion de desbordamiento, SMAP durante
+  las copias y fallos de proceso aislados. Lo que faltaba era una PRUEBA reproducible de esa defensa.
+- Nuevo `src/arch/x86_64/uaccess.h`: la validacion de rangos de usuario (ventana, desbordamiento, presente+U+W por pagina) como funcion
+  pura. `usermode.c` la usa; un `_Static_assert` impide que sus banderas se desincronicen de `vmm.h`. Ademas se evita la suma `p+len`.
+- Nuevo `tests/test_uaccess.c` (en `make test`): casos limite (ultimo byte, justo fuera, direcciones de kernel, 7 desbordamientos de 64
+  bits) y 400 000 casos aleatorios contrastados con una referencia en 128 bits, bajo ASan/UBSan.
+- `SYS_WRITE` con longitud 0 devuelve 0 en vez de -1.
+- Comprobado: `usermode_selftest` completo en QEMU con y sin SMEP/SMAP (`-cpu max`); builds x86_64 y aarch64.
+
+## Parche 102 — Fase 1 (seguridad), paso 2: validacion de punteros de usuario comprobable
+- Contexto: los pasos 0 y 1 de la Fase 1 (inventario y mapa de superficies) senalaron `usermode.c`, `idt.c`, `apic.c`, `vmm.c`, `shell.c`
+  y `kernel.c`. La revision manual de `usermode.c` no encontro un fallo explotable: ya hay comprobacion de desbordamiento, SMAP durante
+  las copias y fallos de proceso aislados. Lo que faltaba era una PRUEBA reproducible de esa defensa.
+- Nuevo `src/arch/x86_64/uaccess.h`: la validacion de rangos de usuario (ventana, desbordamiento, presente+U+W por pagina) como funcion
+  pura. `usermode.c` la usa; un `_Static_assert` impide que sus banderas se desincronicen de `vmm.h`. Ademas se evita la suma `p+len`.
+- Nuevo `tests/test_uaccess.c` (en `make test`): casos limite (ultimo byte, justo fuera, direcciones de kernel, 7 desbordamientos de 64
+  bits) y 400 000 casos aleatorios contrastados con una referencia en 128 bits, bajo ASan/UBSan.
+- `SYS_WRITE` con longitud 0 devuelve 0 en vez de -1.
+- Comprobado: `usermode_selftest` completo en QEMU con y sin SMEP/SMAP (`-cpu max`); builds x86_64 y aarch64.
+
+## Parche 102 — Fase 1 (seguridad), paso 2: validacion de punteros de usuario comprobable
+- Contexto: los pasos 0 y 1 de la Fase 1 (inventario y mapa de superficies) senalaron `usermode.c`, `idt.c`, `apic.c`, `vmm.c`, `shell.c`
+  y `kernel.c`. La revision manual de `usermode.c` no encontro un fallo explotable: ya hay comprobacion de desbordamiento, SMAP durante
+  las copias y fallos de proceso aislados. Lo que faltaba era una PRUEBA reproducible de esa defensa.
+- Nuevo `src/arch/x86_64/uaccess.h`: la validacion de rangos de usuario (ventana, desbordamiento, presente+U+W por pagina) como funcion
+  pura. `usermode.c` la usa; un `_Static_assert` impide que sus banderas se desincronicen de `vmm.h`. Ademas se evita la suma `p+len`.
+- Nuevo `tests/test_uaccess.c` (en `make test`): casos limite (ultimo byte, justo fuera, direcciones de kernel, 7 desbordamientos de 64
+  bits) y 400 000 casos aleatorios contrastados con una referencia en 128 bits, bajo ASan/UBSan.
+- `SYS_WRITE` con longitud 0 devuelve 0 en vez de -1.
+- Comprobado: `usermode_selftest` completo en QEMU con y sin SMEP/SMAP (`-cpu max`); builds x86_64 y aarch64.
+
 ## Parche 070: comprobacion de la red `user` en pi5.py
 
 * `qemu-system-aarch64 -netdev help` sin maquina da error ("No machine specified") y `pi5.py` creia que a la imagen le faltaba la red `user`
   aunque estuviera bien construida (con la imagen ya reconstruida se reconstruia en bucle). Ahora se pasa `-M raspi5b`.
+
+## Parche 103 — Fase 1 (seguridad), paso 3: guarda de reentrada del heap
+- Revision de `mem.c` (heap): ya tenia canarios, veneno al liberar, deteccion de double free, contabilidad por dueno y 100 pruebas en host.
+  Lo unico que no cubria es la concurrencia: no hay cerrojo, porque el nucleo es cooperativo a proposito (parche 072). Eso es seguro mientras
+  ninguna IRQ ni punto de desalojo caiga dentro de `kmalloc`/`kfree`; nada lo comprobaba.
+- `kmalloc`/`kfree` pasan a envolver a sus implementaciones con una bandera. Una llamada reentrante se rechaza (`kmalloc` -> NULL, `kfree` ->
+  se ignora) y se cuenta en `kheap_counters.reentries`, que `kheap_dump_stats` muestra si es > 0. Antes habria corrompido las listas en silencio.
+- `kheap_test_reentry()` + `test_reentrada` en `tests/test_heap.c` (98 -> 102 comprobaciones, bajo ASan/UBSan). Sin cambios de comportamiento normal.
+
+## Parche 104 — Fase 1 (seguridad), paso 4: espacios de direcciones de usuario probados en host
+- Revision de `vmm.c` y de las rutas de `usermode.c` que lo usan: `vmm_as_map` solo permite la entrada PML4[1] del proceso, las tablas del kernel
+  se comparten por valor y `vmm_as_destroy` libera PT/PD/PDPT/PML4 sin tocar los marcos de datos (los libera el dueno). No hay fallo explotable.
+- Hueco cerrado: `vmm_as_destroy` liberaba las tablas aunque fueran las del espacio ACTIVO (CR3 habria quedado apuntando a memoria reutilizable).
+  Hoy `usermode.c` nunca lo hace, pero nada lo impedia a un llamador futuro: ahora vuelve antes al espacio del kernel.
+- `vmm.c` se puede compilar en host con `-DVMM_HOST_TEST` (solo sustituye CR3/INVLPG/CR0; el kernel se compila igual que antes).
+- Nuevo `tests/test_vmm.c` (en `make test`, bajo ASan/UBSan): 50 ciclos crear/mapear 700 paginas/destruir sin fugas de marcos, rechazo de
+  mapeos fuera de la region de usuario, PML4 del kernel intacto, el PMM fallando en cada uno de los 12 primeros marcos (sin fugas ni dobles
+  liberaciones) y destruccion del espacio activo. Verificado que el test falla si se quita la guarda.
+
+## Parche 105 — Correccion del test de vmm en macOS
+- `tests/test_vmm.c` (parche 104) fallaba al enlazar en macOS/arm64 (`___data_start` sin definir): glibc aporta `__data_start`, macOS no.
+  Con `-DVMM_HOST_TEST`, `vmm.c` renombra los simbolos del enlazador (`__host_*`) y el test define los suyos: vale igual en Linux y en macOS.
+  Sin cambios en el kernel (el renombrado solo existe en la prueba en host).
+
+## Parche 106 — `make test` completo en macOS (terminal)
+- `tests/test_termcore.c` fallaba al enlazar en macOS (`_clip_seq`, `_clip_set_text`, `_clip_text`): `term_core.c` declara el portapapeles del
+  sistema como simbolos debiles sin definir (en Linux valen NULL), y el enlazador de Mach-O no lo admite en un ejecutable.
+- El test define esas tres funciones solo en macOS (sin portapapeles compartido, mismo comportamiento que NULL). El kernel no cambia.
+- Auditoria: ningun otro binario de prueba tiene simbolos debiles sin definir (comprobado con `nm`).
+
+## Parche 107 — SRCFS: el indice de fuentes ya cabe todo `src/` (fallo real hallado por `make test`)
+- Sintoma: en macOS `test_srcfs` fallaba (`src_ls net/` no listaba nada). No era de macOS: reproducido en Linux. El indice de fuentes admitia 255
+  entradas y `src/` ya tiene mas de 320 archivos; el empaquetado cortaba por ORDEN ALFABETICO, asi que `net/`, `lang/`, `ui/` y `user/`
+  no estaban en la imagen. El agente de SOMA no podia leer con `src_ls`/`src_cat`/`src_grep` ni el codigo de red, ni el del lenguaje, ni la GUI.
+- Correccion: indice de 64 sectores (511 entradas) en `srcfs.c`, `disk_layout.h` y `ejecutar.py` (los datos empiezan ahora en el LBA 8256).
+  `ejecutar.py` reempaqueta en cada arranque, asi que el disco se actualiza solo.
+- `tests/test_srcfs_pack.py`: capacidad 511 y una comprobacion nueva que falla si alguna carpeta de `src/` queda fuera de la imagen.
+- Limite honesto: con 511 entradas quedan ~190 de margen. Si `src/` los supera, el empaquetado avisa (`[SRCFS] AVISO`).

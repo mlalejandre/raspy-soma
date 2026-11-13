@@ -3,6 +3,7 @@
 _start:
     /* PARCHE 033: el cargador entrega la direccion del arbol de dispositivos (DTB) en x0; se guarda en x19 */
     mov x19, x0
+    mrs x20, CurrentEL              /* PARCHE 082: nivel de entrada (decide SMC o HVC para PSCI) */
     /* Leer ID del core y detener núcleos secundarios */
     mrs x0, mpidr_el1
     and x0, x0, #0xFF
@@ -56,10 +57,74 @@ bss_loop:
 bss_done:
     ldr x1, =soma_dtb_addr
     str x19, [x1]
+    lsr x20, x20, #2
+    ldr x1, =soma_boot_el
+    str x20, [x1]
 
     bl mmu_early_init           /* PARCHE 060: MMU y cachés */
     bl kernel_main
     b hang
+
+/* ====================================================================
+ * PARCHE 082: entrada de los nucleos secundarios (PSCI CPU_ON). x0 = indice del nucleo (1..3).
+ * Baja a EL1 si hace falta, activa la MMU con los valores que dejo el nucleo 0 en smp_mmu_cfg (escritos hasta la RAM: aqui la MMU y
+ * las caches estan apagadas, asi que no se toca la pila hasta tenerlas), pone su pila y salta a smp_secondary_main(indice).
+ * ==================================================================== */
+.global smp_secondary_entry
+smp_secondary_entry:
+    mov x19, x0
+    mrs x0, CurrentEL
+    lsr x0, x0, #2
+    cmp x0, #2
+    b.ne 2f
+    mrs x0, cnthctl_el2
+    orr x0, x0, #3
+    msr cnthctl_el2, x0
+    msr cntvoff_el2, xzr
+    mov x0, #(1 << 31)
+    msr hcr_el2, x0
+    mov x0, #0x33ff
+    msr cptr_el2, x0
+    msr hstr_el2, xzr
+    mov x0, #0x0800
+    movk x0, #0x30d0, lsl #16
+    msr sctlr_el1, x0
+    mov x0, #0x3c5
+    msr spsr_el2, x0
+    adr x0, 2f
+    msr elr_el2, x0
+    eret
+2:
+    msr daifset, #0xf
+    ldr x2, =smp_mmu_cfg
+    ldr x3, [x2]
+    msr mair_el1, x3
+    ldr x3, [x2, #8]
+    msr tcr_el1, x3
+    ldr x3, [x2, #16]
+    msr ttbr0_el1, x3
+    isb
+    tlbi vmalle1
+    dsb nsh
+    ic iallu
+    dsb nsh
+    isb
+    ldr x3, [x2, #24]
+    msr sctlr_el1, x3
+    isb
+    ldr x0, =vectors
+    msr vbar_el1, x0
+    isb
+    ldr x1, =smp_stacks
+    add x2, x19, #1
+    lsl x2, x2, #16                 /* 64 KiB por nucleo */
+    add x1, x1, x2
+    mov sp, x1
+    mov x0, x19
+    bl smp_secondary_main
+3:
+    wfe
+    b 3b
 
 /* ====================================================================
  * TABLA VECTORIAL DE EXCEPCIONES AARCH64 (VBAR_EL1)

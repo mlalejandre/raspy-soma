@@ -1,6 +1,7 @@
 #include "lang/lang.h"
 #include "arch.h"
 #include "agent.h"
+#include "coder_app.h"
 #include "rtc.h"
 #include "console.h"
 #include "llm.h"
@@ -1667,6 +1668,36 @@ static void llmfix_save_debug(const char *path, const char *text)
     if (path && text && n) (void)vfs_write(path, text, n);
 }
 
+/* PARCHE 097: las misiones de programacion van al programador (coder_core), no al bucle generico */
+static int programador_should_handle(const char *m)
+{
+    static const char *const no[] = { "historia", "cuento", "documento", "maquet", "poema", "carta", "informe", "redacta", "noticia", "busca en", "investiga", 0 };
+    static const char *const verb[] = { "crea", "haz", "programa", "escribe", "genera", "desarrolla", "construye", "disena", "diseña", "modifica",
+                                        "mejora", "corrige", "arregla", "implementa", "codifica", 0 };
+    static const char *const noun[] = { "app", "aplicacion", "aplicación", "programa", "juego", "calculadora", "reloj", "contador", "cronometro",
+                                        "cronómetro", "temporizador", "script", "codigo", "código", "soma-lang", "snake", "pong", "tetris",
+                                        "ventana", "boton", "botón", "conversor", "agenda", "lista de tareas", 0 };
+    if (mayordomo_has(m, ".soma")) return 1;
+    for (int i = 0; no[i]; i++) if (mayordomo_has(m, no[i])) return 0;
+    int v = 0, n = 0;
+    for (int i = 0; verb[i]; i++) if (mayordomo_has(m, verb[i])) v = 1;
+    for (int i = 0; noun[i]; i++) if (mayordomo_has(m, noun[i])) n = 1;
+    return v && n;
+}
+static void programador_run(const char *mission)
+{
+    extern int gui_is_running(void);
+    extern void gui_open_coder_app(void);
+    extern void coder_app_load_project(const char *path);
+    static char target[128];
+    kprint("\n\033[1;36m[PROGRAMADOR] La mision es de programacion: la resuelve el programador de SOMA.\033[0m\n");
+    coder_pick_target(mission, target, sizeof target);
+    agent_last_response[0] = '\0';
+    int ok = coder_run_mission(target, mission, agent_last_response, sizeof(agent_last_response));
+    mayordomo_store_reply(agent_last_response, 1);
+    if (ok && gui_is_running()) { coder_app_load_project(target); gui_open_coder_app(); }
+}
+
 void agent_run(const char *agent_name, const char *mission)
 {
     while (*mission == ' ') mission++;
@@ -1678,6 +1709,10 @@ void agent_run(const char *agent_name, const char *mission)
     if (str_eq_ci(requested_agent, "soma") && mayordomo_should_handle(mission)) {
         agent_run("mayordomo", mission);
         return;
+    }
+    if (str_eq_ci(requested_agent, "coder") || (str_eq_ci(requested_agent, "soma") && programador_should_handle(mission))) {
+        while (*mission == ' ') mission++;
+        if (*mission) { programador_run(mission); return; }
     }
     const struct agent_profile *agent = resolve_agent(requested_agent);
 

@@ -7,7 +7,13 @@ enum soma_cursor_id {
     CURSOR_ARROW     = 0,
     CURSOR_CROSSHAIR = 1,
     CURSOR_HAND      = 2,
-    CURSOR_COUNT     = 3
+    CURSOR_RESIZE_H  = 3,    /* PARCHE 085: punteros vectoriales para redimensionar, mover y texto */
+    CURSOR_RESIZE_V  = 4,
+    CURSOR_RESIZE_NWSE = 5,
+    CURSOR_RESIZE_NESW = 6,
+    CURSOR_MOVE      = 7,
+    CURSOR_TEXT      = 8,
+    CURSOR_COUNT     = 9
 };
 
 void mouse_init(void);

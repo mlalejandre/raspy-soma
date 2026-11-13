@@ -37,3 +37,4 @@ tools/pi5/firmware/
 *.avi
 estructuranotepad.txt
 tools/pi5/firmware/
+parche*.py

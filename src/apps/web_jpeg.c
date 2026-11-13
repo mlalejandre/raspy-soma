@@ -1,6 +1,9 @@
 /* SOMA_PARCHE_NAVEGADOR: decodificador JPEG progresivo / base (enteros). Sobremuestreo por replicacion. */
 #include "web_jpeg.h"
 #include "web_util.h"
+/* PARCHE 086: las reservas que fallan se anotan (el navegador distingue "sin memoria" de "imagen danada") */
+static void *wj_alloc(size_t n) { void *p = kmalloc(n); if (!p) wi_oom = 1; return p; }
+#define kmalloc(n) wj_alloc(n)
 
 struct jh { uint8_t bits[17]; uint8_t vals[256]; int16_t look[512]; int32_t maxcode[18]; int32_t valptr[17]; int32_t mincode[17]; int ok; };
 struct jc { int id, h, v, tq, bw, bh, w, hh; int16_t *coef; int dcpred; int td, ta; };
@@ -173,8 +176,13 @@ static void idct(const int16_t *in, const uint16_t *q, uint8_t *out, int stride)
     }
 }
 
-int wj_decode_progressive(const uint8_t *d, uint32_t n, struct wimg *o)
+/* PARCHE 086: salida con reduccion en el dominio DCT (scale 1, 2, 4 u 8: la imagen sale ya pequena y gasta 1/scale^2 de memoria),
+ * croma con interpolacion bilineal (antes se repetia el pixel: bordes de color en escalera) y JPEG de 4 componentes (CMYK / YCCK de Adobe). */
+int wj_decode_progressive(const uint8_t *d, uint32_t n, struct wimg *o) { return wj_decode(d, n, o, 1); }
+static inline int clamp255(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
+int wj_decode(const uint8_t *d, uint32_t n, struct wimg *o, int scale)
 {
+    if (scale != 2 && scale != 4 && scale != 8) scale = 1;
     struct jd *J = (struct jd *)kmalloc(sizeof(*J)); if (!J) return -1;
     memset(J, 0, sizeof *J); J->d = d; J->n = n; J->pos = 2; J->adobe = -1;
     int rc = -1, got_sof = 0; uint8_t *planes[4] = { 0, 0, 0, 0 };
@@ -200,7 +208,7 @@ int wj_decode_progressive(const uint8_t *d, uint32_t n, struct wimg *o)
         else if (m == 0xC0 || m == 0xC1 || m == 0xC2) {
             if (pl < 6 || p[0] != 8) goto out;
             J->prog = (m == 0xC2); J->H = (p[1] << 8) | p[2]; J->W = (p[3] << 8) | p[4]; J->ncomp = p[5];
-            if (J->W <= 0 || J->H <= 0 || (uint64_t)J->W * J->H > WI_MAX_PIXELS || (J->ncomp != 1 && J->ncomp != 3) || pl < 6u + J->ncomp * 3u) goto out;
+            if (J->W <= 0 || J->H <= 0 || (uint64_t)J->W * J->H > WI_MAX_PIXELS || (J->ncomp != 1 && J->ncomp != 3 && J->ncomp != 4) || pl < 6u + J->ncomp * 3u) goto out;
             for (int i = 0; i < J->ncomp; i++) { struct jc *c = &J->c[i]; c->id = p[6 + i * 3]; c->h = p[7 + i * 3] >> 4; c->v = p[7 + i * 3] & 15; c->tq = p[8 + i * 3] & 3; if (c->h < 1 || c->h > 4 || c->v < 1 || c->v > 4) goto out; if (c->h > J->hmax) J->hmax = c->h; if (c->v > J->vmax) J->vmax = c->v; }
             J->mcux = (J->W + 8 * J->hmax - 1) / (8 * J->hmax); J->mcuy = (J->H + 8 * J->vmax - 1) / (8 * J->vmax);
             uint64_t tot = 0;
@@ -227,28 +235,70 @@ int wj_decode_progressive(const uint8_t *d, uint32_t n, struct wimg *o)
     }
     if (!got_sof) goto out;
     {
-        o->px = (uint32_t *)kmalloc((size_t)J->W * J->H * 4); if (!o->px) goto out;
+        const int S = scale, OW = (J->W + S - 1) / S, OH = (J->H + S - 1) / S;
+        int pw_[4], cw_[4], ch_[4];
+        o->px = (uint32_t *)kmalloc((size_t)OW * OH * 4); if (!o->px) goto out;
         for (int i = 0; i < J->ncomp; i++) {
-            struct jc *c = &J->c[i]; planes[i] = (uint8_t *)kmalloc((size_t)c->bw * 8 * c->bh * 8); if (!planes[i]) goto out2;
-            int pw = c->bw * 8;
-            for (int by = 0; by < c->bh; by++) for (int bx = 0; bx < c->bw; bx++) idct(c->coef + ((size_t)by * c->bw + bx) * 64, J->q[c->tq], planes[i] + (size_t)by * 8 * pw + bx * 8, pw);
+            struct jc *c = &J->c[i]; int bs = 8 / S, pw = c->bw * bs, ph = c->bh * bs; pw_[i] = pw;
+            cw_[i] = (c->w + S - 1) / S; ch_[i] = (c->hh + S - 1) / S; if (cw_[i] < 1) cw_[i] = 1; if (ch_[i] < 1) ch_[i] = 1;
+            if (cw_[i] > pw) cw_[i] = pw;
+            if (ch_[i] > ph) ch_[i] = ph;
+            planes[i] = (uint8_t *)kmalloc((size_t)pw * ph); if (!planes[i]) goto out2;
+            uint8_t tmp[64];
+            for (int by = 0; by < c->bh; by++) {
+                if ((by & 7) == 0) wu_tick();
+                for (int bx = 0; bx < c->bw; bx++) {
+                    const int16_t *cf = c->coef + ((size_t)by * c->bw + bx) * 64;
+                    uint8_t *dst = planes[i] + (size_t)by * bs * pw + bx * bs;
+                    if (S == 1) { idct(cf, J->q[c->tq], dst, pw); continue; }
+                    if (S == 8) { dst[0] = (uint8_t)clamp255(((DQ(cf[0], J->q[c->tq][0]) + 4) >> 3) + 128); continue; }
+                    idct(cf, J->q[c->tq], tmp, 8);
+                    for (int yy = 0; yy < bs; yy++) for (int xx = 0; xx < bs; xx++) {
+                        int sum = 0; for (int a = 0; a < S; a++) for (int b = 0; b < S; b++) sum += tmp[(yy * S + a) * 8 + xx * S + b];
+                        dst[(size_t)yy * pw + xx] = (uint8_t)((sum + S * S / 2) / (S * S));
+                    }
+                }
+            }
             kfree(c->coef); c->coef = 0;
         }
-        for (int y = 0; y < J->H; y++) for (int x = 0; x < J->W; x++) {
-            int comp[3];
-            for (int i = 0; i < J->ncomp; i++) { struct jc *c = &J->c[i]; int sx = x * c->h / J->hmax, sy = y * c->v / J->vmax; comp[i] = planes[i][(size_t)sy * c->bw * 8 + sx]; }
-            uint32_t px;
-            if (J->ncomp == 1) px = 0xFF000000u | (comp[0] << 16) | (comp[0] << 8) | comp[0];
-            else {
-                int Y = comp[0], cb = comp[1] - 128, cr = comp[2] - 128, r = Y, g = Y, b = Y;
-                if (J->adobe != 0) { r = Y + ((91881 * cr) >> 16); g = Y - ((22554 * cb + 46802 * cr) >> 16); b = Y + ((116130 * cb) >> 16); }
-                else { r = comp[0]; g = comp[1]; b = comp[2]; }
-                r = r < 0 ? 0 : (r > 255 ? 255 : r); g = g < 0 ? 0 : (g > 255 ? 255 : g); b = b < 0 ? 0 : (b > 255 ? 255 : b);
-                px = 0xFF000000u | (r << 16) | (g << 8) | b;
+        /* posicion de cada pixel de salida en cada plano (1/256 de muestra), con centrado de JPEG/JFIF */
+        for (int y = 0; y < OH; y++) {
+            if ((y & 31) == 0) wu_tick();
+            int comp[4];
+            for (int x = 0; x < OW; x++) {
+                for (int i = 0; i < J->ncomp; i++) {
+                    struct jc *c = &J->c[i]; const uint8_t *pl = planes[i]; int pw = pw_[i];
+                    if (c->h == J->hmax && c->v == J->vmax) { comp[i] = pl[(size_t)y * pw + x]; continue; }
+                    int fx = ((2 * x + 1) * c->h * 128) / J->hmax - 128, fy = ((2 * y + 1) * c->v * 128) / J->vmax - 128;
+                    if (fx < 0) fx = 0;
+                    if (fy < 0) fy = 0;
+                    int x0 = fx >> 8, y0 = fy >> 8, ax = fx & 255, ay = fy & 255;
+                    if (x0 >= cw_[i] - 1) { x0 = cw_[i] - 1; ax = 0; }
+                    if (y0 >= ch_[i] - 1) { y0 = ch_[i] - 1; ay = 0; }
+                    const uint8_t *r0 = pl + (size_t)y0 * pw, *r1 = ay ? r0 + pw : r0;
+                    int x1 = ax ? x0 + 1 : x0;
+                    int top = r0[x0] * (256 - ax) + r0[x1] * ax, bot = r1[x0] * (256 - ax) + r1[x1] * ax;
+                    comp[i] = (top * (256 - ay) + bot * ay + 32768) >> 16;
+                }
+                int r, g, b;
+                if (J->ncomp == 1) r = g = b = comp[0];
+                else {
+                    int ycc = J->ncomp == 3 ? (J->adobe != 0) : (J->adobe == 2);
+                    if (ycc) {
+                        int Y = comp[0], cb = comp[1] - 128, cr = comp[2] - 128;
+                        r = clamp255(Y + ((91881 * cr + 32768) >> 16)); g = clamp255(Y - ((22554 * cb + 46802 * cr - 32768) >> 16)); b = clamp255(Y + ((116130 * cb + 32768) >> 16));
+                    } else { r = comp[0]; g = comp[1]; b = comp[2]; }
+                    if (J->ncomp == 4) {   /* CMYK: con marcador Adobe los valores van invertidos (lo habitual de Photoshop) */
+                        int k = comp[3];
+                        if (ycc) { r = 255 - r; g = 255 - g; b = 255 - b; }   /* YCCK: la transformada da el complemento */
+                        if (J->adobe >= 0) { r = r * k / 255; g = g * k / 255; b = b * k / 255; }
+                        else { r = (255 - r) * (255 - k) / 255; g = (255 - g) * (255 - k) / 255; b = (255 - b) * (255 - k) / 255; }
+                    }
+                }
+                o->px[(size_t)y * OW + x] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
             }
-            o->px[(size_t)y * J->W + x] = px;
         }
-        o->w = J->W; o->h = J->H; rc = 0;
+        o->w = OW; o->h = OH; o->nw = J->W; o->nh = J->H; rc = 0;
     }
 out2:
     if (rc < 0 && o->px) { kfree(o->px); o->px = 0; }

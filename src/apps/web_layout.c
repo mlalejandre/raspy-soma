@@ -2,6 +2,9 @@
 #include "web_layout.h"
 #include "web_font.h"
 #include "fb.h"
+/* PARCHE 085: el contenido de las paginas no usa los ajustes de fuente de la interfaz */
+#define wf_draw(x, y, s, n, px, c, fl, a) wf_draw((x), (y), (s), (n), (px), (c), (fl) | WF_RAW, (a))
+#define wf_width64(s, n, px, fl) wf_width64((s), (n), (px), (fl) | WF_RAW)
 
 #define MAXD 100
 #define BIG 0x3fffffff

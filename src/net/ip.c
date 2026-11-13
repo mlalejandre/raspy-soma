@@ -30,7 +30,7 @@ extern uint64_t tsc_ticks_per_ms;
 #define TSC_PER_US        (tsc_ticks_per_ms / 1000ULL > 0 ? tsc_ticks_per_ms / 1000ULL : 1ULL)
 
 
-static const uint8_t net_netmask[4] = { 255, 255, 255, 0 };
+uint8_t net_netmask[4] = { 255, 255, 255, 0 };   /* PARCHE 081: la fija DHCP */
 
 static uint16_t ip_ident;
 
@@ -137,6 +137,10 @@ int ip_send(
     uint16_t len
 )
 {
+    if (dst_ip[0] == 255 && dst_ip[1] == 255 && dst_ip[2] == 255 && dst_ip[3] == 255) {   /* PARCHE 081: difusion (DHCP) */
+        static const uint8_t bc[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+        return ip_send_to_mac(bc, dst_ip, proto, payload, len);
+    }
     const uint8_t *next_hop = is_on_link(dst_ip) ? dst_ip : net_gateway;
 
     uint8_t mac[6];
@@ -247,7 +251,9 @@ void ip_input(const uint8_t *frame, uint16_t len)
     }
 
     if (memcmp(ip + 16, net_ip, 4) != 0) {
-        return;
+        /* PARCHE 081: UDP de difusion o, sin direccion todavia, cualquier UDP (respuestas DHCP) */
+        static const uint8_t bc[4] = { 255, 255, 255, 255 }, none[4] = { 0, 0, 0, 0 };
+        if (ip[9] != 17 || (memcmp(ip + 16, bc, 4) != 0 && memcmp(net_ip, none, 4) != 0)) return;
     }
 
     if (ip[9] == IP_PROTO_ICMP) {

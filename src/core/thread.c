@@ -8,6 +8,7 @@
 #include "pmm.h"
 #include "mem.h"
 #include "console.h"
+#include "acct.h"
 #include "idt.h"
 #include "net.h"
 #include "panic.h"
@@ -25,7 +26,7 @@ extern void thread_trampoline_asm(void);
 #endif
 #endif
 #define THREAD_SLOT_SIZE   0x00010000ULL /* 64 KiB */
-#define THREAD_STACK_PAGES 8             /* 32 KiB reales de pila */
+#define THREAD_STACK_PAGES 15            /* PARCHE 091: 60 KiB reales de pila (el agente ya corre en su propio hilo) */
 
 /* SOMA_PARCHE_006_SCHED: las ranuras de pila se reutilizan (antes la ranura salia
  * del tid, que nunca se reciclaba: el espacio virtual crecia sin limite). */
@@ -53,6 +54,10 @@ static void thread_slot_release(uint64_t slot_addr)
 static struct tcb *thread_list = 0;
 static struct tcb *curr_thread = 0;
 static struct tcb *idle_tcb = 0;
+/* PARCHE 089: ciclos por dueno */
+static uint64_t own_cyc[256], own_mark;
+uint64_t acct_now(void);
+static void acct_charge(uint64_t now) { own_cyc[kheap_owner] += now - own_mark; own_mark = now; }
 static uint32_t    next_tid = 0;
 static int         multitasking_active = 0;
 
@@ -337,6 +342,8 @@ void thread_init(void)
 
     /* Hilo 1: idle task */
     idle_tcb = thread_create("idle", idle_thread_func, 0);
+    if (idle_tcb) idle_tcb->owner = ACCT_IDLE;                 /* PARCHE 089 */
+    kmain->cyc_start = acct_now(); own_mark = kmain->cyc_start;
 
     /* Hilo 2: net daemon */
     thread_create("netd", netd_thread_func, 0);
@@ -404,6 +411,13 @@ static void schedule(void)
     }
     candidate->state = THREAD_STATE_RUNNING;
     candidate->ticks_run++;
+    {   /* PARCHE 089: tiempo de CPU por hilo y por dueno */
+        uint64_t now = acct_now();
+        prev->cyc_total += now - prev->cyc_start;
+        acct_charge(now);
+        candidate->cyc_start = now;
+        kheap_owner = candidate->owner;
+    }
     curr_thread = candidate;
 
     arch_thread_switch(prev, candidate);    /* SOMA_PARCHE_015_PROC */
@@ -644,4 +658,37 @@ int thread_format_table(char *out, uint32_t max)
 
     out[pos] = '\0';
     return (int)pos;
+}
+
+/* ================================================================== PARCHE 089: contabilidad para el Monitor del sistema */
+uint64_t acct_now(void) { return arch_cycle_counter(); }
+uint8_t acct_set_owner(uint8_t o)
+{
+    uint8_t old = kheap_owner;
+    if (o == old) return old;
+    acct_charge(acct_now());
+    kheap_owner = o;
+    if (curr_thread) curr_thread->owner = o;
+    return old;
+}
+uint64_t acct_owner_cycles(uint8_t o)
+{
+    if (o == kheap_owner) { uint64_t now = acct_now(); return own_cyc[o] + (now - own_mark); }
+    return own_cyc[o];
+}
+void thread_set_owner(void *tcb, uint8_t o) { struct tcb *t = (struct tcb *)tcb; if (t) { t->owner = o; if (t == curr_thread) kheap_owner = o; } }
+int thread_snapshot(struct thread_info *out, int max)
+{
+    if (!thread_list || max <= 0) return 0;
+    int n = 0; uint64_t now = acct_now();
+    struct tcb *t = thread_list;
+    do {
+        if (n >= max) break;
+        struct thread_info *o = &out[n++];
+        o->tid = t->tid; o->state = t->state; str_copy(o->name, t->name, sizeof o->name);
+        o->cycles = t->cyc_total + (t == curr_thread ? now - t->cyc_start : 0);
+        o->switches = t->ticks_run; o->stack_kb = (uint32_t)(THREAD_STACK_PAGES * 4); o->owner = t->owner; o->user = t->uproc ? 1 : 0;
+        t = t->next;
+    } while (t && t != thread_list);
+    return n;
 }

@@ -8,5 +8,7 @@ void imgview_load_file(const char *path);
 void imgview_render_window(uint32_t win_x, uint32_t win_y, uint32_t win_w, uint32_t win_h, int show_cursor);
 int  imgview_handle_click(int32_t mx, int32_t my, uint32_t win_x, uint32_t win_y, uint32_t win_w, uint32_t win_h);
 void imgview_handle_key(char c);
+int  imgview_mouse(int32_t mx, int32_t my, uint32_t win_x, uint32_t win_y, uint32_t win_w, uint32_t win_h, int wheel, int held);   /* PARCHE 088 */
+int  imgview_clip_op(int op);
 
 #endif

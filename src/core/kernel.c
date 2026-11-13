@@ -29,11 +29,14 @@
 #include "arch/aarch64/rpi_fb.h"
 #ifdef PLATFORM_rpi5
 #include "arch/aarch64/rp1_gpio.h"
+#include "arch/aarch64/wifi.h"
 void xhci2_autostart(void);
 #endif
 #include "sdhci.h"
 #include "xhci.h"
 #endif
+#include "smp.h"                                     /* PARCHE 082 */
+#include "crypto.h"
 
 extern uint32_t multiboot_magic;
 extern uint32_t multiboot_info_addr;
@@ -144,6 +147,11 @@ void kernel_main(void)
 #ifdef PLATFORM_rpi5
     xhci2_autostart();                                  /* PARCHE 077: segundo controlador USB del RP1 (los otros puertos de la placa) */
     if (rp1_fan_set(1) == 0) kprint("FAN: ventilador en marcha (GPIO45; 'fan off' lo para, 'fan inv' si gira al reves)\n");
+    board_print();                                      /* PARCHE 079: modelo de placa; 'wifi prueba' arranca el chip Wi-Fi */
+#endif
+#ifdef __aarch64__
+    smp_init();                                         /* PARCHE 082: nucleos secundarios para calculo en paralelo */
+    if (smp_cpus() > 1) crypto_parallel = smp_parallel_n;
 #endif
     kprint("\033[1;32m[SOMA ready]\033[0m Sistema interactivo listo en consola serie.\n\n");
     kprint("\033[1;36m[DESKTOP]: Iniciando Entorno Grafico SOMA por defecto...\033[0m\n");

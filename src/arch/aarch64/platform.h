@@ -7,6 +7,9 @@
 #define SOMA_PMM_BASE        0x20000000UL      /* reserva de marcos: RAM de la placa desde 512 MiB (todas las Pi 5 tienen >= 2 GiB) */
 #define SOMA_HAVE_VIRTIO     0
 #define SOMA_SD_BASE         0x1000fff000ULL   /* SDHCI de la ranura de tarjeta (SDIO1) */
+#define SOMA_SDIO2_BASE      0x1001100000ULL   /* PARCHE 079: SDHCI del Wi-Fi (SDIO2, chip CYW43455) */
+#define SOMA_GIO_BASE        0x107d508500ULL   /* PARCHE 079: GPIO de la BCM2712 (brcmstb): WL_ON = pin 28 del banco 0 */
+#define SOMA_PINCTRL_BASE    0x107d504100ULL   /* PARCHE 079: funciones de los pines de la BCM2712 (SD2 = pines 30-35) */
 #define SOMA_MBOX_BASE       0x107c013880ULL   /* PARCHE 063: mailbox del VideoCore (canal 8 = propiedades): lectura +0, estado +0x18, escritura +0x20 */
 #define SOMA_PCIE_BASE       0x1000110000ULL   /* PARCHE 062: root complex PCIe1 (conector externo), tipo Broadcom STB */
 #define SOMA_PCIE_MEM_CPU    0x1800000000ULL   /* ventana de PCI memoria vista por la CPU (apertura de 16 GiB de PCIe1) */
@@ -30,6 +33,9 @@
 #define SOMA_PMM_BASE        0x44000000UL
 #define SOMA_HAVE_VIRTIO     1
 #define SOMA_SD_BASE         0                 /* QEMU virt no tiene SDHCI */
+#define SOMA_SDIO2_BASE      0                 /* sin Wi-Fi */
+#define SOMA_GIO_BASE        0
+#define SOMA_PINCTRL_BASE    0
 #define SOMA_MBOX_BASE       0                 /* sin VideoCore */
 #define SOMA_PCIE_BASE       0                 /* sin root complex Broadcom */
 #define SOMA_PCIE_MEM_CPU    0

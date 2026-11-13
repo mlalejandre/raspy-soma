@@ -19,6 +19,10 @@ for name, fmt, kw, mode in [("a.jpg", "JPEG", {}, "RGB"), ("b.jpg", "JPEG", {"pr
     im = img(37, 29, "RGB" if mode == "P" else mode)
     if mode == "P": im = im.convert("P")
     b = io.BytesIO(); im.save(b, fmt, **kw); open(os.path.join(out, name), "wb").write(b.getvalue())
+# PARCHE 086: JPEG CMYK (Adobe, progresivo y base) y fotos grandes que se decodifican reducidas
+for name, kw in [("k.jpg", {}), ("kp.jpg", {"progressive": True})]:
+    b = io.BytesIO(); img(37, 29, "RGB").convert("CMYK").save(b, "JPEG", **kw); open(os.path.join(out, name), "wb").write(b.getvalue())
+b = io.BytesIO(); img(160, 96, "RGB").save(b, "JPEG", progressive=True, quality=60); open(os.path.join(out, "big.jpg"), "wb").write(b.getvalue())
 raw = bytes(random.randrange(0, 16) for _ in range(3000))
 open(os.path.join(out, "z.zlib"), "wb").write(zlib.compress(raw))
 open(os.path.join(out, "z.gz"), "wb").write(gzip.compress(raw))

@@ -22,13 +22,40 @@
 #include "lang_diag.h"
 #include "llm.h"
 #include "gui.h"
+#include "codeedit.h"
+#include "coder_core.h"
+#include "clipboard.h"
+#include "web_font.h"
+#include "textfield.h"
+
+/* PARCHE 094: toda la interfaz del Coder con la fuente antialiasada del sistema (antes: mapa de bits 8x8) */
+static int cdr_wf(void) { static int v = -1; if (v < 0) v = wf_init() ? 1 : 0; return v; }
+static int cdr_is_caps(const char *s) { int n = 0, up = 0; for (; s[n]; n++) { if (s[n] >= 'a' && s[n] <= 'z') return 0; if (s[n] >= 'A' && s[n] <= 'Z') up++; } return up >= 4 && n < 48; }
+static int cdr_tw(const char *s)
+{
+    uint32_t n = 0; while (s[n]) n++;
+    if (!cdr_wf()) return (int)n * 8;
+    return cdr_is_caps(s) ? wf_width(s, n, 11, WF_BOLD) + (int)n : wf_width(s, n, 13, 0);
+}
+static void cdr_txt(uint32_t x, uint32_t y, const char *s, uint32_t col, int scale)
+{
+    uint32_t n = 0; while (s[n]) n++;
+    if (!cdr_wf()) { font_draw_string(x, y, s, col, scale); return; }
+    if (cdr_is_caps(s)) {                               /* rotulos en mayusculas: versalitas espaciadas */
+        int xx = (int)x;
+        for (uint32_t i = 0; i < n; i++) { wf_draw(xx, (int)y + 9, s + i, 1, 11, col, WF_BOLD, 255); xx += wf_width(s + i, 1, 11, WF_BOLD) + 1; }
+        return;
+    }
+    wf_draw((int)x, (int)y + 9, s, n, 13, col, 0, 255);
+}
+#define font_draw_string(x, y, s, c, sc) cdr_txt((x), (y), (s), (c), (sc))
 
 extern uint64_t timer_get_uptime_ms(void);
 
 #define CDR_MAX_PROJECTS 64
 #define CDR_SRC_MAX      16384
-#define CDR_LOG_N        8
-#define CDR_LOG_LEN      88
+#define CDR_LOG_N        40   /* PARCHE 099 */
+#define CDR_LOG_LEN      120
 #define CDR_LINT_N       6
 #define CDR_LINT_LEN     96
 #define CDR_MISSION_MAX  1024
@@ -40,12 +67,12 @@ extern uint64_t timer_get_uptime_ms(void);
 #define CDR_BAK_FILE     "/tmp/coder_prev.bak"
 #define CDR_REPORT_FILE  "/agent/coder_log.txt"
 
-#define CDR_C_BG       0x00080E1Au
-#define CDR_C_PANEL    0x000F172Au
-#define CDR_C_DARK     0x00050811u
-#define CDR_C_BORDER   0x001E293Bu
+#define CDR_C_BG       0x000A0F1Cu
+#define CDR_C_PANEL    0x00111827u
+#define CDR_C_DARK     0x00080C17u
+#define CDR_C_BORDER   0x001B2436u
 #define CDR_C_BORDER2  0x00334155u
-#define CDR_C_GREEN    0x0000FF88u
+#define CDR_C_GREEN    0x0034D399u
 #define CDR_C_CYAN     0x0038BDF8u
 #define CDR_C_TXT      0x00E2E8F0u
 #define CDR_C_SOFT     0x00CBD5E1u
@@ -65,7 +92,8 @@ enum cdr_tab {
     CDR_TAB_NEW = 0,
     CDR_TAB_MODIFY = 1,
     CDR_TAB_PROJECTS = 2,
-    CDR_TAB_LOG = 3
+    CDR_TAB_LOG = 3,
+    CDR_TAB_EDITOR = 4      /* PARCHE 093: editor profesional */
 };
 
 enum coder_job_state {
@@ -86,10 +114,6 @@ struct cdr_proj {
 /* ------------------------------------------------------------------------
  * Utilidades de cadena internas (seguras en Ring 0)
  * ------------------------------------------------------------------------ */
-static uint32_t cdr_sub(uint32_t a, uint32_t b)
-{
-    return (a > b) ? (a - b) : 0u;
-}
 
 static uint32_t cdr_len(const char *s)
 {
@@ -129,14 +153,6 @@ static void cdr_cat(char *dst, uint32_t cap, const char *src)
 }
 
 /* Añade como máximo max_add caracteres y siempre conserva el terminador NUL. */
-static void cdr_cat_limited(char *dst, uint32_t cap, const char *src, uint32_t max_add)
-{
-    uint32_t n, i = 0;
-    if (!dst || cap == 0) return;
-    n = cdr_len(dst);
-    while (src && src[i] && i < max_add && n + 1 < cap) dst[n++] = src[i++];
-    dst[n] = '\0';
-}
 
 static void cdr_cat_u32(char *dst, uint32_t cap, uint32_t v)
 {
@@ -150,17 +166,6 @@ static void cdr_cat_u32(char *dst, uint32_t cap, uint32_t v)
     cdr_cat(dst, cap, out);
 }
 
-static void cdr_num_pad(char *dst, uint32_t width, uint32_t v)
-{
-    char tmp[12];
-    uint32_t n = 0, i = 0, pad;
-    if (v == 0) tmp[n++] = '0';
-    while (v > 0 && n < 11) { tmp[n++] = (char)('0' + (v % 10u)); v /= 10u; }
-    pad = (n < width) ? (width - n) : 0u;
-    while (i < pad) dst[i++] = ' ';
-    while (n > 0) dst[i++] = tmp[--n];
-    dst[i] = '\0';
-}
 
 static int cdr_eq(const char *a, const char *b)
 {
@@ -192,15 +197,7 @@ static const char *cdr_find(const char *hay, const char *needle)
     return 0;
 }
 
-static int cdr_isalpha(char c)
-{
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
-}
 
-static int cdr_isalnum(char c)
-{
-    return cdr_isalpha(c) || (c >= '0' && c <= '9');
-}
 
 static void cdr_clean_text(char *dst, uint32_t cap, const char *src)
 {
@@ -291,7 +288,7 @@ static struct cdr_job g_job = {
     .ended_ms = 0,
     .phase_desc = "Listo para crear o modificar aplicaciones .soma",
     .live_thought = "",
-    .target_file = "/workspace/calc.soma",
+    .target_file = "",
     .mission = "",
     .plan = ""
 };
@@ -375,13 +372,18 @@ static void cdr_log(const char *msg)
  * Estado de la interfaz de usuario
  * ------------------------------------------------------------------------ */
 static int      cdr_inited = 0;
-static enum cdr_tab cdr_tab_cur = CDR_TAB_NEW;
+static enum cdr_tab cdr_tab_cur = CDR_TAB_EDITOR;
+static const struct { const char *t; uint32_t w; enum cdr_tab tab; } cdr_tabs[] = {   /* PARCHE 093 */
+    { "EDITOR", 92, CDR_TAB_EDITOR }, { "CREAR CON IA", 124, CDR_TAB_NEW }, { "PROYECTOS", 104, CDR_TAB_PROJECTS }, { "REGISTRO", 96, CDR_TAB_LOG } };
+#define CDR_NTABS 4
+static void cdr_open_in_editor(const char *path);
+static int ide_inited;
+static int coder_job_busy(void);
 
-static char     input_create_prompt[384] = "Crea una app interactiva que sea una calculadora con botones";
+static char     input_create_prompt[384] = "";
 static uint32_t input_create_len = 0;
-static char     input_create_file[64] = "/workspace/calc.soma";
+static char     input_create_file[96] = "";
 static uint32_t input_create_file_len = 0;
-static int      input_create_focus = 0;
 
 static char     input_mod_prompt[384] = "Anade un boton de reset y cambia el color del fondo";
 static uint32_t input_mod_len = 0;
@@ -390,7 +392,6 @@ static char     mod_code[CDR_SRC_MAX];
 static int      mod_loaded = 0;
 static int      mod_scroll = 0;
 static int      mod_total_lines = 0;
-static int      mod_vis_lines = 10;
 static int      mod_err_line = 0;
 static uint32_t mod_size = 0;
 
@@ -400,7 +401,6 @@ static uint32_t cdr_check_col = 0x0094A3B8u;
 static struct cdr_proj projects[CDR_MAX_PROJECTS];
 static int      project_count = 0;
 static int      project_selected = -1;
-static int      proj_scroll = 0;
 static int      proj_del_armed = -1;
 
 static volatile int g_need_rescan = 0;
@@ -423,11 +423,7 @@ static char     cdr_probe[CDR_SRC_MAX];
 
 static char     cdr_w_target[96];
 static char     cdr_w_mission[CDR_MISSION_MAX];
-static char     cdr_w_full[CDR_FULL_MAX];
-static char     cdr_w_repair[CDR_MISSION_MAX];
 static char     cdr_plan_w[CDR_PLAN_MAX];
-static char     cdr_prompt[3072];
-static char     cdr_reply[4096];
 static char     cdr_report[2048];
 
 static void cdr_sync_inputs(void)
@@ -665,7 +661,9 @@ static void cdr_scan_projects(void)
         path[pl] = '\0';
         while (*p && *p != ',' && *p != ' ') p++;
 
-        if (cdr_ends_with(path, ".soma")) {
+        int dup = 0;                                     /* PARCHE 094: el listado puede repetir archivos (RamFS + disco) */
+        for (int q = 0; q < project_count; q++) if (cdr_eq(projects[q].path, path)) dup = 1;
+        if (!dup && cdr_ends_with(path, ".soma")) {
             struct cdr_proj *it = &projects[project_count];
             const char *last = path;
             const char *q = path;
@@ -743,110 +741,8 @@ static int cdr_cancelled(void)
     return g_job.cancel ? 1 : 0;
 }
 
-static void cdr_make_plan(void)
-{
-    static char exc[704];
-    const char *t;
-    const char *e;
-    cdr_plan_w[0] = '\0';
-    cdr_copy(cdr_prompt, sizeof(cdr_prompt),
-        "Eres el arquitecto de software de SOMA OS. Redacta un PLAN breve (3 a 5 pasos numerados, "
-        "maximo 380 caracteres en total) para esta tarea en SOMA-LANG, un lenguaje propio parecido a "
-        "JavaScript simple (let, fn, if/else, while, for, arrays, tablas, ventanas win.*), NO Python. Tarea: ");
-    cdr_cat(cdr_prompt, sizeof(cdr_prompt), cdr_w_mission);
-    if (cdr_orig_len > 0) {
-        cdr_clean_text(exc, sizeof(exc), cdr_src + 128);
-        cdr_cat(cdr_prompt, sizeof(cdr_prompt), " CODIGO ACTUAL (extracto): ");
-        cdr_cat(cdr_prompt, sizeof(cdr_prompt), exc);
-    }
-    cdr_cat(cdr_prompt, sizeof(cdr_prompt), " Responde SOLO con el plan, sin markdown ni explicaciones.");
-    cdr_reply[0] = '\0';
-    if (!llm_chat(cdr_prompt, cdr_reply, sizeof(cdr_reply), 45000)) {
-        cdr_log("Planificador no disponible: se continua sin plan.");
-        return;
-    }
-    t = cdr_reply;
-    e = cdr_find(cdr_reply, "</think>");
-    if (e) t = e + 8;
-    cdr_clean_text(cdr_plan_w, sizeof(cdr_plan_w), t);
-    /* No inyectar en la mision metarazonamiento, cabeceras de chat ni planes interminables. */
-    if (cdr_len(cdr_plan_w) > 380u ||
-        cdr_find(cdr_reply, "[Razonamiento]") ||
-        cdr_find(cdr_reply, "Here's a thinking process") ||
-        cdr_find(cdr_reply, "Analyze User Input") ||
-        cdr_find(cdr_reply, "Role:") || cdr_find(cdr_reply, "Task:")) {
-        cdr_plan_w[0] = '\0';
-        cdr_lock(&g_job.lock);
-        g_job.plan[0] = '\0';
-        cdr_unlock(&g_job.lock);
-        cdr_log("Plan descartado: contenia metatexto o superaba 380 caracteres; se continua sin contaminar la mision.");
-        return;
-    }
-    cdr_lock(&g_job.lock);
-    cdr_copy(g_job.plan, CDR_PLAN_MAX, cdr_plan_w);
-    cdr_unlock(&g_job.lock);
-    if (cdr_plan_w[0]) cdr_log("Plan elaborado por el arquitecto.");
-    else cdr_log("El planificador no devolvio un plan util.");
-}
 
-static void cdr_build_full_mission(void)
-{
-    cdr_copy(cdr_w_full, sizeof(cdr_w_full), "Archivo objetivo obligatorio: ");
-    cdr_cat(cdr_w_full, sizeof(cdr_w_full), cdr_w_target);
-    /* El espacio antes del salto permite que el extractor de rutas del agente cierre la ruta. */
-    cdr_cat(cdr_w_full, sizeof(cdr_w_full), " \nTarea del usuario: ");
-    cdr_cat_limited(cdr_w_full, sizeof(cdr_w_full), cdr_w_mission, 720);
-    if (cdr_len(cdr_w_mission) > 720u)
-        cdr_cat(cdr_w_full, sizeof(cdr_w_full), " [tarea truncada por límite de contexto]");
-    if (cdr_plan_w[0]) {
-        cdr_cat(cdr_w_full, sizeof(cdr_w_full), " PLAN ACORDADO: ");
-        cdr_cat_limited(cdr_w_full, sizeof(cdr_w_full), cdr_plan_w, 300);
-    }
-    /* Esta instrucción queda al final y no se pierde por desbordamiento silencioso. */
-    cdr_cat(cdr_w_full, sizeof(cdr_w_full),
-            " Escribe el programa SOMA-LANG COMPLETO en la ruta objetivo indicada; no uses placeholders. "
-            "Después valida con compile y lint. No declares éxito sin cambios guardados y verificables.");
-}
 
-static void cdr_build_repair(const char *target, int vr)
-{
-    int i;
-    cdr_copy(cdr_w_repair, sizeof(cdr_w_repair), "Corrige el programa en ");
-    cdr_cat(cdr_w_repair, sizeof(cdr_w_repair), target);
-    cdr_cat(cdr_w_repair, sizeof(cdr_w_repair), ": ");
-    if (cdr_target_unchanged)
-        cdr_cat(cdr_w_repair, sizeof(cdr_w_repair),
-                "el archivo sigue idéntico a la versión inicial: aplica la misión solicitada y guarda el resultado. ");
-    if (vr < 0) {
-        cdr_cat(cdr_w_repair, sizeof(cdr_w_repair),
-                "el archivo no existe o esta vacio. Escribe el programa COMPLETO con write. Tarea original: ");
-        cdr_cat(cdr_w_repair, sizeof(cdr_w_repair), cdr_w_mission);
-        return;
-    }
-    if (vr == 0 && cdr_diag_valid) {
-        cdr_cat(cdr_w_repair, sizeof(cdr_w_repair), "[COMPILER ERROR L");
-        cdr_cat_u32(cdr_w_repair, sizeof(cdr_w_repair), (uint32_t)cdr_diag.line);
-        cdr_cat(cdr_w_repair, sizeof(cdr_w_repair), "]: ");
-        cdr_cat(cdr_w_repair, sizeof(cdr_w_repair), cdr_diag.msg);
-        cdr_cat(cdr_w_repair, sizeof(cdr_w_repair), " cerca de ");
-        cdr_cat(cdr_w_repair, sizeof(cdr_w_repair), cdr_diag.token);
-        cdr_cat(cdr_w_repair, sizeof(cdr_w_repair), ".");
-        if (cdr_diag.snippet[0]) {
-            cdr_cat(cdr_w_repair, sizeof(cdr_w_repair), " Linea con el fallo: ");
-            cdr_cat(cdr_w_repair, sizeof(cdr_w_repair), cdr_diag.snippet);
-            cdr_cat(cdr_w_repair, sizeof(cdr_w_repair), ".");
-        }
-    }
-    for (i = 0; i < cdr_rep.count; ++i) {
-        if (cdr_rep.msg[i][0] == 'E') {
-            cdr_cat(cdr_w_repair, sizeof(cdr_w_repair), " ");
-            cdr_cat(cdr_w_repair, sizeof(cdr_w_repair), cdr_rep.msg[i]);
-            cdr_cat(cdr_w_repair, sizeof(cdr_w_repair), ".");
-        }
-    }
-    cdr_cat(cdr_w_repair, sizeof(cdr_w_repair),
-            " Reescribe el archivo COMPLETO corregido con write, valida con compile y revisa con lint.");
-}
 
 static void cdr_write_report(const char *target, int ok, int repairs, const char *summary)
 {
@@ -871,6 +767,13 @@ static void cdr_write_report(const char *target, int ok, int repairs, const char
     if (cdr_rep.count == 0) cdr_cat(cdr_report, sizeof(cdr_report), "  (sin avisos)\n");
     vfs_write(CDR_REPORT_FILE, cdr_report, cdr_len(cdr_report));
 }
+
+static int cdr_force_new;
+/* PARCHE 096: adaptadores del entorno del nucleo agentico */
+static int cdr_env_llm(const char *prompt, char *out, uint32_t max, uint32_t to) { return llm_chat(prompt, out, max, to); }
+static int cdr_env_read(const char *path, char *buf, uint32_t max) { return vfs_read(path, buf, max); }
+static int cdr_env_write(const char *path, const char *buf, uint32_t len) { return vfs_write(path, buf, len); }
+static void cdr_env_status(int phase, const char *desc, const char *thought) { cdr_set_state(CODER_JOB_WORKING, phase, desc, thought); }
 
 static void coder_worker_thread(void *arg)
 {
@@ -904,77 +807,50 @@ static void coder_worker_thread(void *arg)
     }
     if (backup_state > 0) cdr_log("Copia de seguridad creada en /tmp/coder_prev.bak");
 
-    /* FASE 1: Planificacion */
-    cdr_set_state(CODER_JOB_WORKING, 1,
-                  "Fase 1/6: Elaborando plan de arquitectura con el LLM...",
-                  "Analizando requisitos, contexto del archivo y diseno...");
-    cdr_make_plan();
-    if (cdr_cancelled()) { cancelled = 1; goto done; }
-
-    /* FASE 2: Generacion de codigo */
-    cdr_build_full_mission();
-    cdr_set_state(CODER_JOB_WORKING, 2,
-                  "Fase 2/6: Generando codigo con el Agente Coder...",
-                  "Escribiendo programa con bucle de validacion en Ring 0...");
-    agent_run("coder", cdr_w_full);
-    if (cdr_cancelled()) { cancelled = 1; goto done; }
-
-    /* FASE 3: Verificacion (Compilacion + Lint) */
-    cdr_set_state(CODER_JOB_WORKING, 3,
-                  "Fase 3/6: Verificando bytecode y analisis estatico...",
-                  "Validando sintaxis estricta, tipos y patrones de ejecucion...");
-    thread_sleep(60);
-    vr = cdr_verify_after_change(cdr_w_target);
-    cdr_publish_lint();
-
-    /* FASE 4: Auto-reparacion iterativa */
-    while (vr <= 0 && attempt < CDR_MAX_REPAIRS && !cdr_cancelled()) {
-        attempt++;
+    /* PARCHE 096: nucleo agentico nuevo (coder_core.c): generar -> normalizar -> compilar/lint -> reparar con el diagnostico,
+     * mejor candidato, revision critica y una sola escritura final. El archivo no se toca hasta tener un programa correcto. */
+    {
+        static struct cc_result cr;
+        struct cc_env env;
+        /* PARCHE 100: la estructura se pone a cero ENTERA. env.trace quedaba sin inicializar (basura de la pila) y el nucleo
+         * saltaba a una direccion invalida: KERNEL PANIC con RIP=0xCCCCCCCD en el hilo coder_bg. */
+        for (uint32_t zi = 0; zi < sizeof env; zi++) ((uint8_t *)&env)[zi] = 0;
+        env.force_new = cdr_force_new;
+        env.llm = cdr_env_llm; env.read = cdr_env_read; env.write = cdr_env_write;
+        env.log = cdr_log; env.status = cdr_env_status; env.cancelled = cdr_cancelled; env.max_llm_calls = 7;
+        cc_run(&env, cdr_w_target, cdr_w_mission, &cr);
+        attempt = cr.repairs + cr.regenerations;
         cdr_lock(&g_job.lock);
+        cdr_copy(g_job.plan, CDR_PLAN_MAX, cr.plan);
         g_job.attempt = attempt;
         cdr_unlock(&g_job.lock);
-
-        desc[0] = '\0';
-        cdr_copy(desc, sizeof(desc), "Fase 4/6: Auto-reparando (intento ");
-        cdr_cat_u32(desc, sizeof(desc), (uint32_t)attempt);
-        cdr_cat(desc, sizeof(desc), "/3)...");
-
-        tmp[0] = '\0';
-        cdr_diag_text(tmp, sizeof(tmp));
-        cdr_set_state(CODER_JOB_WORKING, 4, desc, tmp);
-
-        cdr_log("Fallo detectado; solicitando auto-reparacion guiada...");
-        cdr_build_repair(cdr_w_target, vr);
-        agent_run("coder", cdr_w_repair);
-
-        if (cdr_cancelled()) { cancelled = 1; goto done; }
+        cdr_copy(cdr_plan_w, sizeof(cdr_plan_w), cr.plan);
+        {
+            char m[CDR_LOG_LEN]; m[0] = 0;
+            cdr_cat(m, sizeof m, "Metricas: "); cdr_cat_u32(m, sizeof m, (uint32_t)cr.llm_calls); cdr_cat(m, sizeof m, " llamadas, ");
+            cdr_cat_u32(m, sizeof m, (uint32_t)cr.repairs); cdr_cat(m, sizeof m, " reparaciones, ");
+            cdr_cat_u32(m, sizeof m, (uint32_t)cr.auto_fixes); cdr_cat(m, sizeof m, " correcciones automaticas");
+            cdr_log(m);
+        }
+        if (cr.cancelled) { cancelled = 1; goto done; }
         vr = cdr_verify_after_change(cdr_w_target);
         cdr_publish_lint();
-    }
-    if (cdr_cancelled()) { cancelled = 1; goto done; }
-
-    /* FASE 5: Revision final y Rollback si no compila */
-    cdr_set_state(CODER_JOB_WORKING, 5,
-                  "Fase 5/6: Revision de calidad y consistencia...",
-                  "Comprobando integridad final del archivo...");
-    thread_sleep(40);
-    vr = cdr_verify_after_change(cdr_w_target);
-    cdr_publish_lint();
-
-    if (vr > 0) {
-        ok = 1;
-    } else {
-        ok = 0;
-        if (backup_state > 0) {
-            cdr_log("Compilacion fallida: revirtiendo a la version anterior...");
-            if (cdr_backup_restore(cdr_w_target)) {
-                cdr_log("Rollback completado con exito.");
-            } else {
-                cdr_log("Error al aplicar rollback desde copia.");
-            }
-        } else if (!cdr_target_preexisted) {
-            if (vfs_delete(cdr_w_target) == 0)
-                cdr_log("Archivo nuevo eliminado porque no superó la verificación final.");
+        ok = cr.ok && vr > 0;
+        if (!ok && cr.wrote && backup_state > 0) {            /* no deberia pasar: escrito pero no verifica en el kernel */
+            cdr_log("La verificacion final no coincide: se restaura la copia.");
+            cdr_backup_restore(cdr_w_target);
+        }
+        if (!ok && !cr.wrote) {
+            cdr_copy(cdr_check_msg, sizeof(cdr_check_msg), cr.last_error);
+            cdr_lock(&g_job.lock);
+            cdr_copy(g_job.phase_desc, sizeof(g_job.phase_desc), cr.last_error[0] ? cr.last_error : cr.summary);
+            cdr_unlock(&g_job.lock);
+        }
+        if (!ok) {
+            cdr_set_state(CODER_JOB_ERROR, 6, cr.last_error[0] ? cr.last_error : cr.summary, cr.summary);
+            cdr_write_report(cdr_w_target, 0, attempt, cr.summary);
+            g_need_rescan = 1; g_need_reload = 1;
+            return;
         }
     }
 
@@ -1012,6 +888,16 @@ done:
     g_need_reload = 1;
 }
 
+/* PARCHE 098: las apps se lanzan SIEMPRE en su propio hilo (con buffer de salida, el despachador las pone en segundo plano);
+ * antes se ejecutaban dentro del hilo del escritorio y un bucle de juego lo congelaba todo. */
+static void cdr_run_app(const char *path)
+{
+    static char out[512]; char cmd[160];
+    cdr_copy(cmd, sizeof cmd, "app "); cdr_cat(cmd, sizeof cmd, path);
+    out[0] = 0;
+    dispatch_command(cmd, out, sizeof out);
+}
+static int cdr_has_ci(const char *h, const char *n);
 static void cdr_launch_job(const char *target, const char *mission)
 {
     char norm[96];
@@ -1049,11 +935,33 @@ static void coder_start_creation(void)
 {
     cdr_sync_inputs();
     if (input_create_len == 0) return;
+    /* PARCHE 098: si la ruta es la de ejemplo (calc.soma) o ya existe otro programa con ese nombre, el nombre sale de la mision
+     * y nunca se pisa un programa existente: crear es crear, no modificar la calculadora. */
+    {
+        int deflt = !input_create_file[0] || (cdr_eq(input_create_file, "/workspace/calc.soma") && !cdr_has_ci(input_create_prompt, "calc"));
+        if (input_create_file[0] && input_create_file[0] != '/') { char t[96]; cdr_copy(t, sizeof t, "/workspace/"); cdr_cat(t, sizeof t, input_create_file); cdr_copy(input_create_file, sizeof input_create_file, t); }
+        if (!deflt && !cdr_ends_with(input_create_file, ".soma")) cdr_cat(input_create_file, sizeof input_create_file, ".soma");
+        if (deflt || vfs_size(input_create_file) > 0) {
+            char t[96], base[96];
+            if (deflt) coder_pick_target(input_create_prompt, base, sizeof base); else cdr_copy(base, sizeof base, input_create_file);
+            cdr_copy(t, sizeof t, base);
+            for (uint32_t k = 2; vfs_size(t) > 0 && k < 100; k++) {
+                uint32_t L = cdr_len(base); cdr_copy(t, sizeof t, base);
+                if (L > 5) t[L - 5] = 0;
+                cdr_cat(t, sizeof t, "_"); cdr_cat_u32(t, sizeof t, k); cdr_cat(t, sizeof t, ".soma");
+            }
+            cdr_copy(input_create_file, sizeof input_create_file, t);
+            input_create_file_len = cdr_len(input_create_file);
+            char m[128]; cdr_copy(m, sizeof m, "Archivo nuevo: "); cdr_cat(m, sizeof m, t); cdr_log(m);
+        }
+    }
+    cdr_force_new = 1;
     cdr_launch_job(input_create_file, input_create_prompt);
 }
 
 static void coder_start_modification(void)
 {
+    cdr_force_new = 0;
     cdr_sync_inputs();
     if (input_mod_len == 0) return;
     cdr_launch_job(mod_current_file, input_mod_prompt);
@@ -1081,14 +989,15 @@ void coder_app_notify_thought(const char *txt)
 void coder_app_load_project(const char *path)
 {
     cdr_load_mod_file(path);
-    cdr_tab_cur = CDR_TAB_MODIFY;
+    cdr_open_in_editor(path);
 }
 
 void coder_app_init(void)
 {
     cdr_ensure_init();
-    cdr_tab_cur = CDR_TAB_NEW;
+    cdr_tab_cur = CDR_TAB_EDITOR;                /* PARCHE 093 */
     cdr_scan_projects();
+    if (ide_inited) return;                      /* conserva el archivo abierto y sus cambios */
     if (project_count > 0 && !mod_loaded) {
         cdr_load_mod_file(projects[0].path);
     } else {
@@ -1101,155 +1010,805 @@ void coder_app_init(void)
  * ------------------------------------------------------------------------ */
 static void cdr_draw_btn(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                          const char *lbl, uint32_t bg, uint32_t brd, uint32_t txt)
-{
-    fb_fill_rounded_rect((int32_t)x, (int32_t)y, (int32_t)w, (int32_t)h, 4, bg);
-    fb_draw_rounded_rect((int32_t)x, (int32_t)y, (int32_t)w, (int32_t)h, 4, brd);
-    font_draw_string(x + 10, y + (h - 8) / 2, lbl, txt, 1);
+{   /* PARCHE 094: botones planos redondeados; los neutros sin borde, los de accion con tinte y contorno suave */
+    int neutral = (brd == CDR_C_BORDER2 || brd == CDR_C_BORDER);
+    if (neutral) { bg = 0x00182132u; txt = (txt == CDR_C_SOFT || txt == CDR_C_GRAY) ? 0x00D5DCE8u : txt; }
+    fb_fill_rounded_rect((int32_t)x, (int32_t)y, (int32_t)w, (int32_t)h, 7, bg);
+    if (!neutral) fb_stroke_rrect_aa((int32_t)x, (int32_t)y, (int32_t)w, (int32_t)h, 7, 0x90000000u | brd);
+    else fb_fill_rect(x + 7, y, w > 14 ? w - 14 : 1, 1, 0x00222C40u);
+    int tw = cdr_tw(lbl);
+    font_draw_string(x + (uint32_t)(((int)w - tw) / 2 > 4 ? ((int)w - tw) / 2 : 6), y + (h - 9) / 2, lbl, txt, 1);
 }
 
 static void cdr_draw_tab_btn(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                              const char *title, int active)
-{
-    uint32_t bg = active ? 0x001E293Bu : 0x000F172Au;
-    uint32_t border = active ? CDR_C_GREEN : CDR_C_BORDER2;
-    uint32_t txt = active ? CDR_C_WHITE : CDR_C_GRAY;
-
-    fb_fill_rounded_rect((int32_t)x, (int32_t)y, (int32_t)w, (int32_t)h, 4, bg);
-    fb_draw_rounded_rect((int32_t)x, (int32_t)y, (int32_t)w, (int32_t)h, 4, border);
+{   /* PARCHE 094: pestanas de tipo subrayado */
+    int tw = cdr_tw(title);
     if (active) {
-        fb_fill_rect(x + 4, y + h - 3, w - 8, 2, CDR_C_GREEN);
+        fb_fill_rounded_rect((int32_t)x, (int32_t)y, (int32_t)w, (int32_t)h, 7, 0x00162036u);
+        fb_fill_rounded_rect((int32_t)(x + 12), (int32_t)(y + h - 3), (int32_t)(w - 24), 3, 1, CDR_C_GREEN);
     }
-    font_draw_string(x + 12, y + 8, title, txt, 1);
+    font_draw_string(x + (uint32_t)((int)w - tw) / 2, y + (h - 9) / 2 - 1, title, active ? CDR_C_WHITE : CDR_C_DIM, 1);
 }
 
-static void cdr_draw_stepper(uint32_t x, uint32_t y, uint32_t w, int phase, enum coder_job_state st)
-{
-    static const char *const titles[CDR_PHASES] = {
-        "1. Plan", "2. Codigo", "3. Lint", "4. Reparar", "5. Revision", "6. Entrega"
-    };
-    uint32_t pw = w / CDR_PHASES;
-    int s;
-    for (s = 0; s < CDR_PHASES; ++s) {
-        uint32_t sx = x + (uint32_t)s * pw;
-        uint32_t col = CDR_C_BORDER2;
-        uint32_t tcol = CDR_C_DIM;
-        int step_num = s + 1;
 
-        if (st == CODER_JOB_SUCCESS) {
-            col = CDR_C_GREEN; tcol = CDR_C_GREEN;
-        } else if (phase > step_num) {
-            col = CDR_C_GREEN; tcol = CDR_C_GREEN;
-        } else if (phase == step_num) {
-            if (st == CODER_JOB_ERROR) { col = CDR_C_RED; tcol = CDR_C_RED; }
-            else { col = CDR_C_CYAN; tcol = CDR_C_WHITE; }
-        }
-        fb_fill_rect(sx, y, pw - 4, 3, col);
-        font_draw_string(sx, y + 6, titles[s], tcol, 1);
+
+
+
+
+/* ========================================================================
+ * PARCHE 093: SOMA Studio -- editor profesional (pestana EDITOR)
+ * El usuario ve y modifica el codigo a mano y, cuando quiere, pide a SOMA un cambio sobre el mismo archivo;
+ * el resultado del agente entra como una edicion mas (Ctrl+Z la deshace).
+ * ======================================================================== */
+extern int keyboard_ctrl_held(void);
+extern int keyboard_shift_held(void);
+
+struct ide_btn { int x, y, w, h; int id; };
+enum { IB_NEW = 1, IB_OPEN, IB_SAVE, IB_SAVEAS, IB_UNDO, IB_REDO, IB_FIND, IB_REPL, IB_GOTO, IB_COMMENT, IB_VERIFY, IB_RUN, IB_IA, IB_IA_FIELD, IB_IA_CANCEL };
+static struct ide_btn ide_btns[24]; static int ide_nb;
+static int  ide_focus;           /* 0 editor, 1 campo IA */
+static char ide_ia[384]; static int ide_ia_len;
+static char ide_msg[160]; static uint32_t ide_msg_col = CDR_C_GRAY;
+static char ide_prob[4][112]; static int ide_prob_line[4], ide_prob_n, ide_prob_ok = -1;
+static int  ide_was_working, ide_job_mine;
+static char ide_job_target[96];
+static int  ide_ex_x, ide_ex_y, ide_ex_w, ide_ex_rows, ide_ex_scroll, ide_ex_armed = -1, ide_ex_hover = -1;
+static int  ide_ed_x, ide_ed_y, ide_ed_w, ide_ed_h, ide_pr_y;
+static struct soma_lint_report ide_rep;
+/* ---- campos ---- */
+static struct tfield tf_cprompt, tf_cfile, tf_search, tf_rename, tf_ia;
+static char ui_search[64], ui_renbuf[96];
+static struct tfield *ui_focus;                 /* campo con el foco en CREAR/PROYECTOS (0 = ninguno) */
+static int ui_tf_ready;
+static void ui_tf_init(void)
+{
+    if (ui_tf_ready) return;
+    ui_tf_ready = 1;
+    tf_init(&tf_cprompt, input_create_prompt, sizeof input_create_prompt, 1);
+    tf_init(&tf_cfile, input_create_file, sizeof input_create_file, 0);
+    tf_init(&tf_search, ui_search, sizeof ui_search, 0);
+    tf_init(&tf_rename, ui_renbuf, sizeof ui_renbuf, 0);
+    tf_init(&tf_ia, ide_ia, sizeof ide_ia, 0);
+    ui_focus = &tf_cprompt;
+}
+
+
+
+static void ide_say(const char *m, uint32_t col) { cdr_copy(ide_msg, sizeof ide_msg, m); ide_msg_col = col; }
+
+static void ide_open(const char *path)
+{
+    int r = ce_load(path);
+    ide_prob_n = 0; ide_prob_ok = -1; ce_set_error(0, 0);
+    if (r < 0) { ide_say("Archivo demasiado grande para el editor (maximo 256 KiB).", CDR_C_RED); return; }
+    char m[160]; cdr_copy(m, sizeof m, r ? "Abierto " : "Nuevo archivo (aun no existe): "); cdr_cat(m, sizeof m, path);
+    ide_say(m, r ? CDR_C_GRAY : CDR_C_AMBER);
+    cdr_copy(mod_current_file, sizeof mod_current_file, path);
+    ide_focus = 0;
+}
+static void cdr_open_in_editor(const char *path) { if (path && *path) { ide_open(path); ide_inited = 1; } cdr_tab_cur = CDR_TAB_EDITOR; }
+
+static int ide_verify(void)
+{
+    uint32_t len = 0; const char *t = ce_text(&len);
+    struct cdr_snap sn; cdr_snapshot(&sn);
+    if (sn.state == CODER_JOB_WORKING) { ide_say("El compilador esta ocupado con la tarea de SOMA; espera a que termine.", CDR_C_AMBER); return -1; }
+    uint8_t *bc = (uint8_t *)kmalloc(65536); uint32_t bl = 0;
+    if (!bc) { ide_say("Sin memoria para compilar.", CDR_C_RED); return -1; }
+    ide_rep.count = ide_rep.hard = 0;
+    lang_lint(t, len, &ide_rep);
+    int bad = lang_compile(t, len, bc, 65536, &bl) != 0;
+    kfree(bc);
+    ide_prob_n = 0; ce_set_error(0, 0);
+    if (bad) {
+        struct soma_compile_diag d; lang_get_diagnostic(&d);
+        char m[112]; cdr_copy(m, sizeof m, "Linea "); cdr_cat_u32(m, sizeof m, d.line); cdr_cat(m, sizeof m, ": "); cdr_cat(m, sizeof m, d.msg);
+        cdr_copy(ide_prob[0], sizeof ide_prob[0], m); ide_prob_line[0] = (int)d.line; ide_prob_n = 1;
+        ce_set_error((int)d.line, d.msg);
+        if (d.line) ce_goto_line((int)d.line);
     }
+    for (uint32_t i = 0; i < ide_rep.count && ide_prob_n < 4; i++) { cdr_copy(ide_prob[ide_prob_n], sizeof ide_prob[0], ide_rep.msg[i]); ide_prob_line[ide_prob_n++] = 0; }
+    ide_prob_ok = (!bad && ide_rep.hard == 0);
+    if (ide_prob_ok) { char m[96]; cdr_copy(m, sizeof m, "Compilacion correcta: "); cdr_cat_u32(m, sizeof m, bl); cdr_cat(m, sizeof m, " bytes de bytecode, 0 errores."); ide_say(m, CDR_C_GREEN); }
+    else ide_say(bad ? "Error de compilacion: revisa la linea marcada." : "El analisis estatico encontro errores graves.", CDR_C_RED);
+    return ide_prob_ok;
 }
-
-static uint32_t cdr_token_color(const char *t)
+static int ide_save(void)
 {
-    if (cdr_eq(t, "let") || cdr_eq(t, "fn") || cdr_eq(t, "return")) return CDR_C_DECL;
-    if (cdr_eq(t, "if") || cdr_eq(t, "else") || cdr_eq(t, "while") || cdr_eq(t, "for") ||
-        cdr_eq(t, "break") || cdr_eq(t, "continue")) return CDR_C_KW;
-    if (cdr_eq(t, "win") || cdr_eq(t, "fb") || cdr_eq(t, "sys") ||
-        cdr_eq(t, "vfs") || cdr_eq(t, "mem")) return CDR_C_NS;
-    if (cdr_eq(t, "true") || cdr_eq(t, "false") || cdr_eq(t, "nil")) return CDR_C_NUM;
-    return CDR_C_TXT;
+    if (!ce_save()) { ide_say("No se pudo guardar (ruta protegida o sin espacio).", CDR_C_RED); return 0; }
+    char m[160]; cdr_copy(m, sizeof m, "Guardado "); cdr_cat(m, sizeof m, ce_path()); ide_say(m, CDR_C_GREEN);
+    cdr_copy(mod_current_file, sizeof mod_current_file, ce_path());
+    cdr_scan_projects();
+    return 1;
 }
-
-static void cdr_draw_code_line(uint32_t x, uint32_t y, const char *line, uint32_t len)
+static void ide_run(void)
 {
-    uint32_t i = 0, px = x;
-    while (i < len) {
-        if (line[i] == ' ') { px += 8; i++; continue; }
-        if (line[i] == '/' && i + 1 < len && line[i + 1] == '/') {
-            char cm[128]; uint32_t cl = 0;
-            while (i < len && cl + 1 < sizeof(cm)) cm[cl++] = line[i++];
-            cm[cl] = '\0';
-            font_draw_string(px, y, cm, CDR_C_COMMENT, 1);
-            break;
+    if (ce_dirty() && !ide_save()) return;
+    if (ide_verify() != 1) return;
+    cdr_run_app(ce_path());
+    ide_say("Programa lanzado.", CDR_C_CYAN);
+}
+static void ide_ask_soma(void)
+{
+    struct cdr_snap sn; cdr_snapshot(&sn);
+    if (sn.state == CODER_JOB_WORKING) { ide_say("SOMA ya esta trabajando en otra tarea.", CDR_C_AMBER); return; }
+    if (!ide_ia_len) { ide_focus = 1; ide_say("Escribe que quieres que cambie SOMA en este archivo.", CDR_C_AMBER); return; }
+    if (ce_dirty() && !ide_save()) return;
+    cdr_copy(mod_current_file, sizeof mod_current_file, ce_path());
+    cdr_copy(input_mod_prompt, sizeof input_mod_prompt, ide_ia);
+    coder_start_modification();
+    cdr_snapshot(&sn);
+    if (sn.state == CODER_JOB_WORKING) { ide_job_mine = 1; cdr_copy(ide_job_target, sizeof ide_job_target, sn.target_file); ide_say("SOMA esta modificando el archivo...", CDR_C_CYAN); }
+}
+static void ide_track_job(const struct cdr_snap *sn)
+{
+    int working = sn->state == CODER_JOB_WORKING;
+    int same = cdr_eq(sn->target_file, ce_path());
+    if (working && same) ce_set_readonly(1, "SOMA esta modificando este archivo: se puede leer y copiar, pero no editar.");
+    if (ide_was_working && !working) {
+        ce_set_readonly(0, 0);
+        if (same) {
+            if (sn->state == CODER_JOB_SUCCESS) {
+                if (ce_reload_keep_undo()) { ide_say("Cambios de SOMA aplicados y verificados (compila). Ctrl+Z los deshace.", CDR_C_GREEN); ide_prob_ok = 1; }
+                else ide_say("SOMA termino sin cambiar el archivo.", CDR_C_AMBER);
+                ide_ia_len = 0; tf_set(&tf_ia, ""); ide_prob_n = 0; ce_set_error(0, 0);
+            } else ide_say("SOMA no pudo completar el cambio; el archivo queda como estaba.", CDR_C_RED);
         }
-        if (line[i] == '"' || line[i] == '\'') {
-            char q = line[i]; char st[128]; uint32_t sl = 0;
-            st[sl++] = line[i++];
-            while (i < len && line[i] != q && sl + 2 < sizeof(st)) st[sl++] = line[i++];
-            if (i < len && line[i] == q) st[sl++] = line[i++];
-            st[sl] = '\0';
-            font_draw_string(px, y, st, CDR_C_STR, 1);
-            px += sl * 8;
-            continue;
-        }
-        if (cdr_isalpha(line[i])) {
-            char id[32]; uint32_t il = 0;
-            while (i < len && cdr_isalnum(line[i]) && il + 1 < sizeof(id)) id[il++] = line[i++];
-            id[il] = '\0';
-            font_draw_string(px, y, id, cdr_token_color(id), 1);
-            px += il * 8;
-            continue;
-        }
-        if (line[i] >= '0' && line[i] <= '9') {
-            char nm[32]; uint32_t nl = 0;
-            while (i < len && (cdr_isalnum(line[i]) || line[i] == 'x' || line[i] == 'X') && nl + 1 < sizeof(nm))
-                nm[nl++] = line[i++];
-            nm[nl] = '\0';
-            font_draw_string(px, y, nm, CDR_C_NUM, 1);
-            px += nl * 8;
-            continue;
-        }
-        {
-            char ch[2]; ch[0] = line[i++]; ch[1] = '\0';
-            font_draw_string(px, y, ch, CDR_C_SOFT, 1);
-            px += 8;
-        }
+        ide_job_mine = 0;
     }
+    ide_was_working = working;
 }
-
-static void cdr_render_code_viewer(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+static void ide_add_btn(int *x, int y, const char *t, int id, uint32_t bg, uint32_t br, uint32_t tx)
 {
-    const char *p;
-    uint32_t cur_line = 0, drawn = 0;
-    fb_fill_rect(x, y, w, h, 0x0003050Bu);
-    fb_draw_rect(x, y, w, h, CDR_C_BORDER);
-    fb_fill_rect(x, y, 48, h, 0x0009101Eu);
-    fb_fill_rect(x + 48, y, 1, h, CDR_C_BORDER);
+    int w = cdr_tw(t) + (id == IB_RUN ? 40 : 24);
+    cdr_draw_btn((uint32_t)*x, (uint32_t)y, (uint32_t)w, 28, t, bg, br, tx);
+    if (ide_nb < 24) { ide_btns[ide_nb].x = *x; ide_btns[ide_nb].y = y; ide_btns[ide_nb].w = w; ide_btns[ide_nb].h = 28; ide_btns[ide_nb].id = id; ide_nb++; }
+    *x += w + 6;
+}
+static void ide_sep(int *x, int y) { fb_fill_rect((uint32_t)(*x + 3), (uint32_t)(y + 6), 1, 16, 0x00263043u); *x += 10; }
 
-    mod_vis_lines = (int)(h / 14u);
-    if (mod_vis_lines < 1) mod_vis_lines = 1;
-    fb_set_clip((int32_t)(x + 52), (int32_t)(y + 2), (int32_t)cdr_sub(w, 54), (int32_t)cdr_sub(h, 4));
+/* PARCHE 094: tarjeta redondeada con contorno suave */
+static void ide_card(int x, int y, int w, int h, uint32_t bg, uint32_t edge)
+{
+    fb_fill_rounded_rect(x, y, w, h, 10, bg);
+    fb_stroke_rrect_aa(x, y, w, h, 10, 0xFF000000u | edge);
+}
+static const char *ide_base(const char *p) { const char *n = p; for (; *p; p++) if (*p == '/') n = p + 1; return n; }
 
-    p = mod_code;
-    while (*p && (int)drawn < mod_vis_lines) {
-        const char *ls = p;
-        uint32_t llen = 0;
-        char num[8];
-        while (*p && *p != '\n' && *p != '\r') { llen++; p++; }
-        if ((int)cur_line >= mod_scroll) {
-            uint32_t ly = y + 3 + drawn * 14;
-            int is_err = (mod_err_line > 0 && (int)(cur_line + 1) == mod_err_line);
-            if (is_err) {
-                fb_fill_rect(x + 49, ly - 1, w - 50, 14, 0x003A121Du);
+static void ide_render(uint32_t win_x, uint32_t win_y, uint32_t win_w, uint32_t win_h, const struct cdr_snap *sn)
+{
+    int x0 = (int)win_x + 12, w = (int)win_w - 24, y0 = (int)win_y + 54, y1 = (int)(win_y + win_h) - 10;
+    int working = sn->state == CODER_JOB_WORKING;
+    ide_nb = 0;
+    ui_tf_init();
+    if (!ide_inited) { ide_inited = 1; ide_open(mod_current_file); }
+    ide_track_job(sn);
+
+    /* ---- barra de herramientas ---- */
+    int bx = x0, by = y0;
+    uint32_t pb = CDR_C_PANEL, pr = CDR_C_BORDER2, pt = CDR_C_SOFT;
+    ide_add_btn(&bx, by, "Nuevo", IB_NEW, pb, pr, pt);
+    ide_add_btn(&bx, by, "Abrir", IB_OPEN, pb, pr, pt);
+    ide_add_btn(&bx, by, "Guardar", IB_SAVE, ce_dirty() ? 0x000E2F26u : pb, ce_dirty() ? CDR_C_GREEN : pr, ce_dirty() ? 0x00A7F3D0u : pt);
+    if (w > 960) ide_add_btn(&bx, by, "Guardar como", IB_SAVEAS, pb, pr, pt);
+    ide_sep(&bx, by);
+    ide_add_btn(&bx, by, "Deshacer", IB_UNDO, pb, pr, pt);
+    ide_add_btn(&bx, by, "Rehacer", IB_REDO, pb, pr, pt);
+    ide_sep(&bx, by);
+    ide_add_btn(&bx, by, "Buscar", IB_FIND, pb, pr, pt);
+    if (w > 840) ide_add_btn(&bx, by, "Reemplazar", IB_REPL, pb, pr, pt);
+    if (w > 780) ide_add_btn(&bx, by, "Ir a", IB_GOTO, pb, pr, pt);
+    if (w > 1040) ide_add_btn(&bx, by, "Comentar", IB_COMMENT, pb, pr, pt);
+    {   /* acciones principales alineadas a la derecha */
+        int rw = cdr_tw("Verificar") + 24 + 6 + cdr_tw("Ejecutar") + 40;
+        int rx = x0 + w - rw; if (rx < bx + 8) rx = bx + 8;
+        ide_add_btn(&rx, by, "Verificar", IB_VERIFY, 0x00241C0Au, CDR_C_AMBER, 0x00FCD34Du);
+        int ex0 = rx; ide_add_btn(&rx, by, "Ejecutar", IB_RUN, 0x00173A7Au, 0x0060A5FAu, CDR_C_WHITE);
+        /* triangulo de "play" */
+        for (int k = 0; k < 8; k++) fb_fill_rect((uint32_t)(ex0 + 11), (uint32_t)(by + 9 + k), (uint32_t)(k < 4 ? k + 1 : 8 - k), 1, CDR_C_WHITE);
+    }
+
+    int body_y = y0 + 36;
+    int status_y = y1 - 24, ia_y = status_y - 48;
+    int prob_h = ide_prob_n ? 30 + ide_prob_n * 18 : 0;
+    int ed_bottom = ia_y - 8 - (prob_h ? prob_h + 8 : 0);
+
+    /* ---- explorador ---- */
+    int ex_w = (w >= 800) ? 220 : 0;
+    ide_ex_w = ex_w;
+    if (ex_w) {
+        ide_ex_x = x0; ide_ex_y = body_y;
+        ide_card(x0, body_y, ex_w, ed_bottom - body_y, 0x000C1220u, 0x001A2335u);
+        font_draw_string((uint32_t)(x0 + 14), (uint32_t)(body_y + 11), "EXPLORADOR", CDR_C_DIM, 1);
+        { char n[12]; n[0] = 0; cdr_cat_u32(n, sizeof n, (uint32_t)project_count); int nw = cdr_tw(n) + 14;
+          fb_fill_rounded_rect(x0 + ex_w - nw - 12, body_y + 8, nw, 18, 9, 0x001A2335u); font_draw_string((uint32_t)(x0 + ex_w - nw - 5), (uint32_t)(body_y + 12), n, CDR_C_GRAY, 1); }
+        int ry = body_y + 34; ide_ex_rows = (ed_bottom - ry - 6) / 26;
+        if (ide_ex_scroll > project_count - 1) ide_ex_scroll = 0;
+        for (int i = ide_ex_scroll; i < project_count && i - ide_ex_scroll < ide_ex_rows; i++) {
+            int open = cdr_eq(projects[i].path, ce_path());
+            if (open) { fb_fill_rounded_rect(x0 + 6, ry, ex_w - 12, 24, 7, 0x00172A4Au); fb_fill_rounded_rect(x0 + 6, ry + 5, 3, 14, 1, CDR_C_CYAN); }
+            if (!open && ide_ex_hover == i) fb_fill_rounded_rect(x0 + 6, ry, ex_w - 12, 24, 7, 0x00121C30u);   /* PARCHE 101: resaltado al pasar el raton */
+            if (ide_ex_armed == i) fb_fill_rounded_rect(x0 + 6, ry, ex_w - 12, 24, 7, 0x003A1520u);
+            fb_set_clip(x0 + 8, ry, ex_w - 16, 24);
+            /* icono de archivo: hoja con esquina doblada, color segun tipo */
+            uint32_t ic = projects[i].is_gui ? CDR_C_GREEN : CDR_C_CYAN;
+            fb_fill_rounded_rect(x0 + 18, ry + 5, 11, 14, 2, ic);
+            fb_fill_rect((uint32_t)(x0 + 25), (uint32_t)(ry + 5), 4, 4, open ? 0x00172A4Au : 0x000C1220u);
+            fb_fill_rect((uint32_t)(x0 + 21), (uint32_t)(ry + 11), 5, 1, 0x000C1220u);
+            fb_fill_rect((uint32_t)(x0 + 21), (uint32_t)(ry + 14), 5, 1, 0x000C1220u);
+            font_draw_string((uint32_t)(x0 + 38), (uint32_t)(ry + 7), projects[i].name, open ? CDR_C_WHITE : 0x00AEB9CCu, 1);
+            {   /* PARCHE 094: mismo nombre en otra carpeta: muestra la carpeta */
+                int twin = 0; for (int q = 0; q < project_count; q++) if (q != i && cdr_eq(projects[q].name, projects[i].name)) twin = 1;
+                if (twin) { char d[64]; cdr_copy(d, sizeof d, projects[i].path); int L = (int)cdr_len(d) - (int)cdr_len(projects[i].name) - 1; if (L <= 0) cdr_copy(d, sizeof d, "/"); else d[L] = 0;
+                    font_draw_string((uint32_t)(x0 + 44 + cdr_tw(projects[i].name)), (uint32_t)(ry + 7), d, 0x00566479u, 1); }
             }
-            cdr_num_pad(num, 4, cur_line + 1);
-            font_draw_string(x + 6, ly, num, is_err ? CDR_C_RED : CDR_C_DIM, 1);
-            cdr_draw_code_line(x + 54, ly, ls, llen);
-            drawn++;
+            if (open && ce_dirty()) fb_fill_rounded_rect(x0 + ex_w - 22, ry + 9, 7, 7, 3, CDR_C_AMBER);
+            fb_reset_clip();
+            ry += 26;
         }
-        cur_line++;
-        if (*p == '\r') p++;
-        if (*p == '\n') p++;
+        if (project_count == 0) font_draw_string((uint32_t)(x0 + 16), (uint32_t)(body_y + 40), "Sin archivos .soma todavia", CDR_C_DIM, 1);
+        if (ide_ex_armed >= 0) {
+            fb_fill_rounded_rect(x0 + 8, ed_bottom - 50, ex_w - 16, 42, 8, 0x002A1F0Au);
+            font_draw_string((uint32_t)(x0 + 16), (uint32_t)(ed_bottom - 44), "Hay cambios sin guardar.", CDR_C_AMBER, 1);
+            font_draw_string((uint32_t)(x0 + 16), (uint32_t)(ed_bottom - 26), "Clic otra vez: descartar", 0x00D6B36Au, 1);
+        }
+    }
+
+    /* ---- editor con su pestana ---- */
+    int ex = x0 + (ex_w ? ex_w + 8 : 0), ew = w - (ex_w ? ex_w + 8 : 0);
+    ide_card(ex, body_y, ew, ed_bottom - body_y, 0x000B1120u, 0x001A2335u);
+    {
+        const char *pth = ce_path(), *nm = ide_base(pth);
+        int tw = cdr_tw(nm) + 46;
+        fb_fill_rounded_rect(ex + 1, body_y + 1, ew - 2, 32, 10, 0x000D1426u);
+        fb_fill_rect((uint32_t)(ex + 1), (uint32_t)(body_y + 20), (uint32_t)(ew - 2), 13, 0x000D1426u);
+        fb_fill_rounded_rect(ex + 6, body_y + 6, tw, 27, 7, 0x000B1120u);
+        fb_fill_rect((uint32_t)(ex + 6), (uint32_t)(body_y + 26), (uint32_t)tw, 8, 0x000B1120u);
+        fb_fill_rounded_rect(ex + 14, body_y + 6, tw - 16, 2, 1, CDR_C_CYAN);
+        fb_fill_rounded_rect(ex + 16, body_y + 14, 9, 11, 2, CDR_C_CYAN);
+        font_draw_string((uint32_t)(ex + 32), (uint32_t)(body_y + 14), nm, CDR_C_WHITE, 1);
+        if (ce_dirty()) fb_fill_rounded_rect(ex + tw - 6, body_y + 16, 8, 8, 4, CDR_C_AMBER);
+        fb_set_clip(ex + tw + 14, body_y, ew - tw - 24, 33);
+        font_draw_string((uint32_t)(ex + tw + 18), (uint32_t)(body_y + 14), pth, CDR_C_DIM, 1);
+        fb_reset_clip();
+        fb_fill_rect((uint32_t)(ex + 1), (uint32_t)(body_y + 33), (uint32_t)(ew - 2), 1, 0x001A2335u);
+    }
+    ide_ed_x = ex + 1; ide_ed_y = body_y + 34; ide_ed_w = ew - 2; ide_ed_h = ed_bottom - body_y - 40;
+    ce_render(ide_ed_x, ide_ed_y, ide_ed_w, ide_ed_h, ide_focus == 0);
+
+    /* ---- problemas ---- */
+    ide_pr_y = ed_bottom + 8 + 26;
+    if (ide_prob_n) {
+        int py0 = ed_bottom + 8;
+        ide_card(x0, py0, w, prob_h, 0x00140B12u, 0x003F1A26u);
+        font_draw_string((uint32_t)(x0 + 14), (uint32_t)(py0 + 9), "PROBLEMAS", 0x00FDA4AFu, 1);
+        { char n[12]; n[0] = 0; cdr_cat_u32(n, sizeof n, (uint32_t)ide_prob_n); int nw = cdr_tw(n) + 14;
+          fb_fill_rounded_rect(x0 + 104, py0 + 6, nw, 18, 9, 0x004C1D2Bu); font_draw_string((uint32_t)(x0 + 111), (uint32_t)(py0 + 10), n, 0x00FECDD3u, 1); }
+        for (int i = 0; i < ide_prob_n; i++) {
+            int py = ide_pr_y + 2 + i * 18;
+            uint32_t col = (ide_prob[i][0] == 'W') ? CDR_C_AMBER : 0x00FB7185u;
+            fb_fill_rounded_rect(x0 + 16, py + 3, 9, 9, 4, col);
+            fb_set_clip(x0 + 30, py, w - 44, 18);
+            font_draw_string((uint32_t)(x0 + 34), (uint32_t)(py + 2), ide_prob[i], ide_prob_line[i] ? 0x00FECDD3u : col, 1);
+            fb_reset_clip();
+        }
+    }
+
+    /* ---- barra de SOMA IA ---- */
+    {
+        uint32_t edge = ide_focus == 1 ? CDR_C_GREEN : (working ? 0x002563EBu : 0x001F3A33u);
+        ide_card(x0, ia_y, w, 40, 0x000C1A1Au, edge);
+        /* insignia */
+        fb_fill_rounded_rect(x0 + 8, ia_y + 8, 86, 24, 12, working ? 0x00132A4Au : 0x000F3B2Eu);
+        int pulse = working ? (int)((timer_get_uptime_ms() / 120) % 6) : 0;
+        fb_fill_rounded_rect(x0 + 17, ia_y + 16, 8, 8, 4, working ? (pulse < 3 ? 0x0060A5FAu : 0x001E40AFu) : CDR_C_GREEN);
+        font_draw_string((uint32_t)(x0 + 31), (uint32_t)(ia_y + 14), "SOMA IA", working ? 0x00BFDBFEu : 0x00A7F3D0u, 1);
+        int fx = x0 + 100, bw = working ? cdr_tw("Cancelar") + 24 : cdr_tw("Aplicar con IA") + 24, fw = w - 100 - bw - 18;
+        if (ide_nb < 24) { ide_btns[ide_nb].x = fx; ide_btns[ide_nb].y = ia_y + 7; ide_btns[ide_nb].w = fw; ide_btns[ide_nb].h = 26; ide_btns[ide_nb].id = IB_IA_FIELD; ide_nb++; }
+        if (working) {
+            fb_fill_rounded_rect(fx, ia_y + 7, fw, 26, 8, 0x00070D16u);
+            fb_set_clip(fx + 6, ia_y + 7, fw - 12, 26);
+            font_draw_string((uint32_t)(fx + 12), (uint32_t)(ia_y + 15), sn->live_thought[0] ? sn->live_thought : sn->phase_desc, 0x0093C5FDu, 1);
+            fb_reset_clip();
+        } else tf_render(&tf_ia, fx, ia_y + 7, fw, 26, ide_focus == 1, "Pide un cambio sobre este archivo: anade un boton de reset, explica y comenta el codigo...", CDR_C_WHITE);
+        int bxx = fx + fw + 8;
+        if (working) ide_add_btn(&bxx, ia_y + 7, "Cancelar", IB_IA_CANCEL, 0x003A121Du, CDR_C_RED, 0x00FECDD3u);
+        else ide_add_btn(&bxx, ia_y + 7, "Aplicar con IA", IB_IA, 0x00065F46u, CDR_C_GREEN, CDR_C_WHITE);
+    }
+
+    /* ---- barra de estado ---- */
+    {
+        uint32_t sbg = working ? 0x00122B57u : 0x000D1426u;
+        fb_fill_rounded_rect(x0, status_y, w, 24, 8, sbg);
+        int ln, col, lines, sc; ce_status(&ln, &col, &lines, &sc);
+        char st[128]; st[0] = 0;
+        cdr_cat(st, sizeof st, "Ln "); cdr_cat_u32(st, sizeof st, (uint32_t)ln);
+        cdr_cat(st, sizeof st, ", Col "); cdr_cat_u32(st, sizeof st, (uint32_t)col);
+        if (sc) { cdr_cat(st, sizeof st, "  ("); cdr_cat_u32(st, sizeof st, (uint32_t)sc); cdr_cat(st, sizeof st, " sel.)"); }
+        cdr_cat(st, sizeof st, "   \xC2\xB7   "); cdr_cat_u32(st, sizeof st, (uint32_t)lines);
+        cdr_cat(st, sizeof st, " lineas   \xC2\xB7   UTF-8   \xC2\xB7   SOMA-LANG");
+        int sw = cdr_tw(st);
+        font_draw_string((uint32_t)(x0 + w - sw - 14), (uint32_t)(status_y + 7), st, 0x008391A7u, 1);
+        uint32_t dot = ide_prob_ok == 1 ? CDR_C_GREEN : ide_prob_ok == 0 ? CDR_C_RED : 0x00475569u;
+        const char *dl = ide_prob_ok == 1 ? "Sin errores" : ide_prob_ok == 0 ? "Con errores" : "Sin verificar";
+        int dw = cdr_tw(dl) + 28;
+        fb_fill_rounded_rect(x0 + 4, status_y + 3, dw, 18, 9, ide_prob_ok == 1 ? 0x000F3B2Eu : ide_prob_ok == 0 ? 0x004C1D2Bu : 0x001A2335u);
+        fb_fill_rounded_rect(x0 + 11, status_y + 9, 7, 7, 3, dot);
+        font_draw_string((uint32_t)(x0 + 22), (uint32_t)(status_y + 7), dl, ide_prob_ok == 0 ? 0x00FECDD3u : 0x00CBD5E1u, 1);
+        fb_set_clip(x0 + dw + 14, status_y, w - sw - dw - 40, 24);
+        font_draw_string((uint32_t)(x0 + dw + 16), (uint32_t)(status_y + 7), ide_msg[0] ? ide_msg : "Ctrl+S guardar  \xC2\xB7  Ctrl+F buscar  \xC2\xB7  Ctrl+Z deshacer  \xC2\xB7  Ctrl+E ejecutar", ide_msg[0] ? ide_msg_col : 0x0064748Bu, 1);
+        fb_reset_clip();
+    }
+}
+
+static void ide_action(int act)
+{
+    switch (act) {
+    case CE_ACT_SAVE: ide_save(); break;
+    case CE_ACT_RUN: ide_run(); break;
+    case CE_ACT_VERIFY: ide_verify(); break;
+    case CE_ACT_NEW: ce_new("/workspace/nuevo.soma"); ce_prompt(CE_PR_SAVEAS); ide_say("Archivo nuevo: escribe la ruta y pulsa Intro (o Esc y guardalo mas tarde).", CDR_C_AMBER); break;
+    case CE_ACT_OPEN: { char p[128]; cdr_copy(p, sizeof p, ce_prompt_value()); if (p[0] != '/') { ide_say("La ruta debe empezar por /", CDR_C_RED); break; } ide_open(p); break; }
+    case CE_ACT_SAVEAS: {
+        char p[128]; cdr_copy(p, sizeof p, ce_prompt_value());
+        if (p[0] != '/' || p[cdr_len(p) - 1] == '/') { ide_say("Escribe una ruta completa, por ejemplo /workspace/mi_app.soma", CDR_C_RED); break; }
+        if (ce_save_as(p)) { char m[160]; cdr_copy(m, sizeof m, "Guardado como "); cdr_cat(m, sizeof m, p); ide_say(m, CDR_C_GREEN); cdr_copy(mod_current_file, sizeof mod_current_file, p); cdr_scan_projects(); }
+        else ide_say("No se pudo guardar en esa ruta.", CDR_C_RED);
+        break; }
+    default: break;
+    }
+}
+static int ide_click(int mx, int my)
+{
+    for (int i = 0; i < ide_nb; i++) {
+        struct ide_btn *b = &ide_btns[i];
+        if (mx < b->x || mx >= b->x + b->w || my < b->y || my >= b->y + b->h) continue;
+        switch (b->id) {
+        case IB_NEW: ide_action(CE_ACT_NEW); break;
+        case IB_OPEN: ce_prompt(CE_PR_OPEN); ide_focus = 0; break;
+        case IB_SAVE: ide_save(); break;
+        case IB_SAVEAS: ce_prompt(CE_PR_SAVEAS); ide_focus = 0; break;
+        case IB_UNDO: ce_undo(); break;
+        case IB_REDO: ce_redo(); break;
+        case IB_FIND: ce_prompt(CE_PR_FIND); ide_focus = 0; break;
+        case IB_REPL: ce_prompt(CE_PR_REPLACE); ide_focus = 0; break;
+        case IB_GOTO: ce_prompt(CE_PR_GOTO); ide_focus = 0; break;
+        case IB_COMMENT: ce_toggle_comment(); break;
+        case IB_VERIFY: ide_verify(); break;
+        case IB_RUN: ide_run(); break;
+        case IB_IA: ide_ask_soma(); break;
+        case IB_IA_FIELD: { extern int keyboard_shift_held(void); ide_focus = 1; ui_tf_init(); tf_press(&tf_ia, mx, my, keyboard_shift_held()); } break;
+        case IB_IA_CANCEL: coder_cancel_job(); ide_say("Cancelando la tarea de SOMA...", CDR_C_AMBER); break;
+        }
+        return 1;
+    }
+    if (ide_ex_w && mx >= ide_ex_x && mx < ide_ex_x + ide_ex_w && my >= ide_ex_y + 34 && my < ide_ex_y + 34 + ide_ex_rows * 26) {
+        int i = ide_ex_scroll + (my - ide_ex_y - 34) / 26;          /* PARCHE 101: misma geometria que el dibujo (34 + 26 por fila) */
+        if (i >= 0 && i < project_count) {
+            if (cdr_eq(projects[i].path, ce_path())) { ide_ex_armed = -1; return 1; }
+            if (ce_dirty() && ide_ex_armed != i) { ide_ex_armed = i; ide_say("Hay cambios sin guardar. Pulsa Guardar o haz clic otra vez en el archivo para descartarlos.", CDR_C_AMBER); return 1; }
+            ide_ex_armed = -1; ide_open(projects[i].path);
+        }
+        return 1;
+    }
+    if (ide_ex_w && mx >= ide_ex_x && mx < ide_ex_x + ide_ex_w && my >= ide_ex_y && my < ide_ex_y + 34) return 1;
+    for (int i = 0; i < ide_prob_n; i++)
+        if (ide_prob_line[i] && my >= ide_pr_y + 2 + i * 18 && my < ide_pr_y + 20 + i * 18) { ce_goto_line(ide_prob_line[i]); ide_focus = 0; return 1; }
+    if (ce_press(mx, my)) { ide_focus = 0; ide_ex_armed = -1; return 1; }
+    return 0;
+}
+static void ide_key(char c)
+{
+    int k = (uint8_t)c;
+    if (ide_focus == 1) {                                  /* PARCHE 099: campo de texto completo */
+        extern int keyboard_last_mods(void);
+        int md = keyboard_last_mods();
+        ui_tf_init();
+        int r = tf_key(&tf_ia, c, (md & 1) || keyboard_ctrl_held(), (md & 2) || keyboard_shift_held());
+        ide_ia_len = (int)cdr_len(ide_ia);
+        if (r == TF_ESC || r == TF_TAB) ide_focus = 0;
+        else if (r == TF_ENTER) ide_ask_soma();
+        (void)k;
+        return;
+    }
+    extern int keyboard_last_mods(void);
+    int md = keyboard_last_mods();                    /* PARCHE 094: Ctrl/Mayus guardados con la propia tecla */
+    int act = ce_key(c, (md & 1) || keyboard_ctrl_held(), (md & 2) || keyboard_shift_held());
+    if (act >= CE_ACT_SAVE) ide_action(act);
+}
+
+
+/* ========================================================================
+ * PARCHE 099: pestanas CREAR CON IA, PROYECTOS y REGISTRO rehechas.
+ * - Campos de texto de verdad (textfield.c): cursor, seleccion con raton y teclado, doble clic, Ctrl+A, portapapeles.
+ * - Registro de zonas pulsables: cada boton se registra al pintarlo, asi el clic cae SIEMPRE donde se ve.
+ * ======================================================================== */
+enum { UB_GEN = 1, UB_CANCEL, UB_RUN, UB_EDIT, UB_TPL0, UB_TPL_END = UB_TPL0 + 8, UB_AUTO,
+       UB_PRUN, UB_PEDIT, UB_PNOTES, UB_PDUP, UB_PREN, UB_PDEL, UB_PDELOK, UB_PROW0 = 100, UB_PROW_END = 400,
+       UB_LCOPY = 500, UB_LTRACE, UB_LCLEAR };
+struct ui_hit { int x, y, w, h, id; };
+static struct ui_hit ui_hits[96]; static int ui_nh;
+static void ui_reg(int x, int y, int w, int h, int id) { if (ui_nh < 96) { ui_hits[ui_nh].x = x; ui_hits[ui_nh].y = y; ui_hits[ui_nh].w = w; ui_hits[ui_nh].h = h; ui_hits[ui_nh].id = id; ui_nh++; } }
+static int ui_btn(int x, int y, const char *t, int id, uint32_t bg, uint32_t br, uint32_t tx)
+{
+    int w = cdr_tw(t) + 28;
+    cdr_draw_btn((uint32_t)x, (uint32_t)y, (uint32_t)w, 32, t, bg, br, tx);
+    ui_reg(x, y, w, 32, id);
+    return w;
+}
+/* texto con ajuste de linea por palabras; devuelve la y final */
+static int ui_wrap(int x, int y, int w, const char *t, uint32_t col, int max_lines, int lh)
+{
+    char line[256]; int n = 0, lines = 0;
+    const char *p = t;
+    while (*p && lines < max_lines) {
+        line[0] = 0; n = 0;
+        const char *best = p; int bn = 0;
+        const char *q = p;
+        while (*q && *q != '\n' && n < 250) {
+            line[n++] = *q; line[n] = 0;
+            if (cdr_tw(line) > w) { n--; line[n] = 0; break; }
+            q++;
+            if (*q == ' ' || *q == 0 || *q == '\n') { best = q; bn = n; }
+        }
+        if (*q && *q != '\n' && bn > 0 && n < 250) { line[bn] = 0; q = best; }
+        font_draw_string((uint32_t)x, (uint32_t)y, line, col, 1);
+        y += lh; lines++;
+        p = q; while (*p == ' ' || *p == '\n') p++;
+        if (q == p && !*p) break;
+    }
+    return y;
+}
+static void ui_card(int x, int y, int w, int h, const char *title)
+{
+    fb_fill_rounded_rect(x, y, w, h, 12, 0x000C1220u);
+    fb_stroke_rrect_aa(x, y, w, h, 12, 0xFF1A2335u);
+    if (title) font_draw_string((uint32_t)(x + 16), (uint32_t)(y + 14), title, CDR_C_DIM, 1);
+}
+
+/* ---- CREAR CON IA ---- */
+static const char *const ui_tpl_name[] = { "Calculadora", "Snake", "Pong", "Contador", "Reloj", "Lista de tareas", "Paint", "Conversor" };
+static const char *const ui_tpl_text[] = {
+    "Una calculadora con ventana, display grande y botones para numeros, + - * / y C, que se usan con el raton",
+    "El juego Snake: la serpiente se mueve con W A S D, come manzanas, crece, cuenta puntos y termina al chocar consigo misma",
+    "Pong para un jugador contra el ordenador: pala con W y S, pelota que rebota y marcador",
+    "Un contador grafico con botones +1, -1 y Reset, con el numero bien grande en el centro",
+    "Un reloj y cronometro en ventana: muestra el tiempo desde el arranque y tiene botones Iniciar, Parar y Reiniciar",
+    "Una lista de tareas por consola: anadir, listar, marcar como hecha y borrar tareas, guardandolas en /workspace/tareas.txt",
+    "Un programa de dibujo: pintar con el raton en la ventana, paleta de 6 colores y boton para borrar el lienzo",
+    "Un conversor de unidades por consola: kilometros a millas, grados Celsius a Fahrenheit y kilos a libras" };
+#define UI_NTPL 8
+
+static void ui_stepper(int x, int y, int w, int phase, int state)
+{
+    static const char *const lab[6] = { "Analisis", "Codigo", "Verificar", "Reparar", "Revision", "Entrega" };
+    int step = w / 6;
+    for (int i = 0; i < 6; i++) {
+        int cx = x + step * i + step / 2, cy = y + 12;
+        int done = (state == CODER_JOB_SUCCESS) || (i + 1 < phase);
+        int cur = (state == CODER_JOB_WORKING && i + 1 == phase);
+        int err = (state == CODER_JOB_ERROR && i + 1 == phase);
+        if (i < 5) fb_fill_rect((uint32_t)(cx + 12), (uint32_t)cy, (uint32_t)(step - 24), 2, done ? CDR_C_GREEN : 0x00263043u);
+        uint32_t c = err ? CDR_C_RED : done ? CDR_C_GREEN : cur ? CDR_C_CYAN : 0x00263043u;
+        fb_fill_rounded_rect(cx - 11, cy - 11, 22, 22, 11, c);
+        char n[2] = { (char)('1' + i), 0 };
+        font_draw_string((uint32_t)(cx - 3), (uint32_t)(cy - 5), n, (done || cur || err) ? 0x00081018u : CDR_C_GRAY, 1);
+        int lw = cdr_tw(lab[i]);
+        font_draw_string((uint32_t)(cx - lw / 2), (uint32_t)(cy + 18), lab[i], cur ? CDR_C_WHITE : done ? 0x00A7F3D0u : CDR_C_DIM, 1);
+    }
+}
+
+static void ui_render_new(uint32_t wx, uint32_t wy, uint32_t ww, uint32_t wh, const struct cdr_snap *sn)
+{
+    int x0 = (int)wx + 12, w = (int)ww - 24, y0 = (int)wy + 54, y1 = (int)(wy + wh) - 10;
+    int running = sn->state == CODER_JOB_WORKING;
+    ui_tf_init(); ui_nh = 0;
+    int wide = w >= 980;
+    int lw = wide ? (w * 52) / 100 : w;
+    /* tarjeta de la orden */
+    int ch = 300;
+    ui_card(x0, y0, lw, ch, "DESCRIBE LA APLICACION");
+    tf_render(&tf_cprompt, x0 + 16, y0 + 36, lw - 32, 104, ui_focus == &tf_cprompt,
+              "Ejemplo: un juego de Snake con puntuacion que se maneja con W A S D...", CDR_C_WHITE);
+    /* plantillas */
+    int cx = x0 + 16, cy = y0 + 152;
+    font_draw_string((uint32_t)cx, (uint32_t)(cy + 2), "Ideas:", CDR_C_DIM, 1);
+    cx += cdr_tw("Ideas:") + 10;
+    for (int i = 0; i < UI_NTPL; i++) {
+        int tw = cdr_tw(ui_tpl_name[i]) + 22;
+        if (cx + tw > x0 + lw - 16) { cx = x0 + 16 + cdr_tw("Ideas:") + 10; cy += 30; }
+        fb_fill_rounded_rect(cx, cy - 4, tw, 24, 12, 0x00162036u);
+        font_draw_string((uint32_t)(cx + 11), (uint32_t)(cy + 2), ui_tpl_name[i], 0x00BFD3EAu, 1);
+        ui_reg(cx, cy - 4, tw, 24, UB_TPL0 + i);
+        cx += tw + 6;
+    }
+    int fy = cy + 34;
+    font_draw_string((uint32_t)(x0 + 16), (uint32_t)(fy + 8), "Archivo", CDR_C_DIM, 1);
+    tf_render(&tf_cfile, x0 + 86, fy, lw - 102 - 70, 30, ui_focus == &tf_cfile, "automatico (se deduce de la descripcion)", CDR_C_AMBER);
+    { int bw = 64; cdr_draw_btn((uint32_t)(x0 + lw - 16 - bw), (uint32_t)fy, (uint32_t)bw, 30, "Auto", CDR_C_PANEL, CDR_C_BORDER2, CDR_C_SOFT); ui_reg(x0 + lw - 16 - bw, fy, bw, 30, UB_AUTO); }
+    int by = fy + 44, bx = x0 + 16;
+    if (running) {
+        bx += ui_btn(bx, by, "Generando...", 0, 0x00122B57u, 0x0060A5FAu, 0x00BFDBFEu) + 8;
+        bx += ui_btn(bx, by, "Cancelar", UB_CANCEL, 0x003A121Du, CDR_C_RED, 0x00FECDD3u) + 8;
+    } else {
+        bx += ui_btn(bx, by, "Generar con IA", UB_GEN, 0x00065F46u, CDR_C_GREEN, CDR_C_WHITE) + 8;
+        if (sn->state == CODER_JOB_SUCCESS) {
+            bx += ui_btn(bx, by, "Probar", UB_RUN, 0x00173A7Au, 0x0060A5FAu, CDR_C_WHITE) + 8;
+            bx += ui_btn(bx, by, "Abrir en el editor", UB_EDIT, CDR_C_PANEL, CDR_C_BORDER2, CDR_C_SOFT) + 8;
+        }
+    }
+    font_draw_string((uint32_t)bx + 6, (uint32_t)(by + 10), running ? "" : "Ctrl+Intro tambien genera", 0x00475569u, 1);
+    if (by + 44 > y0 + ch) ch = by + 44 - y0;   /* (la tarjeta ya se pinto con altura fija; los botones caben) */
+
+    if (wide && y1 - (y0 + ch + 10) > 150) {                     /* consejos */
+        int ty = y0 + ch + 10;
+        ui_card(x0, ty, lw, y1 - ty, "COMO PEDIRLO BIEN");
+        static const char *const tips[] = {
+            "Di QUE hace y COMO se usa: teclas, botones, que se ve en pantalla.",
+            "Si es un juego, explica cuando se gana o se pierde y que puntua.",
+            "Puedes dejar el archivo en blanco: se elige un nombre que no pisa ningun programa.",
+            "Al terminar: Probar lo ejecuta en su ventana y Abrir en el editor te deja retocarlo.",
+            "Atajos: Tab cambia de campo, Ctrl+Intro genera, doble clic selecciona una palabra." };
+        int yy = ty + 42;
+        for (int i = 0; i < 5 && yy + 18 < y1; i++) {
+            fb_fill_rounded_rect(x0 + 18, yy + 5, 6, 6, 3, i == 4 ? CDR_C_CYAN : CDR_C_GREEN);
+            yy = ui_wrap(x0 + 34, yy, lw - 52, tips[i], 0x00AEB9CCu, 2, 17) + 8;
+        }
+    }
+    /* tarjeta de progreso */
+    int px = wide ? x0 + lw + 10 : x0, pw = wide ? w - lw - 10 : w;
+    int py = wide ? y0 : y0 + ch + 10, ph = y1 - py;
+    if (ph < 120) return;
+    ui_card(px, py, pw, ph, "PROGRESO DEL PROGRAMADOR");
+    if (sn->target_file[0]) { int tw = cdr_tw(sn->target_file); font_draw_string((uint32_t)(px + pw - tw - 16), (uint32_t)(py + 14), sn->target_file, CDR_C_AMBER, 1); }
+    ui_stepper(px + 10, py + 42, pw - 20, sn->phase, sn->state);
+    int ty = py + 96;
+    uint32_t dc = sn->state == CODER_JOB_SUCCESS ? CDR_C_GREEN : sn->state == CODER_JOB_ERROR ? 0x00FB7185u : CDR_C_WHITE;
+    ty = ui_wrap(px + 16, ty, pw - 32, sn->phase_desc[0] ? sn->phase_desc : "Escribe que quieres crear y pulsa Generar con IA.", dc, 2, 18) + 6;
+    if (sn->plan[0]) {
+        font_draw_string((uint32_t)(px + 16), (uint32_t)ty, "PLAN", CDR_C_DIM, 1); ty += 18;
+        ty = ui_wrap(px + 16, ty, pw - 32, sn->plan, 0x00CBD5E1u, 4, 17) + 6;
+    }
+    if (running && sn->live_thought[0]) {
+        fb_fill_rounded_rect(px + 12, ty, pw - 24, 44, 8, 0x00101C33u);
+        ui_wrap(px + 24, ty + 6, pw - 48, sn->live_thought, 0x0093C5FDu, 2, 16);
+        ty += 52;
+    }
+    /* bitacora reciente */
+    if (ty + 40 < py + ph) {
+        font_draw_string((uint32_t)(px + 16), (uint32_t)ty, "BITACORA", CDR_C_DIM, 1); ty += 20;
+        int rows = (py + ph - 10 - ty) / 17;
+        int start = sn->log_n - rows; if (start < 0) start = 0;
+        fb_set_clip(px + 12, ty, pw - 24, py + ph - 8 - ty);
+        for (int i = start; i < sn->log_n; i++) {
+            const char *l = sn->log[i];
+            uint32_t c = (cdr_has_ci(l, "error") || cdr_has_ci(l, "fall") || cdr_has_ci(l, "no se")) ? 0x00FDA4AFu :
+                         (cdr_has_ci(l, "correct") || cdr_has_ci(l, "verificado") || cdr_has_ci(l, "guardado")) ? 0x0086EFACu : 0x0094A3B8u;
+            font_draw_string((uint32_t)(px + 16), (uint32_t)ty, l, c, 1); ty += 17;
+        }
+        fb_reset_clip();
+    }
+}
+
+/* ---- PROYECTOS ---- */
+static int ui_proj_scroll, ui_proj_rows, ui_list_x, ui_list_y, ui_list_w, ui_list_h;
+static char ui_pmsg[128]; static uint32_t ui_pmsg_col;
+static int ui_proj_visible(int i) { return !ui_search[0] || cdr_has_ci(projects[i].path, ui_search); }
+static void ui_select_project(int i)
+{
+    project_selected = i; proj_del_armed = -1; ui_pmsg[0] = 0;
+    if (i >= 0 && i < project_count) { tf_set(&tf_rename, projects[i].path); cdr_load_mod_file(projects[i].path); }
+}
+static void ui_render_projects(uint32_t wx, uint32_t wy, uint32_t ww, uint32_t wh)
+{
+    int x0 = (int)wx + 12, w = (int)ww - 24, y0 = (int)wy + 54, y1 = (int)(wy + wh) - 10;
+    ui_tf_init(); ui_nh = 0;
+    int lw = w >= 760 ? 360 : w;
+    ui_card(x0, y0, lw, y1 - y0, "PROGRAMAS SOMA-LANG");
+    { char n[12]; n[0] = 0; cdr_cat_u32(n, sizeof n, (uint32_t)project_count); int nw = cdr_tw(n) + 14;
+      fb_fill_rounded_rect(x0 + lw - nw - 14, y0 + 10, nw, 18, 9, 0x001A2335u); font_draw_string((uint32_t)(x0 + lw - nw - 7), (uint32_t)(y0 + 14), n, CDR_C_GRAY, 1); }
+    tf_render(&tf_search, x0 + 12, y0 + 38, lw - 24, 30, ui_focus == &tf_search, "Buscar por nombre o carpeta...", CDR_C_WHITE);
+    ui_list_x = x0 + 8; ui_list_y = y0 + 78; ui_list_w = lw - 16; ui_list_h = y1 - 8 - ui_list_y;
+    ui_proj_rows = ui_list_h / 40;
+    int vis = 0; for (int i = 0; i < project_count; i++) if (ui_proj_visible(i)) vis++;
+    if (ui_proj_scroll > vis - ui_proj_rows) ui_proj_scroll = vis - ui_proj_rows; if (ui_proj_scroll < 0) ui_proj_scroll = 0;
+    int ry = ui_list_y, k = 0;
+    for (int i = 0; i < project_count; i++) {
+        if (!ui_proj_visible(i)) continue;
+        if (k++ < ui_proj_scroll) continue;
+        if (ry + 38 > ui_list_y + ui_list_h) break;
+        int sel = i == project_selected;
+        if (sel) { fb_fill_rounded_rect(ui_list_x, ry, ui_list_w, 36, 8, 0x00172A4Au); fb_fill_rounded_rect(ui_list_x, ry + 8, 3, 20, 1, CDR_C_CYAN); }
+        uint32_t ic = projects[i].is_gui ? CDR_C_GREEN : CDR_C_CYAN;
+        fb_fill_rounded_rect(ui_list_x + 12, ry + 9, 13, 18, 2, ic);
+        fb_fill_rect((uint32_t)(ui_list_x + 21), (uint32_t)(ry + 9), 4, 4, sel ? 0x00172A4Au : 0x000C1220u);
+        fb_set_clip(ui_list_x + 34, ry, ui_list_w - 40, 36);
+        font_draw_string((uint32_t)(ui_list_x + 36), (uint32_t)(ry + 5), projects[i].name, sel ? CDR_C_WHITE : 0x00D5DCE8u, 1);
+        font_draw_string((uint32_t)(ui_list_x + 36), (uint32_t)(ry + 21), projects[i].path, 0x00566479u, 1);
+        fb_reset_clip();
+        ui_reg(ui_list_x, ry, ui_list_w, 36, UB_PROW0 + i);
+        ry += 40;
+    }
+    if (!vis) font_draw_string((uint32_t)(ui_list_x + 12), (uint32_t)(ui_list_y + 8), ui_search[0] ? "Ningun programa coincide." : "Aun no hay programas .soma", CDR_C_DIM, 1);
+    if (w < 760) return;
+    /* detalle */
+    int dx = x0 + lw + 10, dw = w - lw - 10;
+    ui_card(dx, y0, dw, y1 - y0, "DETALLE");
+    if (project_selected < 0 || project_selected >= project_count) { font_draw_string((uint32_t)(dx + 16), (uint32_t)(y0 + 44), "Selecciona un programa de la lista.", CDR_C_DIM, 1); return; }
+    struct cdr_proj *it = &projects[project_selected];
+    int ty = y0 + 44;
+    fb_fill_rounded_rect(dx + 16, ty, 40, 50, 6, it->is_gui ? CDR_C_GREEN : CDR_C_CYAN);
+    fb_fill_rect((uint32_t)(dx + 44), (uint32_t)ty, 12, 12, 0x000C1220u);
+    font_draw_string((uint32_t)(dx + 70), (uint32_t)(ty + 6), it->name, CDR_C_WHITE, 1);
+    { char inf[96]; inf[0] = 0; cdr_cat(inf, sizeof inf, it->is_gui ? "Aplicacion con ventana" : "Programa de consola");
+      cdr_cat(inf, sizeof inf, "  \xC2\xB7  "); cdr_cat_u32(inf, sizeof inf, it->lines); cdr_cat(inf, sizeof inf, " lineas  \xC2\xB7  ");
+      cdr_fmt_size(inf + cdr_len(inf), sizeof inf - cdr_len(inf), it->size);
+      font_draw_string((uint32_t)(dx + 70), (uint32_t)(ty + 28), inf, CDR_C_GRAY, 1); }
+    ty += 70;
+    int bx = dx + 16;
+    bx += ui_btn(bx, ty, "Ejecutar", UB_PRUN, 0x00173A7Au, 0x0060A5FAu, CDR_C_WHITE) + 8;
+    bx += ui_btn(bx, ty, "Abrir en el editor", UB_PEDIT, 0x00065F46u, CDR_C_GREEN, CDR_C_WHITE) + 8;
+    bx += ui_btn(bx, ty, "Abrir en Notas", UB_PNOTES, CDR_C_PANEL, CDR_C_BORDER2, CDR_C_SOFT) + 8;
+    bx += ui_btn(bx, ty, "Duplicar", UB_PDUP, CDR_C_PANEL, CDR_C_BORDER2, CDR_C_SOFT) + 8;
+    ty += 52;
+    font_draw_string((uint32_t)(dx + 16), (uint32_t)ty, "NOMBRE Y RUTA", CDR_C_DIM, 1); ty += 20;
+    { int bw = cdr_tw("Renombrar / mover") + 28;
+      tf_render(&tf_rename, dx + 16, ty, dw - 32 - bw - 8, 32, ui_focus == &tf_rename, "/workspace/nombre.soma", CDR_C_AMBER);
+      ui_btn(dx + dw - 16 - bw, ty, "Renombrar / mover", UB_PREN, CDR_C_PANEL, CDR_C_BORDER2, CDR_C_SOFT); }
+    ty += 44;
+    font_draw_string((uint32_t)(dx + 16), (uint32_t)ty, "Edita la ruta (doble clic selecciona una palabra) y pulsa Intro o el boton.", 0x00475569u, 1);
+    ty += 30;
+    if (proj_del_armed == project_selected) {
+        int w1 = ui_btn(dx + 16, ty, "Si, borrar definitivamente", UB_PDELOK, 0x007F1D1Du, CDR_C_RED, CDR_C_WHITE);
+        ui_btn(dx + 24 + w1, ty, "No", UB_PDEL, CDR_C_PANEL, CDR_C_BORDER2, CDR_C_SOFT);
+    } else ui_btn(dx + 16, ty, "Borrar", UB_PDEL, 0x002A1015u, 0x009F1239u, 0x00FDA4AFu);
+    ty += 46;
+    if (ui_pmsg[0]) ui_wrap(dx + 16, ty, dw - 32, ui_pmsg, ui_pmsg_col, 3, 17);
+}
+
+/* ---- REGISTRO ---- */
+static int ui_log_scroll;
+static void ui_render_log(uint32_t wx, uint32_t wy, uint32_t ww, uint32_t wh, const struct cdr_snap *sn)
+{
+    int x0 = (int)wx + 12, w = (int)ww - 24, y0 = (int)wy + 54, y1 = (int)(wy + wh) - 10;
+    ui_tf_init(); ui_nh = 0;
+    int lh = (y1 - y0) * 62 / 100;
+    ui_card(x0, y0, w, lh, "BITACORA DEL ULTIMO TRABAJO");
+    int bx = x0 + w - 16;
+    { int bw = cdr_tw("Copiar") + 28; bx -= bw; ui_btn(bx, y0 + 6, "Copiar", UB_LCOPY, CDR_C_PANEL, CDR_C_BORDER2, CDR_C_SOFT); }
+    { int bw = cdr_tw("Traza completa") + 28; bx -= bw + 8; ui_btn(bx, y0 + 6, "Traza completa", UB_LTRACE, CDR_C_PANEL, CDR_C_BORDER2, CDR_C_SOFT); }
+    int rows = (lh - 56) / 18;
+    if (ui_log_scroll > sn->log_n - rows) ui_log_scroll = sn->log_n - rows; if (ui_log_scroll < 0) ui_log_scroll = 0;
+    int ty = y0 + 46;
+    fb_set_clip(x0 + 8, ty, w - 16, lh - 52);
+    for (int i = ui_log_scroll; i < sn->log_n && i < ui_log_scroll + rows; i++) {
+        const char *l = sn->log[i];
+        uint32_t c = (cdr_has_ci(l, "error") || cdr_has_ci(l, "fall") || cdr_has_ci(l, "no se")) ? 0x00FDA4AFu :
+                     (cdr_has_ci(l, "correct") || cdr_has_ci(l, "verificado") || cdr_has_ci(l, "guardado")) ? 0x0086EFACu :
+                     (cdr_has_ci(l, "normaliz") || cdr_has_ci(l, "metrica")) ? 0x0093C5FDu : 0x00CBD5E1u;
+        fb_fill_rounded_rect(x0 + 18, ty + 6, 5, 5, 2, c);
+        font_draw_string((uint32_t)(x0 + 30), (uint32_t)ty, l, c, 1);
+        ty += 18;
     }
     fb_reset_clip();
-
-    if (mod_total_lines > mod_vis_lines) {
-        uint32_t sb_h = (uint32_t)((mod_vis_lines * (int)h) / (mod_total_lines > 0 ? mod_total_lines : 1));
-        uint32_t sb_y = y + (uint32_t)((mod_scroll * (int)cdr_sub(h, sb_h)) / (mod_total_lines - mod_vis_lines));
-        if (sb_h < 10) sb_h = 10;
-        fb_fill_rect(x + w - 4, y, 4, h, 0x00050811u);
-        fb_fill_rect(x + w - 4, sb_y, 4, sb_h, CDR_C_BORDER2);
+    if (!sn->log_n) font_draw_string((uint32_t)(x0 + 18), (uint32_t)(y0 + 48), "Todavia no hay ningun trabajo registrado.", CDR_C_DIM, 1);
+    if (sn->log_n > rows) { int th = (lh - 56) * rows / sn->log_n, tyy = y0 + 46 + (lh - 56 - th) * ui_log_scroll / (sn->log_n - rows); fb_fill_rounded_rect(x0 + w - 10, tyy, 3, th, 1, 0x00334155u); }
+    /* lint */
+    int ly = y0 + lh + 10;
+    ui_card(x0, ly, w, y1 - ly, "ANALISIS ESTATICO DEL ULTIMO PROGRAMA");
+    int yy = ly + 42;
+    if (!sn->lint_n) font_draw_string((uint32_t)(x0 + 18), (uint32_t)yy, "Sin avisos: codigo limpio.", 0x0086EFACu, 1);
+    for (int i = 0; i < sn->lint_n && yy + 18 < y1; i++) {
+        uint32_t c = sn->lint[i][0] == 'E' ? 0x00FDA4AFu : CDR_C_AMBER;
+        fb_fill_rounded_rect(x0 + 18, yy + 5, 7, 7, 3, c);
+        font_draw_string((uint32_t)(x0 + 32), (uint32_t)yy, sn->lint[i], c, 1);
+        yy += 20;
     }
 }
+
+/* ---- eventos ---- */
+static void ui_gen(void)
+{
+    cdr_sync_inputs();
+    if (!input_create_prompt[0]) { ui_focus = &tf_cprompt; return; }
+    coder_start_creation();
+    tf_set(&tf_cfile, input_create_file);
+}
+static void ui_do_rename(void)
+{
+    if (project_selected < 0 || project_selected >= project_count) return;
+    char np[96]; cdr_copy(np, sizeof np, ui_renbuf);
+    if (np[0] != '/') { char t[96]; cdr_copy(t, sizeof t, "/workspace/"); cdr_cat(t, sizeof t, np); cdr_copy(np, sizeof np, t); }
+    if (!cdr_ends_with(np, ".soma")) cdr_cat(np, sizeof np, ".soma");
+    const char *op = projects[project_selected].path;
+    if (cdr_eq(np, op)) { cdr_copy(ui_pmsg, sizeof ui_pmsg, "Es la misma ruta."); ui_pmsg_col = CDR_C_AMBER; return; }
+    if (vfs_size(np) > 0) { cdr_copy(ui_pmsg, sizeof ui_pmsg, "Ya existe un archivo con esa ruta; elige otro nombre."); ui_pmsg_col = 0x00FB7185u; return; }
+    uint32_t len = 0; char *d = vfs_read_alloc(op, &len);
+    if (!d) { cdr_copy(ui_pmsg, sizeof ui_pmsg, "No se pudo leer el archivo."); ui_pmsg_col = 0x00FB7185u; return; }
+    int w = vfs_write(np, d, len); kfree(d);
+    if (w < 0) { cdr_copy(ui_pmsg, sizeof ui_pmsg, "No se pudo escribir en esa ruta (carpeta protegida o sin espacio)."); ui_pmsg_col = 0x00FB7185u; return; }
+    vfs_delete(op);
+    if (cdr_eq(ce_path(), op)) ce_load(np);
+    cdr_scan_projects();
+    for (int i = 0; i < project_count; i++) if (cdr_eq(projects[i].path, np)) ui_select_project(i);
+    cdr_copy(ui_pmsg, sizeof ui_pmsg, "Renombrado a "); cdr_cat(ui_pmsg, sizeof ui_pmsg, np); ui_pmsg_col = 0x0086EFACu;
+}
+static int ui_click(int mx, int my, const struct cdr_snap *sn)
+{
+    extern int keyboard_shift_held(void);
+    ui_tf_init();
+    struct tfield *fs[3]; int nf = 0;
+    if (cdr_tab_cur == CDR_TAB_NEW) { fs[nf++] = &tf_cprompt; fs[nf++] = &tf_cfile; }
+    if (cdr_tab_cur == CDR_TAB_PROJECTS) { fs[nf++] = &tf_search; fs[nf++] = &tf_rename; }
+    for (int i = 0; i < nf; i++) if (tf_hit(fs[i], mx, my)) { ui_focus = fs[i]; tf_press(fs[i], mx, my, keyboard_shift_held()); return 1; }
+    for (int i = 0; i < ui_nh; i++) {
+        struct ui_hit *h = &ui_hits[i];
+        if (mx < h->x || mx >= h->x + h->w || my < h->y || my >= h->y + h->h) continue;
+        int id = h->id;
+        if (id >= UB_TPL0 && id < UB_TPL0 + UI_NTPL) { tf_set(&tf_cprompt, ui_tpl_text[id - UB_TPL0]); tf_set(&tf_cfile, ""); ui_focus = &tf_cprompt; cdr_sync_inputs(); return 1; }
+        if (id >= UB_PROW0 && id < UB_PROW_END) { ui_select_project(id - UB_PROW0); return 1; }
+        const char *pp = (project_selected >= 0 && project_selected < project_count) ? projects[project_selected].path : 0;
+        switch (id) {
+        case UB_GEN: if (sn->state != CODER_JOB_WORKING) ui_gen(); return 1;
+        case UB_CANCEL: coder_cancel_job(); return 1;
+        case UB_RUN: cdr_run_app(sn->target_file); return 1;
+        case UB_EDIT: cdr_open_in_editor(sn->target_file); return 1;
+        case UB_AUTO: { char t[96]; cdr_sync_inputs(); coder_pick_target(input_create_prompt[0] ? input_create_prompt : "app", t, sizeof t); tf_set(&tf_cfile, t); ui_focus = &tf_cfile; return 1; }
+        case UB_PRUN: if (pp) cdr_run_app(pp); return 1;
+        case UB_PEDIT: if (pp) cdr_open_in_editor(pp); return 1;
+        case UB_PNOTES: if (pp) gui_open_notepad(pp); return 1;
+        case UB_PDUP: if (pp) {
+            char dup[96]; uint32_t len = 0; cdr_copy(dup, sizeof dup, pp); if (cdr_ends_with(dup, ".soma")) dup[cdr_len(dup) - 5] = 0;
+            cdr_cat(dup, sizeof dup, "_copia.soma");
+            char *d = vfs_read_alloc(pp, &len); if (d) { vfs_write(dup, d, len); kfree(d); }
+            cdr_scan_projects(); for (int k = 0; k < project_count; k++) if (cdr_eq(projects[k].path, dup)) ui_select_project(k);
+            cdr_copy(ui_pmsg, sizeof ui_pmsg, "Copia creada: "); cdr_cat(ui_pmsg, sizeof ui_pmsg, dup); ui_pmsg_col = 0x0086EFACu; }
+            return 1;
+        case UB_PREN: ui_do_rename(); return 1;
+        case UB_PDEL: proj_del_armed = (proj_del_armed == project_selected) ? -1 : project_selected; return 1;
+        case UB_PDELOK: if (pp) { vfs_delete(pp); proj_del_armed = -1; project_selected = -1; cdr_scan_projects(); cdr_copy(ui_pmsg, sizeof ui_pmsg, "Borrado."); ui_pmsg_col = CDR_C_AMBER; } return 1;
+        case UB_LCOPY: { static char all[CDR_LOG_N * (CDR_LOG_LEN + 1)]; all[0] = 0; for (int k = 0; k < sn->log_n; k++) { cdr_cat(all, sizeof all, sn->log[k]); cdr_cat(all, sizeof all, "\n"); } clip_set_text(all, cdr_len(all)); return 1; }
+        case UB_LTRACE: gui_open_notepad("/agent/coder_ultimo.txt"); return 1;
+        default: return 1;
+        }
+    }
+    ui_focus = 0;
+    return 1;
+}
+static void ui_key(char c)
+{
+    extern int keyboard_last_mods(void);
+    int md = keyboard_last_mods(), ctrl = (md & 1) || keyboard_ctrl_held(), shift = (md & 2) || keyboard_shift_held();
+    ui_tf_init();
+    if (cdr_tab_cur == CDR_TAB_LOG) {
+        if (c == 16 && ui_log_scroll > 0) ui_log_scroll--;
+        if (c == 14) ui_log_scroll++;
+        return;
+    }
+    if (cdr_tab_cur == CDR_TAB_PROJECTS && ui_focus != &tf_search && ui_focus != &tf_rename) {
+        int vis[CDR_MAX_PROJECTS], nv = 0, cur = -1;
+        for (int i = 0; i < project_count; i++) if (ui_proj_visible(i)) { if (i == project_selected) cur = nv; vis[nv++] = i; }
+        if (c == 16 && cur > 0) { ui_select_project(vis[cur - 1]); if (cur - 1 < ui_proj_scroll) ui_proj_scroll--; return; }
+        if (c == 14 && cur + 1 < nv) { ui_select_project(vis[cur + 1]); if (cur + 1 >= ui_proj_scroll + ui_proj_rows) ui_proj_scroll++; return; }
+        if ((c == '\r' || c == '\n') && project_selected >= 0) { cdr_run_app(projects[project_selected].path); return; }
+        if ((uint8_t)c >= 32) { ui_focus = &tf_search; }
+        else return;
+    }
+    if (!ui_focus) { if (cdr_tab_cur == CDR_TAB_NEW) ui_focus = &tf_cprompt; else return; }
+    int r = tf_key(ui_focus, c, ctrl, shift);
+    if (r == TF_TAB) {
+        if (ui_focus == &tf_cprompt) ui_focus = &tf_cfile; else if (ui_focus == &tf_cfile) ui_focus = &tf_cprompt;
+        else if (ui_focus == &tf_search) ui_focus = &tf_rename; else ui_focus = &tf_search;
+    } else if (r == TF_ENTER) {
+        if (ui_focus == &tf_cprompt || ui_focus == &tf_cfile) { if (!coder_job_busy()) ui_gen(); }
+        else if (ui_focus == &tf_rename) ui_do_rename();
+        else if (ui_focus == &tf_search) { for (int i = 0; i < project_count; i++) if (ui_proj_visible(i)) { ui_select_project(i); break; } }
+    } else if (r == TF_ESC) ui_focus = 0;
+    if (ui_focus == &tf_search) ui_proj_scroll = 0;
+    cdr_sync_inputs();
+}
+static int coder_job_busy(void) { struct cdr_snap s; cdr_snapshot(&s); return s.state == CODER_JOB_WORKING; }
 
 void coder_app_render_window(uint32_t win_x, uint32_t win_y, uint32_t win_w, uint32_t win_h, int is_focused)
 {
@@ -1264,234 +1823,36 @@ void coder_app_render_window(uint32_t win_x, uint32_t win_y, uint32_t win_w, uin
     fb_fill_rect(win_x, win_y, win_w, win_h, CDR_C_BG);
     fb_draw_rect(win_x, win_y, win_w, win_h, CDR_C_BORDER);
 
-    tab_bar_y = win_y + 32;
-    fb_fill_rect(win_x + 10, tab_bar_y, win_w - 20, 36, CDR_C_DARK);
-    fb_draw_rect(win_x + 10, tab_bar_y, win_w - 20, 36, CDR_C_BORDER);
+    tab_bar_y = win_y + 6;   /* PARCHE 094 */
+    fb_fill_rect(win_x + 10, tab_bar_y + 37, win_w - 20, 1, CDR_C_BORDER);   /* PARCHE 094: sin caja, linea base */
 
     tx = win_x + 14;
-    cdr_draw_tab_btn(tx, tab_bar_y + 4, 130, 28, "1. CREAR APP", cdr_tab_cur == CDR_TAB_NEW);
-    tx += 136;
-    cdr_draw_tab_btn(tx, tab_bar_y + 4, 140, 28, "2. MODIFICAR", cdr_tab_cur == CDR_TAB_MODIFY);
-    tx += 146;
-    cdr_draw_tab_btn(tx, tab_bar_y + 4, 140, 28, "3. PROYECTOS", cdr_tab_cur == CDR_TAB_PROJECTS);
-    tx += 146;
-    cdr_draw_tab_btn(tx, tab_bar_y + 4, 120, 28, "4. REGISTRO", cdr_tab_cur == CDR_TAB_LOG);
+    for (int ti = 0; ti < CDR_NTABS; ti++) {             /* PARCHE 093 */
+        cdr_draw_tab_btn(tx, tab_bar_y + 4, cdr_tabs[ti].w, 32, cdr_tabs[ti].t,
+                         cdr_tab_cur == cdr_tabs[ti].tab || (cdr_tabs[ti].tab == CDR_TAB_EDITOR && cdr_tab_cur == CDR_TAB_MODIFY));
+        tx += cdr_tabs[ti].w + 6;
+    }
 
     if (win_w > 720) {
-        font_draw_string(win_x + win_w - 180, tab_bar_y + 12, "SOMA-LANG v0.2 [OK]", CDR_C_GREEN, 1);
+        { fb_fill_rounded_rect((int32_t)(win_x + win_w - 170), (int32_t)(tab_bar_y + 9), 150, 22, 11, 0x00102A22u); fb_fill_rounded_rect((int32_t)(win_x + win_w - 160), (int32_t)(tab_bar_y + 17), 6, 6, 3, CDR_C_GREEN); font_draw_string(win_x + win_w - 148, tab_bar_y + 15, "SOMA-LANG v0.2", 0x00A7F3D0u, 1); }
     }
 
     content_y = tab_bar_y + 42;
     content_h = (win_h > 140) ? (win_h - 140) : 100;
 
+    if (cdr_tab_cur == CDR_TAB_MODIFY) cdr_tab_cur = CDR_TAB_EDITOR;   /* PARCHE 093: el editor sustituye al visor */
+    if (cdr_tab_cur != CDR_TAB_EDITOR) ide_track_job(&snap);
+    if (cdr_tab_cur == CDR_TAB_EDITOR) {
+        ide_render(win_x, win_y, win_w, win_h, &snap);
     /* PESTANA 1: CREAR */
-    if (cdr_tab_cur == CDR_TAB_NEW) {
-        uint32_t box_y = content_y + 24;
-        uint32_t box_w = win_w - 48;
-        uint32_t f_y = content_y + 60;
-        uint32_t chip_x;
-        uint32_t act_btn_y = content_y + 92;
-        int is_running = (snap.state == CODER_JOB_WORKING);
-        uint32_t box_p_y = act_btn_y + 38;
-        uint32_t box_p_h = (content_h > 140) ? (content_h - 135) : 80;
-
-        fb_fill_rounded_rect((int32_t)(win_x + 14), (int32_t)content_y, (int32_t)(win_w - 28), 86, 6, CDR_C_PANEL);
-        fb_draw_rounded_rect((int32_t)(win_x + 14), (int32_t)content_y, (int32_t)(win_w - 28), 86, 6, CDR_C_BORDER);
-        font_draw_string(win_x + 24, content_y + 8, "ORDEN PARA EL AGENTE PROGRAMADOR (CODER IA):", CDR_C_CYAN, 1);
-
-        fb_fill_rect(win_x + 24, box_y, box_w, 24, CDR_C_DARK);
-        fb_draw_rect(win_x + 24, box_y, box_w, 24, (input_create_focus == 0) ? CDR_C_GREEN : CDR_C_BORDER2);
-        fb_set_clip((int32_t)(win_x + 28), (int32_t)(box_y + 2), (int32_t)(box_w - 8), 20);
-        font_draw_string(win_x + 28, box_y + 6, input_create_prompt, CDR_C_WHITE, 1);
-        if (input_create_focus == 0) {
-            fb_fill_rect(win_x + 28 + input_create_len * 8, box_y + 4, 2, 16, CDR_C_GREEN);
-        }
-        fb_reset_clip();
-
-        font_draw_string(win_x + 24, f_y + 4, "Guardar en:", CDR_C_GRAY, 1);
-        fb_fill_rect(win_x + 110, f_y, 220, 22, CDR_C_DARK);
-        fb_draw_rect(win_x + 110, f_y, 220, 22, (input_create_focus == 1) ? CDR_C_GREEN : CDR_C_BORDER2);
-        font_draw_string(win_x + 116, f_y + 4, input_create_file, CDR_C_AMBER, 1);
-        if (input_create_focus == 1) {
-            fb_fill_rect(win_x + 116 + input_create_file_len * 8, f_y + 3, 2, 16, CDR_C_GREEN);
-        }
-
-        chip_x = win_x + 340;
-        font_draw_string(chip_x, f_y + 4, "Plantillas:", CDR_C_DIM, 1);
-        chip_x += 80;
-        cdr_draw_btn(chip_x, f_y, 90, 22, "Calculadora", CDR_C_PANEL, CDR_C_BORDER, CDR_C_SOFT);
-        chip_x += 96;
-        cdr_draw_btn(chip_x, f_y, 70, 22, "Pong 2D", CDR_C_PANEL, CDR_C_BORDER, CDR_C_SOFT);
-        chip_x += 76;
-        cdr_draw_btn(chip_x, f_y, 75, 22, "Contador", CDR_C_PANEL, CDR_C_BORDER, CDR_C_SOFT);
-
-        cdr_draw_btn(win_x + 24, act_btn_y, 200, 30,
-                     is_running ? "GENERANDO EN VIVO..." : "[ GENERAR CON CODER ]",
-                     is_running ? 0x001A3A2Au : 0x00064E3Bu,
-                     is_running ? 0x0034D399u : CDR_C_GREEN,
-                     CDR_C_WHITE);
-
-        if (is_running) {
-            cdr_draw_btn(win_x + 232, act_btn_y, 110, 30, "CANCELAR", 0x003A121Du, CDR_C_RED, CDR_C_WHITE);
-        } else if (snap.state == CODER_JOB_SUCCESS) {
-            cdr_draw_btn(win_x + 232, act_btn_y, 140, 30, "> PROBAR AHORA", 0x001E3A8Au, CDR_C_CYAN, CDR_C_WHITE);
-            cdr_draw_btn(win_x + 380, act_btn_y, 120, 30, "VER CODIGO", CDR_C_PANEL, CDR_C_BORDER2, CDR_C_SOFT);
-        }
-
-        fb_fill_rounded_rect((int32_t)(win_x + 14), (int32_t)box_p_y, (int32_t)(win_w - 28), box_p_h, 6, 0x00060A14u);
-        fb_draw_rounded_rect((int32_t)(win_x + 14), (int32_t)box_p_y, (int32_t)(win_w - 28), box_p_h, 6, CDR_C_BORDER);
-        font_draw_string(win_x + 24, box_p_y + 8, "ESTADO DEL PIPELINE AGENTICO:", CDR_C_GRAY, 1);
-        cdr_draw_stepper(win_x + 24, box_p_y + 24, win_w - 48, snap.phase, snap.state);
-
-        font_draw_string(win_x + 24, box_p_y + 46, snap.phase_desc,
-                         (snap.state == CODER_JOB_SUCCESS) ? CDR_C_GREEN : ((snap.state == CODER_JOB_ERROR) ? CDR_C_RED : CDR_C_WHITE), 1);
-
-        if (snap.plan[0]) {
-            font_draw_string(win_x + 24, box_p_y + 64, "Plan acordado:", CDR_C_AMBER, 1);
-            fb_set_clip((int32_t)(win_x + 24), (int32_t)(box_p_y + 78), (int32_t)(win_w - 48), 28);
-            font_draw_string(win_x + 24, box_p_y + 78, snap.plan, CDR_C_SOFT, 1);
-            fb_reset_clip();
-        }
-
-        fb_fill_rect(win_x + 24, box_p_y + box_p_h - 40, win_w - 48, 1, CDR_C_BORDER);
-        font_draw_string(win_x + 24, box_p_y + box_p_h - 32, "Razonamiento en tiempo real:", CDR_C_DIM, 1);
-        fb_set_clip((int32_t)(win_x + 24), (int32_t)(box_p_y + box_p_h - 18), (int32_t)(win_w - 48), 16);
-        font_draw_string(win_x + 24, box_p_y + box_p_h - 18,
-                         snap.live_thought[0] ? snap.live_thought : "(Esperando inicio de mision...)", CDR_C_CYAN, 1);
-        fb_reset_clip();
-
-    /* PESTANA 2: MODIFICAR */
-    } else if (cdr_tab_cur == CDR_TAB_MODIFY) {
-        uint32_t m_act_x;
-        uint32_t mod_in_y = content_y + 54;
-        uint32_t btn_m_y = mod_in_y + 16;
-        uint32_t cv_y = mod_in_y + 48;
-        uint32_t cv_h = (content_h > 115) ? (content_h - 110) : 80;
-        char sz_txt[24];
-
-        fb_fill_rounded_rect((int32_t)(win_x + 14), (int32_t)content_y, (int32_t)(win_w - 28), 48, 6, CDR_C_PANEL);
-        fb_draw_rounded_rect((int32_t)(win_x + 14), (int32_t)content_y, (int32_t)(win_w - 28), 48, 6, CDR_C_BORDER);
-
-        font_draw_string(win_x + 24, content_y + 6, "PROGRAMA SELECCIONADO:", CDR_C_CYAN, 1);
-        font_draw_string(win_x + 24, content_y + 22, mod_current_file, CDR_C_AMBER, 1);
-        cdr_fmt_size(sz_txt, sizeof(sz_txt), mod_size);
-        font_draw_string(win_x + 260, content_y + 22, sz_txt, CDR_C_DIM, 1);
-
-        m_act_x = win_x + win_w - 360;
-        cdr_draw_btn(m_act_x, content_y + 12, 80, 24, "> PROBAR", 0x001E3A8Au, CDR_C_CYAN, CDR_C_WHITE);
-        m_act_x += 86;
-        cdr_draw_btn(m_act_x, content_y + 12, 85, 24, "NOTEPAD", CDR_C_PANEL, CDR_C_BORDER2, CDR_C_SOFT);
-        m_act_x += 91;
-        cdr_draw_btn(m_act_x, content_y + 12, 85, 24, "VERIFICAR", CDR_C_PANEL, CDR_C_BORDER2, CDR_C_SOFT);
-        m_act_x += 91;
-        cdr_draw_btn(m_act_x, content_y + 12, 80, 24, "REVERTIR", 0x003A121Du, CDR_C_RED, CDR_C_WHITE);
-
-        font_draw_string(win_x + 24, mod_in_y, "INSTRUCCION DE CAMBIO PARA EL CODER:", CDR_C_GRAY, 1);
-        fb_fill_rect(win_x + 24, btn_m_y, win_w - 200, 24, CDR_C_DARK);
-        fb_draw_rect(win_x + 24, btn_m_y, win_w - 200, 24, CDR_C_GREEN);
-        fb_set_clip((int32_t)(win_x + 28), (int32_t)(btn_m_y + 2), (int32_t)(win_w - 208), 20);
-        font_draw_string(win_x + 28, btn_m_y + 6, input_mod_prompt, CDR_C_WHITE, 1);
-        fb_reset_clip();
-
-        cdr_draw_btn(win_x + win_w - 165, btn_m_y, 145, 24, "[ APLICAR CAMBIOS ]", 0x00064E3Bu, CDR_C_GREEN, CDR_C_WHITE);
-
-        cdr_render_code_viewer(win_x + 14, cv_y, win_w - 28, cv_h);
-        if (cdr_check_msg[0]) {
-            font_draw_string(win_x + 24, cv_y + cv_h - 18, cdr_check_msg, cdr_check_col, 1);
-        }
-
-    /* PESTANA 3: PROYECTOS */
+    } else if (cdr_tab_cur == CDR_TAB_NEW) {
+        ui_render_new(win_x, win_y, win_w, win_h, &snap);
     } else if (cdr_tab_cur == CDR_TAB_PROJECTS) {
-        uint32_t list_w = (win_w > 360) ? 320 : (win_w - 28);
-        uint32_t row_y = content_y + 26;
-        int i;
-
-        fb_fill_rect(win_x + 14, content_y, list_w, content_h, CDR_C_DARK);
-        fb_draw_rect(win_x + 14, content_y, list_w, content_h, CDR_C_BORDER);
-        font_draw_string(win_x + 22, content_y + 8, "ARCHIVOS .SOMA DETECTADOS:", CDR_C_GRAY, 1);
-
-        for (i = proj_scroll; i < project_count && (row_y + 22) < (content_y + content_h); ++i) {
-            int is_sel = (i == project_selected);
-            if (is_sel) fb_fill_rect(win_x + 16, row_y, list_w - 4, 22, 0x001E3A5Fu);
-            font_draw_string(win_x + 20, row_y + 4, projects[i].is_gui ? "[GUI]" : "[CLI]",
-                             projects[i].is_gui ? CDR_C_GREEN : CDR_C_CYAN, 1);
-            font_draw_string(win_x + 64, row_y + 4, projects[i].name, is_sel ? CDR_C_WHITE : CDR_C_SOFT, 1);
-            row_y += 22;
-        }
-
-        if (win_w > 380) {
-            uint32_t det_x = win_x + 14 + list_w + 10;
-            uint32_t det_w = win_w - 38 - list_w;
-            fb_fill_rounded_rect((int32_t)det_x, (int32_t)content_y, (int32_t)det_w, content_h, 6, CDR_C_PANEL);
-            fb_draw_rounded_rect((int32_t)det_x, (int32_t)content_y, (int32_t)det_w, content_h, 6, CDR_C_BORDER);
-
-            if (project_selected >= 0 && project_selected < project_count) {
-                struct cdr_proj *it = &projects[project_selected];
-                char inf[64];
-                uint32_t ab_y;
-
-                font_draw_string(det_x + 16, content_y + 12, it->name, CDR_C_GREEN, 1);
-                font_draw_string(det_x + 16, content_y + 30, it->path, CDR_C_GRAY, 1);
-
-                inf[0] = '\0';
-                cdr_copy(inf, sizeof(inf), "Lineas: ");
-                cdr_cat_u32(inf, sizeof(inf), it->lines);
-                cdr_cat(inf, sizeof(inf), "  |  Tamano: ");
-                cdr_fmt_size(inf + cdr_len(inf), sizeof(inf) - cdr_len(inf), it->size);
-                font_draw_string(det_x + 16, content_y + 48, inf, CDR_C_SOFT, 1);
-
-                ab_y = content_y + 76;
-                cdr_draw_btn(det_x + 16, ab_y, 120, 28, "> EJECUTAR", 0x001E3A8Au, CDR_C_CYAN, CDR_C_WHITE);
-                cdr_draw_btn(det_x + 144, ab_y, 120, 28, "MODIFICAR", 0x00064E3Bu, CDR_C_GREEN, CDR_C_WHITE);
-
-                ab_y += 36;
-                cdr_draw_btn(det_x + 16, ab_y, 120, 28, "EN NOTEPAD", CDR_C_PANEL, CDR_C_BORDER2, CDR_C_SOFT);
-                cdr_draw_btn(det_x + 144, ab_y, 120, 28, "DUPLICAR", CDR_C_PANEL, CDR_C_BORDER2, CDR_C_SOFT);
-
-                ab_y += 36;
-                if (proj_del_armed == project_selected) {
-                    cdr_draw_btn(det_x + 16, ab_y, 248, 28, "CONFIRMAR BORRADO?", 0x007F1D1Du, CDR_C_RED, CDR_C_WHITE);
-                } else {
-                    cdr_draw_btn(det_x + 16, ab_y, 120, 28, "BORRAR", 0x003A121Du, CDR_C_RED, CDR_C_RED);
-                }
-            } else {
-                font_draw_string(det_x + 20, content_y + 30, "Selecciona un archivo de la lista.", CDR_C_DIM, 1);
-            }
-        }
-
-    /* PESTANA 4: REGISTRO / AUDITORIA */
+        ui_render_projects(win_x, win_y, win_w, win_h);
     } else if (cdr_tab_cur == CDR_TAB_LOG) {
-        int i;
-        uint32_t ly = content_y + 14;
-        fb_fill_rounded_rect((int32_t)(win_x + 14), (int32_t)content_y, (int32_t)(win_w - 28), content_h, 6, CDR_C_PANEL);
-        fb_draw_rounded_rect((int32_t)(win_x + 14), (int32_t)content_y, (int32_t)(win_w - 28), content_h, 6, CDR_C_BORDER);
-
-        font_draw_string(win_x + 24, ly, "HISTORIAL Y BITACORA DEL PIPELINE:", CDR_C_CYAN, 1);
-        ly += 20;
-
-        for (i = 0; i < snap.log_n && (ly + 16) < (content_y + content_h / 2); ++i) {
-            font_draw_string(win_x + 28, ly, snap.log[i], CDR_C_SOFT, 1);
-            ly += 14;
-        }
-        if (snap.log_n == 0) {
-            font_draw_string(win_x + 28, ly, "(Sin eventos registrados aun)", CDR_C_DIM, 1);
-            ly += 16;
-        }
-
-        ly = content_y + content_h / 2 + 6;
-        fb_fill_rect(win_x + 24, ly - 4, win_w - 48, 1, CDR_C_BORDER);
-        font_draw_string(win_x + 24, ly, "INFORME DE REVISION ESTATICA (LINT):", CDR_C_AMBER, 1);
-        ly += 20;
-
-        for (i = 0; i < snap.lint_n && (ly + 16) < (content_y + content_h - 10); ++i) {
-            uint32_t col = (snap.lint[i][0] == 'E') ? CDR_C_RED : CDR_C_AMBER;
-            font_draw_string(win_x + 28, ly, snap.lint[i], col, 1);
-            ly += 14;
-        }
-        if (snap.lint_n == 0) {
-            font_draw_string(win_x + 28, ly, "Sin avisos de analisis estatico (codigo 100% limpio).", CDR_C_GREEN, 1);
-        }
+        ui_render_log(win_x, win_y, win_w, win_h, &snap);
     }
+    (void)content_y; (void)content_h;
 }
 
 /* ------------------------------------------------------------------------
@@ -1499,272 +1860,194 @@ void coder_app_render_window(uint32_t win_x, uint32_t win_y, uint32_t win_w, uin
  * ------------------------------------------------------------------------ */
 int coder_app_handle_click(int32_t mx, int32_t my, uint32_t win_x, uint32_t win_y, uint32_t win_w, uint32_t win_h)
 {
-    uint32_t tab_bar_y = win_y + 32;
-    uint32_t content_y = tab_bar_y + 42;
-    uint32_t content_h = (win_h > 140) ? (win_h - 140) : 100;
+    uint32_t tab_bar_y = win_y + 6;   /* PARCHE 094: sin hueco bajo el titulo */
     struct cdr_snap snap;
-
+    (void)win_w; (void)win_h;
     cdr_snapshot(&snap);
 
     /* Clics en la barra de pestañas */
-    if (point_in_rect(mx, my, win_x + 14, tab_bar_y + 4, 130, 28)) {
-        cdr_tab_cur = CDR_TAB_NEW; return 0;
+    {   uint32_t tx = win_x + 14;                           /* PARCHE 093 */
+        for (int ti = 0; ti < CDR_NTABS; ti++) {
+            if (point_in_rect(mx, my, tx, tab_bar_y + 4, cdr_tabs[ti].w, 32)) {
+                cdr_tab_cur = cdr_tabs[ti].tab;
+                if (cdr_tab_cur == CDR_TAB_PROJECTS || cdr_tab_cur == CDR_TAB_EDITOR) cdr_scan_projects();
+                return 0;
+            }
+            tx += cdr_tabs[ti].w + 6;
+        }
     }
-    if (point_in_rect(mx, my, win_x + 150, tab_bar_y + 4, 140, 28)) {
-        cdr_tab_cur = CDR_TAB_MODIFY; return 0;
-    }
-    if (point_in_rect(mx, my, win_x + 296, tab_bar_y + 4, 140, 28)) {
-        cdr_tab_cur = CDR_TAB_PROJECTS; cdr_scan_projects(); return 0;
-    }
-    if (point_in_rect(mx, my, win_x + 442, tab_bar_y + 4, 120, 28)) {
-        cdr_tab_cur = CDR_TAB_LOG; return 0;
-    }
+    if (cdr_tab_cur == CDR_TAB_EDITOR || cdr_tab_cur == CDR_TAB_MODIFY) { ide_click(mx, my); return 0; }
 
     /* PESTANA 1: CREAR */
-    if (cdr_tab_cur == CDR_TAB_NEW) {
-        uint32_t box_y = content_y + 24;
-        uint32_t box_w = win_w - 48;
-        uint32_t f_y = content_y + 60;
-        uint32_t chip_x = win_x + 420;
-        uint32_t act_btn_y = content_y + 92;
-
-        if (point_in_rect(mx, my, win_x + 24, box_y, box_w, 24)) {
-            input_create_focus = 0; return 0;
-        }
-        if (point_in_rect(mx, my, win_x + 110, f_y, 220, 22)) {
-            input_create_focus = 1; return 0;
-        }
-
-        /* Chips de plantillas */
-        if (point_in_rect(mx, my, chip_x, f_y, 90, 22)) {
-            cdr_copy(input_create_prompt, sizeof(input_create_prompt), "Crea una calculadora interactiva con botones y display");
-            cdr_copy(input_create_file, sizeof(input_create_file), "/workspace/calc.soma");
-            cdr_sync_inputs();
-            return 0;
-        }
-        chip_x += 96;
-        if (point_in_rect(mx, my, chip_x, f_y, 70, 22)) {
-            cdr_copy(input_create_prompt, sizeof(input_create_prompt), "Crea un juego Pong arcade interactivo en ventana 2D");
-            cdr_copy(input_create_file, sizeof(input_create_file), "/workspace/pong_game.soma");
-            cdr_sync_inputs();
-            return 0;
-        }
-        chip_x += 76;
-        if (point_in_rect(mx, my, chip_x, f_y, 75, 22)) {
-            cdr_copy(input_create_prompt, sizeof(input_create_prompt), "Crea un contador grafico con botones +1, -1 y reset");
-            cdr_copy(input_create_file, sizeof(input_create_file), "/workspace/contador.soma");
-            cdr_sync_inputs();
-            return 0;
-        }
-
-        /* Botón de acción principal */
-        if (point_in_rect(mx, my, win_x + 24, act_btn_y, 200, 30)) {
-            if (snap.state != CODER_JOB_WORKING) coder_start_creation();
-            return 0;
-        }
-        if (snap.state == CODER_JOB_WORKING && point_in_rect(mx, my, win_x + 232, act_btn_y, 110, 30)) {
-            coder_cancel_job();
-            return 0;
-        }
-        if (snap.state == CODER_JOB_SUCCESS && point_in_rect(mx, my, win_x + 232, act_btn_y, 140, 30)) {
-            char cmd[128];
-            cmd[0] = '\0';
-            cdr_copy(cmd, sizeof(cmd), "app ");
-            cdr_cat(cmd, sizeof(cmd), snap.target_file);
-            dispatch_command(cmd, 0, 0);
-            return 0;
-        }
-        if (snap.state == CODER_JOB_SUCCESS && point_in_rect(mx, my, win_x + 380, act_btn_y, 120, 30)) {
-            cdr_load_mod_file(snap.target_file);
-            cdr_tab_cur = CDR_TAB_MODIFY;
-            return 0;
-        }
-
-    /* PESTANA 2: MODIFICAR */
-    } else if (cdr_tab_cur == CDR_TAB_MODIFY) {
-        uint32_t m_act_x = win_x + win_w - 360;
-        uint32_t mod_in_y = content_y + 54;
-        uint32_t btn_m_y = mod_in_y + 16;
-        uint32_t cv_y = mod_in_y + 48;
-        uint32_t cv_h = (content_h > 115) ? (content_h - 110) : 80;
-
-        if (point_in_rect(mx, my, m_act_x, content_y + 12, 80, 24)) {
-            char cmd[128];
-            cmd[0] = '\0';
-            cdr_copy(cmd, sizeof(cmd), "app ");
-            cdr_cat(cmd, sizeof(cmd), mod_current_file);
-            dispatch_command(cmd, 0, 0);
-            return 0;
-        }
-        m_act_x += 86;
-        if (point_in_rect(mx, my, m_act_x, content_y + 12, 85, 24)) {
-            gui_open_notepad(mod_current_file);
-            return 0;
-        }
-        m_act_x += 91;
-        if (point_in_rect(mx, my, m_act_x, content_y + 12, 85, 24)) {
-            int vr = cdr_verify(mod_current_file);
-            if (vr > 0) {
-                cdr_set_check("Compilacion OK (0 errores).", CDR_C_GREEN);
-                mod_err_line = 0;
-            } else if (vr == 0) {
-                char chk[128];
-                cdr_diag_text(chk, sizeof(chk));
-                cdr_set_check(chk, CDR_C_RED);
-                mod_err_line = (int)cdr_diag.line;
-            } else {
-                cdr_set_check("Archivo vacio o no encontrado.", CDR_C_AMBER);
-            }
-            return 0;
-        }
-        m_act_x += 91;
-        if (point_in_rect(mx, my, m_act_x, content_y + 12, 80, 24)) {
-            if (cdr_backup_restore(mod_current_file)) {
-                cdr_load_mod_file(mod_current_file);
-                cdr_set_check("Version previa restaurada.", CDR_C_GREEN);
-            } else {
-                cdr_set_check("No hay copia previa para este archivo.", CDR_C_AMBER);
-            }
-            return 0;
-        }
-
-        if (point_in_rect(mx, my, win_x + win_w - 165, btn_m_y, 145, 24)) {
-            if (snap.state != CODER_JOB_WORKING) coder_start_modification();
-            return 0;
-        }
-        if (point_in_rect(mx, my, win_x + 14, cv_y, win_w - 28, cv_h)) {
-            mod_err_line = 0;
-            return 0;
-        }
-
-    /* PESTANA 3: PROYECTOS */
-    } else if (cdr_tab_cur == CDR_TAB_PROJECTS) {
-        uint32_t list_w = (win_w > 360) ? 320 : (win_w - 28);
-        uint32_t row_y = content_y + 26;
-        int i;
-
-        for (i = proj_scroll; i < project_count && (row_y + 22) < (content_y + content_h); ++i) {
-            if (point_in_rect(mx, my, win_x + 16, row_y, list_w - 4, 22)) {
-                project_selected = i;
-                proj_del_armed = -1;
-                cdr_load_mod_file(projects[i].path);
-                return 0;
-            }
-            row_y += 22;
-        }
-
-        if (project_selected >= 0 && project_selected < project_count && win_w > 380) {
-            uint32_t det_x = win_x + 14 + list_w + 10;
-            uint32_t ab_y = content_y + 76;
-
-            if (point_in_rect(mx, my, det_x + 16, ab_y, 120, 28)) {
-                char cmd[128];
-                cmd[0] = '\0';
-                cdr_copy(cmd, sizeof(cmd), "app ");
-                cdr_cat(cmd, sizeof(cmd), projects[project_selected].path);
-                dispatch_command(cmd, 0, 0);
-                return 0;
-            }
-            if (point_in_rect(mx, my, det_x + 144, ab_y, 120, 28)) {
-                cdr_load_mod_file(projects[project_selected].path);
-                cdr_tab_cur = CDR_TAB_MODIFY;
-                return 0;
-            }
-            ab_y += 36;
-            if (point_in_rect(mx, my, det_x + 16, ab_y, 120, 28)) {
-                gui_open_notepad(projects[project_selected].path);
-                return 0;
-            }
-            if (point_in_rect(mx, my, det_x + 144, ab_y, 120, 28)) {
-                char dup[96];
-                dup[0] = '\0';
-                cdr_copy(dup, sizeof(dup), projects[project_selected].path);
-                if (cdr_ends_with(dup, ".soma")) dup[cdr_len(dup) - 5] = '\0';
-                cdr_cat(dup, sizeof(dup), "_copia.soma");
-                int r = vfs_read(projects[project_selected].path, cdr_src, CDR_SRC_MAX - 1);
-                if (r >= 0) {
-                    vfs_write(dup, cdr_src, (uint32_t)r);
-                    cdr_scan_projects();
-                }
-                return 0;
-            }
-            ab_y += 36;
-            if (point_in_rect(mx, my, det_x + 16, ab_y, 120, 28) && proj_del_armed == -1) {
-                proj_del_armed = project_selected;
-                return 0;
-            }
-            if (proj_del_armed == project_selected && point_in_rect(mx, my, det_x + 16, ab_y, 248, 28)) {
-                vfs_delete(projects[project_selected].path);
-                proj_del_armed = -1;
-                project_selected = -1;
-                cdr_scan_projects();
-                return 0;
-            }
-        }
-    }
+    if (ui_click(mx, my, &snap)) return 0;
     return 0;
 }
 
 void coder_app_handle_key(char c)
 {
     cdr_ensure_init();
+    if (cdr_tab_cur == CDR_TAB_EDITOR || cdr_tab_cur == CDR_TAB_MODIFY) { ide_key(c); return; }   /* PARCHE 093 */
 
-    if (cdr_tab_cur == CDR_TAB_NEW) {
-        if (c == '\t') {
-            input_create_focus = !input_create_focus;
+    ui_key(c);
+}
+
+/* PARCHE 093: Esc, portapapeles y raton para el editor */
+int coder_app_escape(void)
+{
+    if (cdr_tab_cur != CDR_TAB_EDITOR) { if (ui_focus) { ui_focus = 0; return 1; } return 0; }
+    if (ide_focus == 1) { ide_focus = 0; return 1; }
+    return ce_escape();
+}
+int coder_app_clip_op(int op)
+{
+    ui_tf_init();
+    if (cdr_tab_cur != CDR_TAB_EDITOR) { if (ui_focus) { tf_clip(ui_focus, op); cdr_sync_inputs(); return 1; } return 0; }
+    if (ide_focus == 1) { tf_clip(&tf_ia, op); ide_ia_len = (int)cdr_len(ide_ia); return 1; }
+    return ce_clip_op(op);
+}
+int coder_app_mouse(int32_t mx, int32_t my, int wheel, int held)
+{
+    ui_tf_init();
+    if (cdr_tab_cur == CDR_TAB_EDITOR) {
+        if (wheel && ide_ex_w && mx >= ide_ex_x && mx < ide_ex_x + ide_ex_w) {     /* PARCHE 101: rueda en el explorador */
+            ide_ex_scroll += wheel * 2;
+            int mxs = project_count - ide_ex_rows; if (mxs < 0) mxs = 0;
+            if (ide_ex_scroll > mxs) ide_ex_scroll = mxs;
+            if (ide_ex_scroll < 0) ide_ex_scroll = 0;
+            return 1;
+        }
+        int r = ce_mouse(mx, my, held, wheel); if (tf_drag(&tf_ia, mx, my, held)) r = 1;
+        {   int hv = -1;
+            if (ide_ex_w && mx >= ide_ex_x && mx < ide_ex_x + ide_ex_w && my >= ide_ex_y + 34 && my < ide_ex_y + 34 + ide_ex_rows * 26) {
+                hv = ide_ex_scroll + (my - ide_ex_y - 34) / 26; if (hv >= project_count) hv = -1; }
+            if (hv != ide_ex_hover) { ide_ex_hover = hv; r = 1; }
+        }
+        return r;
+    }
+    int r = 0;
+    if (ui_focus && tf_drag(ui_focus, mx, my, held)) r = 1;
+    if (wheel) {
+        if (cdr_tab_cur == CDR_TAB_PROJECTS && mx >= ui_list_x && mx < ui_list_x + ui_list_w && my >= ui_list_y && my < ui_list_y + ui_list_h) { ui_proj_scroll += wheel * 2; if (ui_proj_scroll < 0) ui_proj_scroll = 0; r = 1; }
+        if (cdr_tab_cur == CDR_TAB_LOG) { ui_log_scroll += wheel * 3; if (ui_log_scroll < 0) ui_log_scroll = 0; r = 1; }
+        if (cdr_tab_cur == CDR_TAB_NEW && tf_hit(&tf_cprompt, mx, my)) { tf_cprompt.scroll += wheel; if (tf_cprompt.scroll < 0) tf_cprompt.scroll = 0; r = 1; }
+    }
+    return r;
+}
+
+/* ========================================================================
+ * PARCHE 097: el programador para el agente SOMA, la terminal y los subagentes
+ * Todas las misiones de programacion pasan por coder_core (antes el agente generico escribia el archivo con su bucle JSON y
+ * llegaba a compilar su propio razonamiento). Todo se ve en la terminal con el prefijo [PROGRAMADOR] y cada llamada al modelo
+ * (pregunta y respuesta) queda en /agent/coder_ultimo.txt para revisarla.
+ * ======================================================================== */
+static char cm_trace[49152]; static uint32_t cm_trace_n;
+static void cm_tr_add(const char *s, uint32_t max)
+{
+    uint32_t n = 0; while (s[n] && n < max) n++;
+    if (cm_trace_n + n + 1 >= sizeof cm_trace) { if (cm_trace_n + 32 < sizeof cm_trace) { const char *c = "\n[...traza recortada...]\n"; while (*c && cm_trace_n + 1 < sizeof cm_trace) cm_trace[cm_trace_n++] = *c++; } return; }
+    for (uint32_t i = 0; i < n; i++) cm_trace[cm_trace_n++] = s[i];
+    cm_trace[cm_trace_n] = 0;
+}
+static void cm_trace_cb(const char *kind, const char *prompt, const char *reply)
+{
+    cm_tr_add("\n================ ", 32); cm_tr_add(kind, 32); cm_tr_add(" ================\n--- PREGUNTA (inicio) ---\n", 64);
+    cm_tr_add(prompt, 1500);
+    cm_tr_add("\n--- RESPUESTA DEL MODELO ---\n", 64);
+    cm_tr_add(reply, 8000);
+    cm_tr_add("\n", 2);
+    vfs_write("/agent/coder_ultimo.txt", cm_trace, cm_trace_n);
+}
+static void cm_log(const char *m) { kprint("[PROGRAMADOR] "); kprint(m); kprint("\n"); cdr_log(m); cm_tr_add("# ", 2); cm_tr_add(m, 300); cm_tr_add("\n", 2); }
+static void cm_status(int phase, const char *desc, const char *thought)
+{
+    (void)phase; kprint("[PROGRAMADOR] "); kprint(desc); if (thought && thought[0]) { kprint("  ("); kprint(thought); kprint(")"); } kprint("\n");
+    gui_thought_update(desc);
+}
+static int cm_never(void) { return 0; }
+
+static int cdr_has_ci(const char *h, const char *n)
+{
+    for (; *h; h++) { const char *a = h, *b = n; while (*a && *b) { char x = *a; if (x >= 'A' && x <= 'Z') x += 32; if (x != *b) break; a++; b++; } if (!*b) return 1; }
+    return 0;
+}
+static int cm_word_end(char c) { return c == 0 || c == ' ' || c == '"' || c == '\'' || c == ',' || c == ')' || c == '\n' || c == ':' || c == ';'; }
+void coder_pick_target(const char *mission, char *out, uint32_t cap)
+{
+    /* 1) una ruta .soma en la mision */
+    for (const char *p = mission; *p; p++) {
+        if (p[0] == '.' && p[1] == 's' && p[2] == 'o' && p[3] == 'm' && p[4] == 'a' && cm_word_end(p[5])) {
+            const char *b = p; while (b > mission && !cm_word_end(b[-1]) && b[-1] != '(') b--;
+            char t[96]; uint32_t n = (uint32_t)(p + 5 - b); if (n > sizeof t - 1) n = sizeof t - 1;
+            for (uint32_t i = 0; i < n; i++) t[i] = b[i];
+            t[n] = 0;
+            if (t[0] == '/') cdr_copy(out, cap, t); else { cdr_copy(out, cap, "/workspace/"); cdr_cat(out, cap, t); }
             return;
-        }
-        if (c == '\r' || c == '\n') {
-            coder_start_creation();
-            return;
-        }
-        if (input_create_focus == 0) {
-            if (c == '\b' || (uint8_t)c == 127) {
-                if (input_create_len > 0) input_create_prompt[--input_create_len] = '\0';
-            } else if ((uint8_t)c >= 32 && (uint8_t)c < 127 && input_create_len + 1 < sizeof(input_create_prompt)) {
-                input_create_prompt[input_create_len++] = c;
-                input_create_prompt[input_create_len] = '\0';
-            }
-        } else {
-            if (c == '\b' || (uint8_t)c == 127) {
-                if (input_create_file_len > 0) input_create_file[--input_create_file_len] = '\0';
-            } else if ((uint8_t)c >= 32 && (uint8_t)c < 127 && input_create_file_len + 1 < sizeof(input_create_file)) {
-                input_create_file[input_create_file_len++] = c;
-                input_create_file[input_create_file_len] = '\0';
-            }
-        }
-    } else if (cdr_tab_cur == CDR_TAB_MODIFY) {
-        if (c == 16) { if (mod_scroll > 0) mod_scroll--; return; }
-        if (c == 14) { if (mod_scroll + mod_vis_lines < mod_total_lines) mod_scroll++; return; }
-        if (c == '\r' || c == '\n') {
-            coder_start_modification();
-            return;
-        }
-        if (c == '\b' || (uint8_t)c == 127) {
-            if (input_mod_len > 0) input_mod_prompt[--input_mod_len] = '\0';
-        } else if ((uint8_t)c >= 32 && (uint8_t)c < 127 && input_mod_len + 1 < sizeof(input_mod_prompt)) {
-            input_mod_prompt[input_mod_len++] = c;
-            input_mod_prompt[input_mod_len] = '\0';
-        }
-    } else if (cdr_tab_cur == CDR_TAB_PROJECTS) {
-        if (c == 16 && project_selected > 0) {
-            project_selected--;
-            proj_del_armed = -1;
-            cdr_load_mod_file(projects[project_selected].path);
-        }
-        if (c == 14 && project_selected + 1 < project_count) {
-            project_selected++;
-            proj_del_armed = -1;
-            cdr_load_mod_file(projects[project_selected].path);
-        }
-        if (c == '\r' || c == '\n') {
-            if (project_selected >= 0 && project_selected < project_count) {
-                char cmd[128];
-                cmd[0] = '\0';
-                cdr_copy(cmd, sizeof(cmd), "app ");
-                cdr_cat(cmd, sizeof(cmd), projects[project_selected].path);
-                dispatch_command(cmd, 0, 0);
-            }
         }
     }
+    /* 2) modificar "el programa" sin nombre: el ultimo con el que se trabajo */
+    static const char *const mod[] = { "modifica", "mejora", "corrige", "arregla", "cambia", "anade", "añade", 0 };
+    for (int i = 0; mod[i]; i++) if (cdr_has_ci(mission, mod[i]) && mod_current_file[0]) { cdr_copy(out, cap, mod_current_file); return; }
+    /* 3) nombre a partir de la mision: primera palabra significativa tras el verbo */
+    static const char *const skip[] = { "crea", "creame", "haz", "hazme", "programa", "programame", "escribe", "genera", "desarrolla", "construye",
+        "un", "una", "el", "la", "los", "las", "de", "del", "con", "que", "app", "aplicacion", "aplicación", "programa", "juego", "sencillo", "sencilla",
+        "simple", "pequeno", "pequeño", "nuevo", "nueva", "en", "soma", "soma-lang", "para", "me", "por", "favor", 0 };
+    char name[40]; name[0] = 0;
+    const char *p = mission;
+    while (*p && !name[0]) {
+        while (*p == ' ') p++;
+        const char *b = p; while (*p && *p != ' ') p++;
+        uint32_t n = (uint32_t)(p - b); if (!n || n > 30) continue;
+        char w[32]; uint32_t k = 0;
+        for (uint32_t i = 0; i < n; i++) { char c = b[i]; if (c >= 'A' && c <= 'Z') c += 32; if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') w[k++] = c; }
+        w[k] = 0;
+        int sk = k < 3; for (int i = 0; skip[i] && !sk; i++) if (cdr_eq(w, skip[i])) sk = 1;
+        if (!sk) cdr_copy(name, sizeof name, w);
+    }
+    if (!name[0]) cdr_copy(name, sizeof name, "app");
+    cdr_copy(out, cap, "/workspace/"); cdr_cat(out, cap, name); cdr_cat(out, cap, ".soma");
+    for (uint32_t k = 2; vfs_size(out) > 0 && k < 100; k++) {          /* PARCHE 098: crear nunca pisa otro programa */
+        cdr_copy(out, cap, "/workspace/"); cdr_cat(out, cap, name); cdr_cat(out, cap, "_"); cdr_cat_u32(out, cap, k); cdr_cat(out, cap, ".soma");
+    }
+}
+
+static void cm_puts(char *o, uint32_t max, uint32_t *p, const char *s) { while (s && *s && *p + 1 < max) o[(*p)++] = *s++; o[*p] = 0; }
+int coder_run_mission(const char *target_in, const char *mission, char *out, uint32_t max)
+{
+    static struct cc_result cr;
+    char target[128];
+    uint32_t p = 0;
+    if (target_in && target_in[0]) { if (target_in[0] == '/') cdr_copy(target, sizeof target, target_in); else { cdr_copy(target, sizeof target, "/workspace/"); cdr_cat(target, sizeof target, target_in); } }
+    else coder_pick_target(mission, target, sizeof target);
+    cm_trace_n = 0; cm_trace[0] = 0;
+    cm_tr_add("Mision: ", 16); cm_tr_add(mission, 600); cm_tr_add("\nArchivo: ", 16); cm_tr_add(target, 128); cm_tr_add("\n", 2);
+    kprint("\n[PROGRAMADOR] Mision: "); kprint(mission); kprint("\n[PROGRAMADOR] Archivo: "); kprint(target); kprint("\n");
+    struct cc_env env;
+    for (uint32_t zi = 0; zi < sizeof env; zi++) ((uint8_t *)&env)[zi] = 0;
+    env.llm = cdr_env_llm; env.read = cdr_env_read; env.write = cdr_env_write; env.log = cm_log; env.status = cm_status;
+    env.cancelled = cm_never; env.max_llm_calls = 7; env.trace = cm_trace_cb;
+    env.force_new = (vfs_size(target) > 0 && !cdr_has_ci(mission, "modific") && !cdr_has_ci(mission, "mejora") && !cdr_has_ci(mission, "corrige")
+                     && !cdr_has_ci(mission, "arregla") && !cdr_has_ci(mission, "cambia") && !cdr_has_ci(mission, "anade") && !cdr_has_ci(mission, "añade")) ? 1 : 0;
+    cc_run(&env, target, mission, &cr);
+    vfs_write("/agent/coder_ultimo.txt", cm_trace, cm_trace_n);
+    cdr_copy(mod_current_file, sizeof mod_current_file, target);
+    g_need_rescan = 1; g_need_reload = 1;
+    if (out && max) {
+        out[0] = 0;
+        if (cr.ok) {
+            cm_puts(out, max, &p, "Programa listo: "); cm_puts(out, max, &p, target);
+            cm_puts(out, max, &p, "\nCompila y pasa las comprobaciones (");
+            char n[12]; n[0] = 0; cdr_cat_u32(n, sizeof n, cr.bc_len); cm_puts(out, max, &p, n); cm_puts(out, max, &p, " bytes de bytecode).");
+            cm_puts(out, max, &p, "\nEjecutalo con:  app "); cm_puts(out, max, &p, target);
+            cm_puts(out, max, &p, "\nO abrelo en SOMA Studio con:  studio "); cm_puts(out, max, &p, target);
+        } else {
+            cm_puts(out, max, &p, "No he conseguido un programa correcto. "); cm_puts(out, max, &p, cr.summary);
+            if (cr.last_error[0]) { cm_puts(out, max, &p, "\nUltimo error: "); cm_puts(out, max, &p, cr.last_error); }
+        }
+        char m[160]; m[0] = 0;
+        cdr_cat(m, sizeof m, "\n("); cdr_cat_u32(m, sizeof m, (uint32_t)cr.llm_calls); cdr_cat(m, sizeof m, " llamadas al modelo, ");
+        cdr_cat_u32(m, sizeof m, (uint32_t)cr.repairs); cdr_cat(m, sizeof m, " reparaciones, ");
+        cdr_cat_u32(m, sizeof m, (uint32_t)cr.auto_fixes); cdr_cat(m, sizeof m, " correcciones automaticas. Detalle: orden 'coderlog'.)");
+        cm_puts(out, max, &p, m);
+    }
+    return cr.ok;
 }

@@ -12,6 +12,8 @@
 #include "lang/lang.h"
 #include "console.h"
 #include "fs.h"
+#include "coder_app.h"
+#include "web_net.h"   /* PARCHE 087 */
 #include "mem.h"
 #include "thread.h"
 #include "panic.h"
@@ -38,10 +40,16 @@
 #include "gem.h"
 #ifdef __aarch64__
 #include "rpi_fb.h"
+#include "wifi.h"                                     /* PARCHE 079 */
 #endif
 #include "rp1_gpio.h"
 #endif
 #include "net.h"
+#include "netif.h"                                    /* PARCHE 080 */
+#include "crypto.h"
+#include "wpa.h"
+#include "dhcp.h"
+#include "smp.h"
 #include "ip.h"
 #include "dns.h"
 #include "http.h"
@@ -981,6 +989,155 @@ static int cmd_gpio(const char *args, char *out_buf, uint32_t max_out)
     return 1;
 }
 
+/* PARCHE 079: "wifi" (Wi-Fi de la Pi 5, fase 1: bus SDIO y firmware) y "placa" */
+static int cmd_wifi(const char *args, char *out_buf, uint32_t max_out)
+{
+    (void)max_out;
+    if (out_buf) out_buf[0] = 0;
+#ifdef __aarch64__
+    wifi_command(args ? args : "");
+#else
+    (void)args;
+    kprint("wifi: sin adaptador Wi-Fi en esta plataforma\n");
+#endif
+    return 1;
+}
+static int cmd_placa(const char *args, char *out_buf, uint32_t max_out)
+{
+    (void)args; (void)max_out;
+    if (out_buf) out_buf[0] = 0;
+#ifdef __aarch64__
+    board_print();
+#else
+    kprint("placa: PC x86_64 (sin firmware de Raspberry Pi)\n");
+#endif
+    return 1;
+}
+
+/* PARCHE 082: "cpus" - nucleos del procesador y prueba de calculo en paralelo */
+#define CPUS_BUF (256 * 1024)
+static uint8_t cpus_buf[CPUS_BUF];
+struct cpus_job { uint32_t rounds; uint8_t out[4][20]; };
+static void cpus_part(int idx, int n, void *arg)
+{
+    struct cpus_job *j = (struct cpus_job *)arg;
+    /* trabajo total fijo (rounds pasadas de SHA-1 sobre el buffer), repartido por trozos del buffer */
+    uint32_t a = (uint32_t)((uint64_t)CPUS_BUF * (uint32_t)idx / (uint32_t)n), b = (uint32_t)((uint64_t)CPUS_BUF * (uint32_t)(idx + 1) / (uint32_t)n);
+    uint8_t h[20] = { 0 };
+    for (uint32_t r = 0; r < j->rounds; r++) { struct sha1_ctx c; sha1_init(&c); sha1_update(&c, h, 20); sha1_update(&c, cpus_buf + a, b - a); sha1_final(&c, h); }
+    for (int i = 0; i < 20; i++) j->out[idx][i] = h[i];
+}
+extern uint64_t fb_parallel_rects(void);
+static int cmd_cpus(const char *args, char *out_buf, uint32_t max_out)
+{
+    (void)max_out;
+    if (out_buf) out_buf[0] = 0;
+    while (args && *args == ' ') args++;
+    if (args && args[0] == '1' && !args[1]) { smp_set_enabled(0); kprint("cpus: solo el nucleo 0 (vuelve con 'cpus todos')\n"); return 1; }
+    if (args && args[0] == 't') { smp_set_enabled(1); kprint("cpus: todos los nucleos disponibles\n"); }
+    if (args && args[0] == 'p') {
+        for (uint32_t i = 0; i < CPUS_BUF; i++) cpus_buf[i] = (uint8_t)(i * 2654435761u >> 24);
+        struct cpus_job j; j.rounds = 24;
+        uint32_t t1 = 0, tn = 0;
+        for (int pass = 0; pass < 2; pass++) {
+            int n = pass ? smp_cpus() : 1;
+            if (pass && n == 1) break;
+            uint64_t t0 = timer_ticks;
+            int used = smp_parallel_n(cpus_part, &j, n);
+            uint32_t t = (uint32_t)(timer_ticks - t0);
+            if (pass) tn = t; else t1 = t;
+            kprint("  "); kprint_dec((uint32_t)used); kprint(used == 1 ? " nucleo:  " : " nucleos: "); kprint_dec(t); kprint(" ms  (SHA-1 de ");
+            kprint_dec(CPUS_BUF / 1024 * j.rounds / 1024); kprint(" MiB)\n");
+        }
+        if (smp_cpus() > 1 && tn) { uint32_t x10 = t1 * 10 / tn; kprint("  aceleracion: x"); kprint_dec(x10 / 10); kprint(","); kprint_dec(x10 % 10); kprint("\n"); }
+        else if (smp_cpus() == 1) kprint("  (solo hay un nucleo disponible)\n");
+        return 1;
+    }
+    kprint("Nucleos: "); kprint_dec((uint32_t)smp_cpus()); kprint(" en uso | "); kprint(smp_method()); kprint(smp_enabled() ? "\n" : " | reparto apagado ('cpus todos')\n");
+    for (int i = 0; i < 4; i++) {
+        struct smp_core_info c;
+        if (smp_core_info(i, &c) != 0) break;
+        if (i > 0 && !c.online) continue;
+        kprint("  nucleo "); kprint_dec((uint32_t)i); kprint(i == 0 ? "  sistema + calculo" : "  calculo          ");
+        kprint("  MPIDR 0x"); kprint_hex32(c.mpidr); kprint("  trabajos "); kprint_dec((uint32_t)c.jobs); kprint("  ocupado "); kprint_dec((uint32_t)c.busy_ticks); kprint(" ms\n");
+    }
+    kprint("  volcados de pantalla repartidos: "); kprint_dec((uint32_t)fb_parallel_rects()); kprint("\n");
+    kprint("uso: cpus | cpus prueba | cpus 1 | cpus todos\n");
+    return 1;
+}
+
+/* PARCHE 081: "dhcp" - pide direccion al router (Wi-Fi o Ethernet de una red real) */
+static int cmd_dhcp(const char *args, char *out_buf, uint32_t max_out)
+{
+    (void)args; (void)max_out;
+    if (out_buf) out_buf[0] = 0;
+    if (!net_init()) { kprint("dhcp: sin red\n"); return 1; }
+    dhcp_run(1);
+    return 1;
+}
+
+/* PARCHE 080: "netif" (interfaces de red) y "wpa" (criptografia de WPA2) */
+static int cmd_netif(const char *args, char *out_buf, uint32_t max_out)
+{
+    (void)max_out;
+    if (out_buf) out_buf[0] = 0;
+    while (args && *args == ' ') args++;
+    if (args && args[0] == 'u' && args[1] == 's' && args[2] == 'a' && args[3] == 'r') {
+        const char *n = args + 4; while (*n == ' ') n++;
+        if (netif_use(n)) { memcpy(net_mac, netif_mac(), 6); kprint("netif: ahora se usa "); kprint(n); kprint(" (la IP no cambia; 'dhcp' si hace falta)\n"); }
+        else { kprint("netif: "); kprint(n); kprint(" no existe o no arranca\n"); }
+        return 1;
+    }
+    const struct netif_ops *act = netif_active();
+    for (int i = 0; i < netif_count(); i++) {
+        const struct netif_ops *o = netif_get(i);
+        kprint(o == act ? " * " : "   "); kprint(o->name); kprint("  "); kprint(o->desc);
+        kprint(netif_is_up(i) ? "  [operativa" : "  [sin arrancar");
+        if (netif_is_up(i) && o->link) kprint(o->link() ? ", enlace arriba]" : ", sin enlace]"); else kprint("]");
+        if (netif_is_up(i) && o->mac) { kprint("  MAC "); kprint_mac(o->mac()); }
+        kprint("\n");
+    }
+    if (!netif_count()) kprint("netif: ninguna interfaz registrada (la red no se ha iniciado)\n");
+    kprint("uso: netif | netif usar <nombre>\n");
+    return 1;
+}
+
+static void hexline(const uint8_t *b, int n) { static const char *h = "0123456789abcdef"; char t[3] = { 0, 0, 0 }; for (int i = 0; i < n; i++) { t[0] = h[b[i] >> 4]; t[1] = h[b[i] & 15]; kprint(t); } kprint("\n"); }
+static int cmd_wpa(const char *args, char *out_buf, uint32_t max_out)
+{
+    (void)max_out;
+    if (out_buf) out_buf[0] = 0;
+    while (args && *args == ' ') args++;
+    if (args && args[0] == 'p' && args[1] == 's' && args[2] == 'k' && args[3] == ' ') {
+        /* wpa psk <ssid> <contrasena>: la PMK, como wpa_passphrase (el SSID sin espacios en esta orden) */
+        const char *p = args + 4; while (*p == ' ') p++;
+        char ssid[33]; int n = 0; while (*p && *p != ' ' && n < 32) ssid[n++] = *p++; ssid[n] = 0;
+        while (*p == ' ') p++;
+        uint8_t pmk[32]; uint64_t t0 = timer_ticks;
+        if (!n || wpa_psk_to_pmk(p, (const uint8_t *)ssid, (size_t)n, pmk)) { kprint("uso: wpa psk <ssid> <contrasena de 8 a 63 caracteres>\n"); return 1; }
+        kprint("PMK de '"); kprint(ssid); kprint("' ("); kprint_dec((uint32_t)(timer_ticks - t0)); kprint(" ms): "); hexline(pmk, 32);
+        return 1;
+    }
+    /* wpa / wpa prueba: vectores oficiales ejecutados en esta maquina */
+    int ok = 1; uint8_t d[32], e[32];
+    sha1("abc", 3, d);
+    { static const uint8_t r[20] = { 0xa9,0x99,0x3e,0x36,0x47,0x06,0x81,0x6a,0xba,0x3e,0x25,0x71,0x78,0x50,0xc2,0x6c,0x9c,0xd0,0xd8,0x9d }; ok &= !memcmp(d, r, 20); }
+    kprint(ok ? "SHA-1 ............ bien\n" : "SHA-1 ............ MAL\n");
+    { uint8_t k[16], p[16], c[16]; for (int i = 0; i < 16; i++) { k[i] = (uint8_t)i; p[i] = (uint8_t)(i * 0x11); }
+      static const uint8_t r[16] = { 0x69,0xc4,0xe0,0xd8,0x6a,0x7b,0x04,0x30,0xd8,0xcd,0xb7,0x80,0x70,0xb4,0xc5,0x5a };
+      struct aes128 a; aes128_init(&a, k); aes128_encrypt(&a, p, c); aes128_decrypt(&a, c, e);
+      int g = !memcmp(c, r, 16) && !memcmp(e, p, 16); ok &= g; kprint(g ? "AES-128 .......... bien\n" : "AES-128 .......... MAL\n"); }
+    { uint64_t t0 = timer_ticks; wpa_psk_to_pmk("password", (const uint8_t *)"IEEE", 4, d); uint32_t ms = (uint32_t)(timer_ticks - t0);
+      static const uint8_t r[8] = { 0xf4,0x2c,0x6f,0xc5,0x2d,0xf0,0xeb,0xef };
+      int g = !memcmp(d, r, 8); ok &= g; kprint(g ? "PBKDF2 (PMK) ..... bien, " : "PBKDF2 (PMK) ..... MAL, "); kprint_dec(ms); kprint(" ms\n"); }
+    { uint8_t kek[16], kd[16], w[24], u[16]; for (int i = 0; i < 16; i++) { kek[i] = (uint8_t)i; kd[i] = (uint8_t)(i * 0x11); }
+      aes_key_wrap(kek, kd, 16, w);
+      int g = w[0] == 0x1f && w[1] == 0xa6 && w[23] == 0xe5 && aes_key_unwrap(kek, w, 16, u) == 0 && !memcmp(u, kd, 16); ok &= g;
+      kprint(g ? "AES Key Wrap ..... bien\n" : "AES Key Wrap ..... MAL\n"); }
+    kprint(ok ? "wpa: criptografia de WPA2 correcta en esta maquina ('wpa psk <ssid> <clave>' calcula la PMK)\n" : "wpa: HAY FALLOS\n");
+    return 1;
+}
+
 /* PARCHE 077: "fan" - ventilador de la Pi 5 */
 static int cmd_fan(const char *args, char *out_buf, uint32_t max_out)
 {
@@ -1312,18 +1469,20 @@ static int cmd_fat(const char *args, char *out_buf, uint32_t max_out)
             } else {
                 const char *dst = blk_word(&a, dest, sizeof dest);
                 struct fat_dirent st;
-                static char fbuf[FS_DATA_MAX + 1];
+                char *fbuf = 0;
                 int r = dst ? fat_stat(&v, pa, &st) : FAT_E_ARG;
                 if (!dst) fb_puts(b, sizeof b, &p, "fat get: falta el destino\n");
                 else if (r != 0) { fb_puts(b, sizeof b, &p, "fat get: "); fb_puts(b, sizeof b, &p, fat_err_str(r)); fb_putc(b, sizeof b, &p, '\n'); }
                 else if (st.is_dir) fb_puts(b, sizeof b, &p, "fat get: es un directorio\n");
-                else if (st.size > FS_DATA_MAX) { fb_puts(b, sizeof b, &p, "fat get: "); fb_put_dec(b, sizeof b, &p, st.size); fb_puts(b, sizeof b, &p, " bytes no caben en el VFS (maximo 16384)\n"); }
+                else if (st.size > FS_FILE_MAX) { fb_puts(b, sizeof b, &p, "fat get: "); fb_put_dec(b, sizeof b, &p, st.size); fb_puts(b, sizeof b, &p, " bytes no caben en el VFS (maximo 32 MiB)\n"); }
+                else if (!(fbuf = (char *)kmalloc((size_t)st.size + 1))) fb_puts(b, sizeof b, &p, "fat get: sin memoria\n");
                 else {
                     int got = fat_read(&v, pa, 0, fbuf, st.size);
                     if (got < 0) { fb_puts(b, sizeof b, &p, "fat get: "); fb_puts(b, sizeof b, &p, fat_err_str(got)); fb_putc(b, sizeof b, &p, '\n'); }
                     else if (vfs_write(dst, fbuf, (uint32_t)got) < 0) fb_puts(b, sizeof b, &p, "fat get: no se pudo escribir en el VFS\n");
                     else { fb_puts(b, sizeof b, &p, "copiados "); fb_put_dec(b, sizeof b, &p, (uint32_t)got); fb_puts(b, sizeof b, &p, " bytes a "); fb_puts(b, sizeof b, &p, dst); fb_putc(b, sizeof b, &p, '\n'); }
                 }
+                if (fbuf) kfree(fbuf);
             }
         }
     } else fb_puts(b, sizeof b, &p, "uso: fat | fat ls <dev> [ruta] | fat cat <dev> <ruta> | fat get <dev> <ruta> <destino>\n");
@@ -1752,10 +1911,9 @@ static int cmd_exec_impl(const char *args, char *out_buf, uint32_t max_out)
         if (g != (int64_t)st.size) { kfree(img); fb_puts(out_buf, max_out, &pos, "exec: error de lectura de "); fb_puts(out_buf, max_out, &pos, path); return 1; }
         len = (size_t)st.size;
     } else {
-        img = (char *)kmalloc(FS_DATA_MAX);
-        if (!img) { fb_puts(out_buf, max_out, &pos, "exec: sin memoria"); return 1; }
-        int l = vfs_read(path, img, FS_DATA_MAX);
-        if (l <= 0) { kfree(img); fb_puts(out_buf, max_out, &pos, "exec: no se puede leer "); fb_puts(out_buf, max_out, &pos, path); return 1; }
+        uint32_t ul = 0; img = vfs_read_alloc(path, &ul);   /* PARCHE 087 */
+        int l = img ? (int)ul : -1;
+        if (l <= 0) { if (img) kfree(img); fb_puts(out_buf, max_out, &pos, "exec: no se puede leer "); fb_puts(out_buf, max_out, &pos, path); return 1; }
         len = (size_t)l;
     }
 
@@ -2175,10 +2333,12 @@ static int cmd_cp(const char *args, char *out_buf, uint32_t max_out)
     while (*args == ' ') args++;
     while (*args && *args != ' ' && di < sizeof(dst) - 1) dst[di++] = *args++;
     dst[di] = '\0';
-    static char cp_buf[4096]; int r = vfs_read(src, cp_buf, sizeof(cp_buf));
+    uint32_t rl = 0; char *cp_buf = vfs_read_alloc(src, &rl);   /* PARCHE 087: antes copiaba solo los primeros 4 KiB */
     uint32_t pos = 0;
-    if (r < 0) { kprint("cp: origen no encontrado\n"); fb_puts(out_buf, max_out, &pos, "cp: error"); }
-    else if (vfs_write(dst, cp_buf, (uint32_t)r) >= 0) { kprint("cp: copiado OK\n"); fb_puts(out_buf, max_out, &pos, "cp: OK"); }
+    if (!cp_buf) { kprint("cp: origen no encontrado\n"); fb_puts(out_buf, max_out, &pos, "cp: error (no existe o sin memoria)"); }
+    else if (vfs_write(dst, cp_buf, rl) >= 0) { kprint("cp: copiado OK\n"); fb_puts(out_buf, max_out, &pos, "cp: OK"); }
+    else fb_puts(out_buf, max_out, &pos, "cp: no se pudo escribir");
+    if (cp_buf) kfree(cp_buf);
     return 1;
 }
 
@@ -2191,10 +2351,12 @@ static int cmd_mv(const char *args, char *out_buf, uint32_t max_out)
     while (*args == ' ') args++;
     while (*args && *args != ' ' && di < sizeof(dst) - 1) dst[di++] = *args++;
     dst[di] = '\0';
-    static char mv_buf[4096]; int r = vfs_read(src, mv_buf, sizeof(mv_buf));
+    uint32_t rl = 0; char *mv_buf = vfs_read_alloc(src, &rl);   /* PARCHE 087 */
     uint32_t pos = 0;
-    if (r < 0) { kprint("mv: origen no encontrado\n"); fb_puts(out_buf, max_out, &pos, "mv: error"); }
-    else if (vfs_write(dst, mv_buf, (uint32_t)r) >= 0) { vfs_delete(src); kprint("mv: movido OK\n"); fb_puts(out_buf, max_out, &pos, "mv: OK"); }
+    if (!mv_buf) { kprint("mv: origen no encontrado\n"); fb_puts(out_buf, max_out, &pos, "mv: error (no existe o sin memoria)"); }
+    else if (vfs_write(dst, mv_buf, rl) >= 0) { vfs_delete(src); kprint("mv: movido OK\n"); fb_puts(out_buf, max_out, &pos, "mv: OK"); }
+    else fb_puts(out_buf, max_out, &pos, "mv: no se pudo escribir");
+    if (mv_buf) kfree(mv_buf);
     return 1;
 }
 
@@ -3210,6 +3372,179 @@ static int cmd_agent_sim(const char *args, char *out_buf, uint32_t max_out)
 }
 
 
+/* PARCHE 089: "monitor" - monitor del sistema */
+static int cmd_monitor(const char *args, char *out_buf, uint32_t max_out)
+{
+    (void)args; uint32_t p = 0;
+    gui_open_sysmon();
+    fb_puts(out_buf, max_out, &p, "Monitor del sistema abierto.");
+    return 1;
+}
+
+/* PARCHE 088: "imagen [archivo]" - visor de imagenes */
+static int cmd_imagen(const char *args, char *out_buf, uint32_t max_out)
+{
+    uint32_t p = 0;
+    while (args && *args == ' ') args++;
+    char path[128]; uint32_t k = 0;
+    while (args && *args && *args != ' ' && k < sizeof path - 1) path[k++] = *args++;
+    path[k] = 0;
+    if (k && path[0] != '/') { char t[128] = "/workspace/"; uint32_t l = 11; for (uint32_t i = 0; path[i] && l < sizeof t - 1; i++) t[l++] = path[i]; t[l] = 0; if (vfs_size(t) >= 0) { for (uint32_t i = 0; i <= l; i++) path[i] = t[i]; } }
+    gui_open_imgview(path);
+    fb_puts(out_buf, max_out, &p, "Visor de imagenes abierto.");
+    return 1;
+}
+
+/* PARCHE 088: "pdf [archivo]" - lector de PDF */
+static int cmd_pdf(const char *args, char *out_buf, uint32_t max_out)
+{
+    uint32_t p = 0;
+    while (args && *args == ' ') args++;
+    char path[128]; uint32_t k = 0;
+    while (args && *args && *args != ' ' && k < sizeof path - 1) path[k++] = *args++;
+    path[k] = 0;
+    if (k && path[0] != '/') { char t[128] = "/workspace/"; uint32_t l = 11; for (uint32_t i = 0; path[i] && l < sizeof t - 1; i++) t[l++] = path[i]; t[l] = 0; if (vfs_size(t) >= 0) { for (uint32_t i = 0; i <= l; i++) path[i] = t[i]; } }
+    gui_open_pdf(path);
+    fb_puts(out_buf, max_out, &p, "Lector PDF abierto.");
+    return 1;
+}
+
+/* PARCHE 087: "suma <archivo>" - tamano y CRC-32 (comprobar que un archivo grande llega y se guarda entero) */
+static int cmd_suma(const char *args, char *out_buf, uint32_t max_out)
+{
+    char rep[200]; uint32_t p = 0; rep[0] = 0;
+    while (args && *args == ' ') args++;
+    uint32_t n = 0; char *d = (args && *args) ? vfs_read_alloc(args, &n) : 0;
+    if (!d) { fb_puts(rep, sizeof rep, &p, "suma: no existe (uso: suma <archivo>)\n"); shell_emit(rep, out_buf, max_out); return 1; }
+    uint32_t c = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < n; i++) { c ^= (uint8_t)d[i]; for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u))); }
+    c = ~c; kfree(d);
+    static const char hx[] = "0123456789abcdef"; char h[9]; for (int i = 0; i < 8; i++) h[i] = hx[(c >> (28 - 4 * i)) & 15]; h[8] = 0;
+    fb_put_dec(rep, sizeof rep, &p, n); fb_puts(rep, sizeof rep, &p, " bytes  crc32 "); fb_puts(rep, sizeof rep, &p, h); fb_puts(rep, sizeof rep, &p, "  "); fb_puts(rep, sizeof rep, &p, args); fb_puts(rep, sizeof rep, &p, "\n");
+    shell_emit(rep, out_buf, max_out);
+    return 1;
+}
+
+/* PARCHE 087: "descargar <url> [archivo]" - guarda en el VFS lo que devuelve una URL (http directo; https por la pasarela) */
+static int cmd_descargar(const char *args, char *out_buf, uint32_t max_out)
+{
+    char rep[256]; rep[0] = 0;
+    char url[300], dst[FS_NAME_MAX]; uint32_t p = 0, k = 0;
+    while (args && *args == ' ') args++;
+    while (args && *args && *args != ' ' && k < sizeof url - 1) url[k++] = *args++;
+    url[k] = 0;
+    while (args && *args == ' ') args++;
+    k = 0; while (args && *args && *args != ' ' && k < sizeof dst - 1) dst[k++] = *args++;
+    dst[k] = 0;
+    if (!url[0]) { fb_puts(rep, sizeof rep, &p, "Uso: descargar <url> [archivo]"); { fb_puts(rep, sizeof rep, &p, "\n"); shell_emit(rep, out_buf, max_out); } return 1; }
+    if (!dst[0]) {   /* nombre: lo ultimo de la ruta, en /workspace */
+        const char *b = url, *q; for (q = url; *q && *q != '?' && *q != '#'; q++) if (*q == '/') b = q + 1;
+        char nm[40]; uint32_t n = 0; for (q = b; *q && *q != '?' && *q != '#' && n < sizeof nm - 1; q++) nm[n++] = *q;
+        nm[n] = 0; if (!n) { const char *d = "descarga"; while (*d) nm[n++] = *d++; nm[n] = 0; }
+        const char *ws = "/workspace/"; uint32_t l = 0; while (ws[l]) { dst[l] = ws[l]; l++; }
+        for (n = 0; nm[n] && l < sizeof dst - 1; n++) dst[l++] = nm[n];
+        dst[l] = 0;
+    }
+    struct wn_req rq; struct wn_resp rs; memset(&rq, 0, sizeof rq); memset(&rs, 0, sizeof rs);
+    rq.url = url; rq.timeout_ms = 30000; rq.max_body = 24u << 20; rq.want_binary = 1;
+    if (wn_fetch(&rq, &rs) != 0 || !rs.body) { fb_puts(rep, sizeof rep, &p, "descargar: error de red "); fb_puts(rep, sizeof rep, &p, rs.err); wn_free(&rs); { fb_puts(rep, sizeof rep, &p, "\n"); shell_emit(rep, out_buf, max_out); } return 1; }
+    if (rs.status < 200 || rs.status >= 300) { fb_puts(rep, sizeof rep, &p, "descargar: estado HTTP "); fb_put_dec(rep, sizeof rep, &p, (uint64_t)rs.status); wn_free(&rs); { fb_puts(rep, sizeof rep, &p, "\n"); shell_emit(rep, out_buf, max_out); } return 1; }
+    int w = vfs_write(dst, rs.body, rs.len);
+    if (w < 0) fb_puts(rep, sizeof rep, &p, w == -2 ? "descargar: demasiado grande (max 32 MiB)" : "descargar: no se pudo guardar (sin memoria o ruta no valida)");
+    else {
+        fb_puts(rep, sizeof rep, &p, "descargados "); fb_put_dec(rep, sizeof rep, &p, rs.len); fb_puts(rep, sizeof rep, &p, " bytes en "); fb_puts(rep, sizeof rep, &p, dst);
+        int pers = vfs_big_persist();
+        if (rs.len >= FS_DATA_MAX && pers == 0) fb_puts(rep, sizeof rep, &p, " (solo en memoria: BIGFS sin formatear)");
+    }
+    wn_free(&rs);
+    { fb_puts(rep, sizeof rep, &p, "\n"); shell_emit(rep, out_buf, max_out); } return 1;
+}
+
+/* PARCHE 097: "programa [archivo.soma] <mision>" crea o modifica un programa con el programador de SOMA */
+static int cmd_programa(const char *args, char *out_buf, uint32_t max_out)
+{
+    while (args && *args == ' ') args++;
+    if (!args || !*args) { uint32_t p = 0; fb_puts(out_buf, max_out, &p, "Uso: programa [archivo.soma] <que debe hacer>"); return 1; }
+    char target[128]; target[0] = 0;
+    const char *m = args;
+    { const char *e = args; while (*e && *e != ' ') e++;
+      uint32_t n = (uint32_t)(e - args);
+      if (n > 5 && n < sizeof target && args[n - 5] == '.' && args[n - 4] == 's' && args[n - 3] == 'o' && args[n - 2] == 'm' && args[n - 1] == 'a') {
+          for (uint32_t i = 0; i < n; i++) target[i] = args[i];
+          target[n] = 0; m = e; while (*m == ' ') m++;
+      } }
+    if (!*m) { uint32_t p = 0; fb_puts(out_buf, max_out, &p, "Falta la descripcion de lo que debe hacer el programa."); return 1; }
+    coder_run_mission(target, m, out_buf, max_out);
+    return 1;
+}
+/* PARCHE 097: "coderlog" muestra el detalle del ultimo trabajo del programador */
+static int cmd_coderlog(const char *args, char *out_buf, uint32_t max_out)
+{
+    static char t[6144]; uint32_t p = 0;
+    int sz = vfs_size("/agent/coder_ultimo.txt");
+    if (sz <= 0) { fb_puts(out_buf, max_out, &p, "Aun no hay ningun trabajo del programador registrado."); return 1; }
+    int full = args && (args[0] == 't' || args[0] == 'c');                 /* "coderlog todo" */
+    char *b = (char *)kmalloc((uint32_t)sz + 1);
+    if (!b) return 1;
+    int r = vfs_read("/agent/coder_ultimo.txt", b, (uint32_t)sz); if (r < 0) r = 0; b[r] = 0;
+    t[0] = 0; uint32_t k = 0;
+    /* resumen: solo las lineas de bitacora (# ...) y las cabeceras; "coderlog todo" incluye las respuestas del modelo */
+    for (char *l = b; *l; ) {
+        char *e = l; while (*e && *e != '\n') e++;
+        int keep = full || l[0] == '#' || l[0] == '=' || (l[0] == 'M' && l[1] == 'i') || (l[0] == 'A' && l[1] == 'r');
+        if (keep) for (char *q = l; q < e && k + 2 < sizeof t; q++) t[k++] = *q;
+        if (keep && k + 2 < sizeof t) t[k++] = '\n';
+        l = *e ? e + 1 : e;
+    }
+    t[k] = 0;
+    kfree(b);
+    kprint(t);
+    fb_puts(out_buf, max_out, &p, t);
+    fb_puts(out_buf, max_out, &p, full ? "" : "\n(Con 'coderlog todo' ves tambien lo que respondio el modelo. Archivo completo: /agent/coder_ultimo.txt)");
+    return 1;
+}
+
+/* PARCHE 093: "studio [archivo.soma]" abre SOMA Studio con el editor */
+static int cmd_studio(const char *args, char *out_buf, uint32_t max_out)
+{
+    uint32_t p = 0;
+    while (args && *args == ' ') args++;
+    if (args && *args) coder_app_load_project(args);
+    gui_open_coder_app();
+    fb_puts(out_buf, max_out, &p, "SOMA Studio abierto.");
+    return 1;
+}
+
+/* PARCHE 085: "navegador [url]" */
+static int cmd_navegador(const char *args, char *out_buf, uint32_t max_out)
+{
+    uint32_t p = 0;
+    while (args && *args == ' ') args++;
+    if (args && *args) gui_open_browser(args); else gui_open_web();
+    fb_puts(out_buf, max_out, &p, "Navegador abierto.");
+    return 1;
+}
+
+/* PARCHE 085: "ajustes" - transparencia de las ventanas y fuente de la interfaz */
+static int cmd_ajustes(const char *args, char *out_buf, uint32_t max_out)
+{
+    (void)args; uint32_t p = 0;
+    gui_open_settings();
+    fb_puts(out_buf, max_out, &p, "Ajustes abiertos.");
+    return 1;
+}
+
+/* PARCHE 084: "latex [archivo.tex]" - abre el maquetador (documento LaTeX) */
+static int cmd_latex(const char *args, char *out_buf, uint32_t max_out)
+{
+    while (*args == ' ') args++;
+    uint32_t p = 0;
+    kprint("Iniciando el maquetador LaTeX...\n");
+    if (*args) gui_open_layout_file(args); else gui_open_layout();
+    fb_puts(out_buf, max_out, &p, "Maquetador abierto.");
+    return 1;
+}
+
 static int cmd_paint(const char *args, char *out_buf, uint32_t max_out)
 {
     while (*args == ' ') args++;
@@ -3731,7 +4066,7 @@ static int cmd_du(const char *args, char *out_buf, uint32_t max_out)
     while (*q) {
         q = shell_list_next(q, item, sizeof(item));
         if (!item[0]) continue;
-        int r = vfs_read(item, data, FS_DATA_MAX);
+        int r = vfs_size(item);
         uint32_t sz = (r > 0) ? (uint32_t)r : 0;
         shell_put_dec_pad(rep, 6144, &p, sz, 7);
         fb_puts(rep, 6144, &p, "  ");
@@ -3768,9 +4103,8 @@ static int cmd_stat(const char *args, char *out_buf, uint32_t max_out)
         shell_emit("Uso: stat <archivo>\n", out_buf, max_out);
         return 1;
     }
-    char *data = (char *)kmalloc(FS_DATA_MAX);
-    if (!data) { kprint("stat: sin memoria.\n"); return 1; }
-    int r = vfs_read(path, data, FS_DATA_MAX);
+    uint32_t dl = 0; char *data = vfs_read_alloc(path, &dl);   /* PARCHE 087 */
+    int r = data ? (int)dl : -1;
     if (r < 0) {
         fb_puts(rep, sizeof(rep), &p, "stat: no encontrado: ");
         fb_puts(rep, sizeof(rep), &p, path);
@@ -3938,13 +4272,8 @@ static char *shell_read_input(const char *fn, const char *who)
 {
     char *buf;
     if (fn && fn[0]) {
-        buf = (char *)kmalloc(FS_DATA_MAX);
-        if (!buf) { kprint(who); kprint(": sin memoria.\n"); return 0; }
-        if (vfs_read(fn, buf, FS_DATA_MAX) < 0) {
-            kprint(who); kprint(": no encontrado: "); kprint(fn); kprint("\n");
-            kfree(buf);
-            return 0;
-        }
+        buf = vfs_read_alloc(fn, 0);                        /* PARCHE 087 */
+        if (!buf) { kprint(who); kprint(": no encontrado: "); kprint(fn); kprint("\n"); return 0; }
         return buf;
     }
     if (pipe_stdin_data) {
@@ -4247,6 +4576,9 @@ int cmd_lang_lint(const char *args, char *out_buf, uint32_t max_out)
 static const struct command_entry cmd_table[] = {
         /* Scripting y Automatizacion (SOMA-LANG) */
     { "vm",           cmd_lang_vm,      CMD_F_SAFE,   "Test y estado de la maquina virtual SOMA-VM" },
+    { "programa",     cmd_programa,     CMD_F_SAFE,   "Crea o modifica un programa SOMA-LANG con IA: programa [archivo.soma] <mision>" },
+    { "coderlog",     cmd_coderlog,     CMD_F_SAFE,   "Detalle del ultimo trabajo del programador (coderlog todo = con respuestas)" },
+    { "studio",       cmd_studio,       CMD_F_SAFE,   "Abre SOMA Studio (editor de codigo) [archivo]" },
     { "coder",        cmd_lang_coder,   CMD_F_SAFE,   "Agente programador autonomo SOMA" },
     { "run",          cmd_lang_run,     CMD_F_SAFE,   "Ejecuta un script o tokeniza codigo .soma" },
     { "app",          cmd_lang_run,     CMD_F_SAFE,   "Lanza una aplicacion SOMA-LANG (.soma) en ventana" },
@@ -4309,6 +4641,12 @@ static const struct command_entry cmd_table[] = {
     { "pmm",          cmd_pmm,          CMD_F_SAFE,   "Telemetria y auto-test del PMM bitmap allocator" },
     { "vmm",          cmd_vmm,          CMD_F_SAFE,   "Verificacion de tablas de paginas MMU 4 KiB" },
     { "pci",          cmd_pci,          CMD_F_SAFE,   "Escaneo completo del bus PCI y BAR0 I/O" },
+    { "wifi",         cmd_wifi,         CMD_F_SAFE,   "Wi-Fi de la Pi 5: wifi | wifi prueba | sondear | nucleos | firmware | log | mux | rd | wr" },
+    { "placa",        cmd_placa,        CMD_F_SAFE,   "Modelo de Raspberry Pi, memoria y revision (segun el firmware)" },
+    { "cpus",         cmd_cpus,         CMD_F_SAFE,   "Nucleos del procesador: cpus | cpus prueba (velocidad en paralelo) | cpus 1 | cpus todos" },
+    { "dhcp",         cmd_dhcp,         CMD_F_SAFE,   "Pide IP, mascara, puerta de enlace y DNS al router por DHCP" },
+    { "netif",        cmd_netif,        CMD_F_SAFE,   "Interfaces de red: netif | netif usar <eth0|wlan0|virtio0>" },
+    { "wpa",          cmd_wpa,          CMD_F_SAFE,   "WPA2: wpa (autoprueba de la criptografia) | wpa psk <ssid> <clave>" },
     { "fan",          cmd_fan,          CMD_F_SAFE,   "Ventilador de la Pi 5: fan | fan on | fan off | fan inv" },
     { "hdmi",         cmd_hdmi,         CMD_F_SAFE,   "Framebuffer HDMI (Pi 5): resolucion, bits, pitch, direccion; 'hdmi swap' cambia rojo/azul" },
     { "eth",          cmd_eth,          CMD_F_SAFE,   "Ethernet del RP1 (Pi 5): velocidad y duplex negociados, tramas" },
@@ -4403,7 +4741,15 @@ static const struct command_entry cmd_table[] = {
     { "font",         cmd_font,         CMD_F_SAFE,   "Muestra o cambia la fuente tipografica activa (classic|modern)" },
     { "terminal",     cmd_terminal,     CMD_F_SAFE,   "Abre la ventana del terminal de la GUI (barra de desplazamiento, seleccion, copiar/pegar, zoom)" },
     { "media",        cmd_media,        CMD_F_SAFE,   "Reproductor multimedia (video AVI y audio WAV del almacen BIGFS): media gui|list|play|pause|stop|seek|status" },
-    { "paint",        cmd_paint,        CMD_F_SAFE,   "Editor de dibujo bitmap estilo Paint (lienzo, paleta y guardado BMP)" },
+    { "monitor",      cmd_monitor,      CMD_F_SAFE,   "Monitor del sistema: CPU, memoria, procesos, graficos, discos, red y hardware" },
+    { "imagen",       cmd_imagen,       CMD_F_SAFE,   "Visor de imagenes: imagen [archivo] (PNG, JPEG, GIF, BMP de cualquier tamano)" },
+    { "pdf",          cmd_pdf,          CMD_F_SAFE,   "Lector de PDF: pdf [archivo.pdf]" },
+    { "suma",         cmd_suma,         CMD_F_SAFE,   "Tamano y CRC-32 de un archivo: suma <archivo>" },
+    { "descargar",    cmd_descargar,    CMD_F_SAFE,   "Descarga una URL a un archivo: descargar <url> [archivo] (sin limite de 16 KiB)" },
+    { "navegador",    cmd_navegador,    CMD_F_SAFE,   "Navegador web: navegador [url] (boton derecho sobre una imagen: Guardar imagen como...)" },
+    { "ajustes",      cmd_ajustes,      CMD_F_SAFE,   "Ajustes de la interfaz: transparencia de las ventanas y fuente" },
+    { "latex",        cmd_latex,        CMD_F_SAFE,   "Maquetador LaTeX: latex [archivo.tex] (formulas, secciones, tablas; vista Documento/Fuente)" },
+    { "paint",        cmd_paint,        CMD_F_SAFE,   "Editor de dibujo: lienzo hasta 640x480, zoom, deshacer y guardado PNG" },
     { "memview",      cmd_memview,      CMD_F_SAFE,   "Visor visual interactivo del arbol de memoria de agentes (GUI)" },
     { "agentmem",     cmd_memview,      CMD_F_ALIAS,  "Alias de memview" },
     { "vsoma",        cmd_vsoma,        CMD_F_SAFE,   "Inicia la interfaz grafica HD (1280x720, 32 bpp, 16.7M colores)" },
@@ -4777,6 +5123,7 @@ static int dispatch_depth_fallback = 0;
 
 static int dispatch_command_inner(const char *cmd_line, char *out_buf, uint32_t max_out);
 
+static struct kmutex shell_mx; static int shell_mx_init; static volatile uint32_t shell_mx_owner;
 int dispatch_command(const char *cmd_line, char *out_buf, uint32_t max_out)
 {
     struct tcb *self = thread_current();
@@ -4792,10 +5139,34 @@ int dispatch_command(const char *cmd_line, char *out_buf, uint32_t max_out)
         return 0;
     }
 
+    /* PARCHE 091: el agente ejecuta ordenes en su propio hilo mientras la GUI sigue viva; el despachador usa bufferes
+     * estaticos, asi que solo un hilo a la vez. El hilo principal (GUI) no espera: si esta ocupado, avisa y sigue. */
+    /* PARCHE 100: el cerrojo se toma si ESTE hilo no lo tiene ya (antes: solo en profundidad 0). El escritorio lo suelta al
+     * arrancar (shell_lock_drop), sea cual sea la orden que lo abrio (vsoma, studio, navegador...): antes, abierto con otra orden,
+     * se lo quedaba toda la sesion y las apps en segundo plano no arrancaban nunca. */
+    if (!shell_mx_init) { kmutex_init(&shell_mx, "shell"); shell_mx_init = 1; }
+    uint32_t me = self ? self->tid + 1u : 1u;
+    int locked = 0;
+    if (shell_mx_owner != me) {
+        if (self && self->tid == 0) {
+            if (!kmutex_trylock(&shell_mx)) {
+                if (out_buf && max_out) { uint32_t ep = 0; fb_puts(out_buf, max_out, &ep, "El agente SOMA esta usando la consola en este momento; vuelve a intentarlo en unos segundos."); }
+                return 1;
+            }
+        } else kmutex_lock(&shell_mx);
+        shell_mx_owner = me; locked = 1;
+    }
     (*depth)++;
     int r = dispatch_command_inner(cmd_line, out_buf, max_out);
     (*depth)--;
+    if (locked && shell_mx_owner == me) { shell_mx_owner = 0; kmutex_unlock(&shell_mx); }
     return r;
+}
+void shell_lock_drop(void)
+{
+    struct tcb *self = thread_current();
+    uint32_t me = self ? self->tid + 1u : 1u;
+    if (shell_mx_init && shell_mx_owner == me) { shell_mx_owner = 0; kmutex_unlock(&shell_mx); }
 }
 
 static int dispatch_command_inner(const char *cmd_line, char *out_buf, uint32_t max_out)

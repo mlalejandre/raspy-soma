@@ -31,6 +31,7 @@ struct kheap_counters {
     uint64_t used_bytes;       /* bytes asignados (incluye cabeceras) */
     uint64_t peak_used_bytes;  /* maximo historico de used_bytes */
     uint64_t mapped_bytes;     /* bytes de heap mapeados */
+    uint64_t reentries;        /* PARCHE 103: llamadas reentrantes rechazadas */
 };
 void  kheap_get_counters(struct kheap_counters *out);
 
@@ -39,5 +40,10 @@ int   kheap_check(void);
 
 /* Auto-test con prueba de expansion dinamica en vivo (>16 KiB) */
 int   kheap_test_self(void);
+int   kheap_test_reentry(void);   /* PARCHE 103 */
 
+size_t kheap_max_bytes(void);   /* PARCHE 086: limite actual del heap */
+/* PARCHE 089: dueno de las reservas (0 = sistema; ver acct.h) y uso del heap por dueno */
+extern volatile uint8_t kheap_owner;
+void kheap_owner_usage(uint64_t out[256], uint32_t blocks[256]);
 #endif

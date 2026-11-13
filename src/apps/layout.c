@@ -1,3 +1,10 @@
+/* PARCHE 084: Maquetador renovado: entiende y dibuja LaTeX (motor propio en tex.c) con la estetica del explorador de archivos.
+ *
+ *  - Vista "Documento": hoja blanca con sombra sobre el fondo oscuro, texto suavizado, formulas, tablas, listas, notas, imagenes.
+ *  - Vista "Fuente": el .tex con colores (comandos, formulas, comentarios, llaves) y numeros de linea.
+ *  - Barra: abrir y recargar el .tex, editarlo en el Bloc de notas, tamano de letra, ruta; rueda y barra de desplazamiento.
+ *  - Abajo: el subagente "maquetador" escribe documentos LaTeX a partir de una peticion (y se guardan en /workspace/documento.tex).
+ *  - Compatibilidad: los documentos #SOMA-LAYOUT v1 de antes se convierten a LaTeX al cargarlos. */
 #include "layout.h"
 #include "fb.h"
 #include "gui_font.h"
@@ -5,798 +12,532 @@
 #include "mem.h"
 #include "agent.h"
 #include "fs.h"
+#include "gui.h"
+#include "tex.h"
+#include "web_font.h"
+#include "web_img.h"
 
-/* ------------------------------------------------------------------ */
-/* Formato #SOMA-LAYOUT v1 (pensado para que el LLM / maquetador emita) */
-/*
- * #SOMA-LAYOUT v1
- * TITLE: Título del documento
- * SUBTITLE: Subtítulo opcional
- * FONT: classic|modern|bold|...   (nombre de fuente SOMA)
- * ALIGN: left|center
- * MARGIN: 20
- * ---
- * H1: Sección principal
- * H2: Subsección
- * H3: Apartado
- * P: Párrafo de texto normal. Puede ser largo.
- * QUOTE: Cita o destacado
- * HR
- * FOOTER: pie de página
- * LIST: elemento de lista
- */
-/* ------------------------------------------------------------------ */
+uint64_t timer_get_uptime_ms(void);
 
-#define LY_SRC_MAX   12288
-#define LY_PROMPT_MAX  256
-#define LY_LINE_MAX    160
-#define LY_MAX_BLOCKS  96
+/* ---------------------------------------------------------------- tema */
+#define KC_WIN     0x000C111B
+#define KC_BAR     0x00131A27
+#define KC_LINE    0x00212B3B
+#define KC_FIELD   0x00090D15
+#define KC_TXT     0x00E5EAF2
+#define KC_DIM     0x008592A8
+#define KC_FAINT   0x00566379
+#define KC_ACC     0x0038BDF8
+#define KC_SELBG   0x001A3558
+#define KC_PRIMARY 0x000B6BCB
+#define KC_AREA    0x00080B12
+#define KC_OK      0x0034D399
 
-enum ly_block_kind {
-    LY_H1 = 0,
-    LY_H2,
-    LY_H3,
-    LY_P,
-    LY_QUOTE,
-    LY_HR,
-    LY_LIST,
-    LY_FOOTER
-};
+#define LY_SRC_MAX    32768
+#define LY_PROMPT_MAX 256
+#define OPS_CAP       14000
+#define POOL_CAP      (192 * 1024)
 
-struct ly_block {
-    enum ly_block_kind kind;
-    char text[LY_LINE_MAX];
-};
+static char ly_src[LY_SRC_MAX]; static uint32_t ly_src_len;
+static char ly_path[128] = "/workspace/documento.tex";
+static char ly_prompt[LY_PROMPT_MAX]; static uint32_t ly_prompt_len; static int ly_prompt_focus;
+static char ly_status[112]; static int ly_status_ok = 1;
+static int ly_scroll, ly_view, ly_px = 15, ly_drag_sb, ly_drag_y0, ly_drag_s0;
+static struct tex_op ly_ops[OPS_CAP]; static char ly_pool[POOL_CAP];
+static struct tex_out ly_out;
+static int ly_dirty = 1, ly_w_cached, ly_px_cached;
+static int ly_doc_h = 100;
+static uint32_t ly_font_gen;                    /* PARCHE 085: se vuelve a maquetar si cambia la fuente de la interfaz */
 
-static char ly_src[LY_SRC_MAX];
-static uint32_t ly_src_len = 0;
+static int s_len(const char *s) { int n = 0; while (s && s[n]) n++; return n; }
+static void s_cpy(char *d, const char *s, int max) { int i = 0; while (s && s[i] && i + 1 < max) { d[i] = s[i]; i++; } d[i] = 0; }
+static void s_cat(char *d, const char *s, int max) { int i = s_len(d), j = 0; while (s && s[j] && i + 1 < max) d[i++] = s[j++]; d[i] = 0; }
+static void s_num(char *d, int max, int v) { char t[12]; int n = 0; do { t[n++] = (char)('0' + v % 10); v /= 10; } while (v && n < 11); char r[12]; for (int i = 0; i < n; i++) r[i] = t[n - 1 - i]; r[n] = 0; s_cat(d, r, max); }
+static void status(const char *m, int ok) { s_cpy(ly_status, m, sizeof ly_status); ly_status_ok = ok; }
+static int find(const char *h, const char *n) { if (!h || !n || !*n) return -1; for (int i = 0; h[i]; i++) { int j = 0; while (n[j] && h[i + j] == n[j]) j++; if (!n[j]) return i; } return -1; }
 
-static char ly_title[96];
-static char ly_subtitle[96];
-static char ly_font_name[32];
-static int  ly_align_center = 0;
-static int  ly_margin = 20;
-static int  ly_font_id = 1; /* modern por defecto */
-
-static struct ly_block ly_blocks[LY_MAX_BLOCKS];
-static int ly_block_count = 0;
-
-static char ly_prompt[LY_PROMPT_MAX];
-static uint32_t ly_prompt_len = 0;
-static int ly_prompt_focus = 1;
-static int ly_scroll = 0;
-static char ly_status[80];
-
-static const char SAMPLE_DOC[] =
-    "#SOMA-LAYOUT v1\n"
-    "TITLE: La Monarquia Espanola\n"
-    "SUBTITLE: Documento profesional de ejemplo · SOMA OS\n"
-    "FONT: modern\n"
-    "ALIGN: left\n"
-    "MARGIN: 24\n"
-    "---\n"
-    "H1: Introduccion\n"
-    "P: La monarquia espanola es una institucion historica con raices en la Edad Media. "
-    "Hoy funciona como monarquia parlamentaria: el Rey es jefe de Estado y simboliza la unidad de la nacion.\n"
-    "H2: Marco constitucional\n"
-    "P: La Constitucion de 1978 define el papel de la Corona, la sucesion y las funciones "
-    "representativas. El poder ejecutivo reside en el Gobierno elegido democraticamente.\n"
-    "H2: Funciones de la Corona\n"
-    "LIST: Representacion del Estado en actos oficiales y diplomacia\n"
-    "LIST: Sancion y promulgacion de las leyes\n"
-    "LIST: Propuesta del candidato a Presidente del Gobierno\n"
-    "LIST: Mando supremo de las Fuerzas Armadas (simbolico)\n"
-    "H3: Nota historica\n"
-    "QUOTE: La transicion democratica consolidó una Corona integrada en el Estado de Derecho.\n"
-    "HR\n"
-    "P: Este documento es una demostracion del motor de maquetacion de SOMA. "
-    "El subagente 'maquetador' generara estructuras similares a partir de informacion del buscador.\n"
-    "FOOTER: SOMA OS · Maquetador de documentos · v0.1\n";
-
-/* ---- utilidades ---- */
-
-static void ly_strcpy(char *dst, const char *src, uint32_t max)
+/* ---------------------------------------------------------------- texto de la interfaz */
+static int g_wf = -1;
+static int has_wf(void) { if (g_wf < 0) g_wf = wf_init() ? 1 : 0; return g_wf; }
+static int tw(const char *s, int px, int bold) { int n = s_len(s); return has_wf() ? wf_width(s, (uint32_t)n, px, bold ? WF_BOLD : 0) : n * 8; }
+static void tx(int32_t x, int32_t top, int32_t h, const char *s, int px, uint32_t col, int bold)
 {
+    int n = s_len(s); if (!n) return;
+    if (has_wf()) { wf_draw(x, top + (h + (px * 72) / 100) / 2, s, (uint32_t)n, px, col, bold ? WF_BOLD : 0, 255); return; }
+    font_draw_string((uint32_t)x, (uint32_t)(top + (h - 10) / 2), s, col, 1);
+}
+
+/* ---------------------------------------------------------------- medidas para el motor */
+static int m_width(const char *s, int n, int px, int st, void *u)
+{
+    (void)u;
+    if (!has_wf()) return n * 8;
+    int fl = (st & TS_BOLD ? WF_BOLD : 0) | (st & TS_ITALIC ? WF_ITALIC : 0) | (st & TS_MONO ? WF_MONO : 0);
+    return wf_width(s, (uint32_t)n, px, fl);
+}
+static int m_asc(int px, void *u) { (void)u; return has_wf() ? wf_ascent(wf_ui_px(px)) : px; }
+static int m_desc(int px, void *u) { (void)u; return has_wf() ? wf_descent(wf_ui_px(px)) : px / 4; }
+/* imagenes: cache pequena de decodificadas */
+struct icache { char path[96]; struct wimg im; int ok; };
+static struct icache g_img[4]; static int g_img_next;
+static struct icache *img_get(const char *path)
+{
+    for (int i = 0; i < 4; i++) if (g_img[i].path[0] && find(g_img[i].path, path) == 0 && s_len(g_img[i].path) == s_len(path)) return &g_img[i];
+    struct icache *c = &g_img[g_img_next]; g_img_next = (g_img_next + 1) % 4;
+    if (c->ok) wi_free(&c->im);
+    c->ok = 0; s_cpy(c->path, path, sizeof c->path);
+    char full[128] = ""; if (path[0] != '/') s_cpy(full, "/workspace/", sizeof full);
+    s_cat(full, path, sizeof full);
+    uint32_t un = 0; uint8_t *raw = (uint8_t *)vfs_read_alloc(full, &un);   /* PARCHE 087: imagenes de cualquier tamano */
+    if (!raw && path[0] != '/') raw = (uint8_t *)vfs_read_alloc(path, &un);
+    if (!raw) return c;
+    if (un > 8 && wi_decode(raw, un, &c->im) == 0) c->ok = 1;
+    kfree(raw);
+    return c;
+}
+static int m_image(const char *path, int *w, int *h, void *u) { (void)u; struct icache *c = img_get(path); if (!c->ok) return -1; *w = c->im.w; *h = c->im.h; return 0; }
+static const struct tex_metrics g_metrics = { m_width, m_asc, m_desc, m_image, 0 };
+
+/* ---------------------------------------------------------------- documento de ejemplo */
+static const char SAMPLE_TEX[] =
+"\\documentclass{article}\n"
+"\\title{El motor \\LaTeX{} de SOMA}\n"
+"\\author{SOMA OS \\and Maquetador}\n"
+"\\date{Noviembre de 2026}\n"
+"\\begin{document}\n"
+"\\maketitle\n"
+"\\begin{abstract}\n"
+"El maquetador entiende \\LaTeX: secciones numeradas, listas, tablas, notas al pie y f\\'ormulas como $E = mc^2$ "
+"o $\\sqrt{x^2+y^2}$ dentro del texto. Abre cualquier \\texttt{.tex} desde el explorador o p\\'idele uno a la IA.\n"
+"\\end{abstract}\n"
+"\\section{C\\'alculo}\\label{sec:calc}\n"
+"El \\textbf{teorema fundamental del c\\'alculo}\\footnote{Newton y Leibniz, siglo XVII.} une derivada e integral. "
+"Para $f$ continua en $[a,b]$:\n"
+"\\begin{equation}\\label{eq:tfc}\n\\int_a^b f(x)\\,dx = F(b) - F(a)\n\\end{equation}\n"
+"La ecuaci\\'on~\\eqref{eq:tfc} abre la secci\\'on~\\ref{sec:calc}. Las ra\\'ices de $ax^2+bx+c=0$ son\n"
+"\\[ x = \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a} \\]\n"
+"\\subsection{Series}\n"
+"\\begin{itemize}\n"
+"\\item Basilea: $\\sum_{n=1}^{\\infty} \\frac{1}{n^2} = \\frac{\\pi^2}{6}$.\n"
+"\\item El n\\'umero $e = \\lim_{n\\to\\infty}\\left(1+\\frac{1}{n}\\right)^n$.\n"
+"\\item Texto en \\emph{cursiva}, \\texttt{monoespaciado} y \\textcolor{red}{color}.\n"
+"\\end{itemize}\n"
+"\\[ \\sum_{k=0}^{n} \\binom{n}{k} x^k = (1+x)^n \\qquad \\oint_C \\vec{F}\\cdot d\\vec{r} = 0 \\]\n"
+"\\section{F\\'isica}\n"
+"Ecuaciones de Maxwell en forma diferencial:\n"
+"\\begin{align}\n\\nabla \\cdot \\mathbf{E} &= \\frac{\\rho}{\\varepsilon_0} \\\\\n"
+"\\nabla \\times \\mathbf{B} &= \\mu_0 \\mathbf{J} + \\mu_0\\varepsilon_0 \\frac{\\partial \\mathbf{E}}{\\partial t}\n\\end{align}\n"
+"\\section{\\'Algebra}\n"
+"\\[ A = \\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}, \\qquad \\det A = ad - bc, \\qquad "
+"|x| = \\begin{cases} x & \\text{si } x \\geq 0 \\\\ -x & \\text{si } x < 0 \\end{cases} \\]\n"
+"\\begin{table}\n\\centering\n\\begin{tabular}{|l|c|r|}\n\\hline\nS\\'imbolo & Nombre & Valor \\\\\n\\hline\n"
+"$\\pi$ & pi & 3,14159 \\\\\n$e$ & Euler & 2,71828 \\\\\n$\\phi$ & raz\\'on \\'aurea & 1,61803 \\\\\n\\hline\n\\end{tabular}\n"
+"\\caption{Constantes matem\\'aticas.}\n\\end{table}\n"
+"\\begin{enumerate}\n\\item Abre un \\texttt{.tex} con doble clic en el explorador.\n\\item Pulsa \\emph{Editar} para cambiarlo en el Bloc de notas y luego \\emph{Recargar}.\n"
+"\\item Escribe abajo un tema y pulsa \\textbf{Generar}: la IA escribe el \\LaTeX.\n\\end{enumerate}\n"
+"\\begin{quote}\nLa matem\\'atica es el alfabeto con el cual Dios ha escrito el universo. --- Galileo\n\\end{quote}\n"
+"\\end{document}\n";
+
+/* ---------------------------------------------------------------- formato antiguo -> LaTeX */
+static void legacy_to_tex(const char *src, uint32_t len)
+{
+    static char out[LY_SRC_MAX]; uint32_t o = 0;
+#define PUT(s) do { const char *_p = (s); while (*_p && o + 1 < sizeof out) out[o++] = *_p++; } while (0)
+    PUT("\\documentclass{article}\n");
+    int in_list = 0, body = 0; char foot[200] = "";
     uint32_t i = 0;
-    if (!src) { dst[0] = '\0'; return; }
-    while (src[i] && i + 1 < max) { dst[i] = src[i]; i++; }
-    dst[i] = '\0';
-}
-
-static int ly_startswith(const char *s, const char *pfx)
-{
-    while (*pfx) {
-        if (*s != *pfx) return 0;
-        s++; pfx++;
-    }
-    return 1;
-}
-
-static void ly_trim_inplace(char *s)
-{
-    char *start = s;
-    while (*start == ' ' || *start == '\t') start++;
-    if (start != s) {
-        char *d = s;
-        while (*start) *d++ = *start++;
-        *d = '\0';
-    }
-    uint32_t n = 0;
-    while (s[n]) n++;
-    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r')) {
-        s[--n] = '\0';
-    }
-}
-
-static int ly_streq_ci(const char *a, const char *b)
-{
-    while (*a && *b) {
-        char ca = (*a >= 'A' && *a <= 'Z') ? (char)(*a + 32) : *a;
-        char cb = (*b >= 'A' && *b <= 'Z') ? (char)(*b + 32) : *b;
-        if (ca != cb) return 0;
-        a++; b++;
-    }
-    return *a == '\0' && *b == '\0';
-}
-
-/* ---- parser del formato ---- */
-
-/* Paso 3 fix: prototipos antes de ly_parse */
-static void ly_utf8_to_ascii_inplace(char *s);
-static void ly_strip_list_prefix(char *s);
-
-static void ly_parse(void)
-{
-    ly_block_count = 0;
-    ly_title[0] = '\0';
-    ly_subtitle[0] = '\0';
-    ly_strcpy(ly_font_name, "modern", sizeof(ly_font_name));
-    ly_align_center = 0;
-    ly_margin = 20;
-    ly_font_id = 1;
-
-    const char *p = ly_src;
-    char line[LY_LINE_MAX];
-    int in_body = 0;
-
-    while (*p && ly_block_count < LY_MAX_BLOCKS) {
-        uint32_t li = 0;
-        while (*p && *p != '\n' && li + 1 < LY_LINE_MAX) {
-            line[li++] = *p++;
-        }
-        if (*p == '\n') p++;
-        line[li] = '\0';
-        ly_trim_inplace(line);
-        if (!line[0]) continue;
-        if (ly_startswith(line, "#")) continue; /* comentarios / cabecera magica */
-
-        if (!in_body) {
-            if (ly_startswith(line, "---")) {
-                in_body = 1;
-                continue;
-            }
-            if (ly_startswith(line, "TITLE:")) {
-                ly_strcpy(ly_title, line + 6, sizeof(ly_title));
-                ly_trim_inplace(ly_title);
-                ly_utf8_to_ascii_inplace(ly_title);
-                continue;
-            }
-            if (ly_startswith(line, "SUBTITLE:")) {
-                ly_strcpy(ly_subtitle, line + 9, sizeof(ly_subtitle));
-                ly_trim_inplace(ly_subtitle);
-                ly_utf8_to_ascii_inplace(ly_subtitle);
-                continue;
-            }
-            if (ly_startswith(line, "FONT:")) {
-                ly_strcpy(ly_font_name, line + 5, sizeof(ly_font_name));
-                ly_trim_inplace(ly_font_name);
-                if (!font_set_by_name(ly_font_name))
-                    font_set(FONT_MODERN);
-                ly_font_id = font_get_current();
-                continue;
-            }
-            if (ly_startswith(line, "ALIGN:")) {
-                const char *v = line + 6;
-                while (*v == ' ') v++;
-                ly_align_center = ly_startswith(v, "center") || ly_startswith(v, "centro");
-                continue;
-            }
-            if (ly_startswith(line, "MARGIN:")) {
-                int v = 0;
-                const char *c = line + 7;
-                while (*c == ' ') c++;
-                while (*c >= '0' && *c <= '9') { v = v * 10 + (*c - '0'); c++; }
-                if (v >= 8 && v <= 64) ly_margin = v;
-                continue;
-            }
-            /* Si no es meta, tratar como cuerpo */
-            in_body = 1;
-        }
-
-        struct ly_block *b = &ly_blocks[ly_block_count];
-        b->text[0] = '\0';
-
-        if (ly_startswith(line, "H1:")) {
-            b->kind = LY_H1;
-            ly_strcpy(b->text, line + 3, sizeof(b->text));
-        } else if (ly_startswith(line, "H2:")) {
-            b->kind = LY_H2;
-            ly_strcpy(b->text, line + 3, sizeof(b->text));
-        } else if (ly_startswith(line, "H3:")) {
-            b->kind = LY_H3;
-            ly_strcpy(b->text, line + 3, sizeof(b->text));
-        } else if (ly_startswith(line, "P:")) {
-            b->kind = LY_P;
-            ly_strcpy(b->text, line + 2, sizeof(b->text));
-        } else if (ly_startswith(line, "QUOTE:")) {
-            b->kind = LY_QUOTE;
-            ly_strcpy(b->text, line + 6, sizeof(b->text));
-        } else if (ly_startswith(line, "LIST:")) {
-            b->kind = LY_LIST;
-            ly_strcpy(b->text, line + 5, sizeof(b->text));
-        } else if (ly_startswith(line, "FOOTER:")) {
-            b->kind = LY_FOOTER;
-            ly_strcpy(b->text, line + 7, sizeof(b->text));
-        } else if (ly_streq_ci(line, "HR") || ly_startswith(line, "HR")) {
-            b->kind = LY_HR;
-            b->text[0] = '\0';
-        } else {
-            b->kind = LY_P;
-            ly_strcpy(b->text, line, sizeof(b->text));
-        }
-        ly_trim_inplace(b->text);
-        ly_utf8_to_ascii_inplace(b->text);
-        if (b->kind == LY_LIST) ly_strip_list_prefix(b->text);
-        ly_block_count++;
-    }
-
-    font_set(ly_font_id);
-}
-
-
-
-/* ---- Paso 3: normalización ASCII + limpieza de LIST ---- */
-
-static void ly_utf8_to_ascii_inplace(char *s)
-{
-    if (!s) return;
-    char *d = s;
-    const unsigned char *p = (const unsigned char *)s;
-    while (*p) {
-        if (*p < 0x80) {
-            *d++ = (char)*p++;
+    while (i < len) {
+        uint32_t a = i; while (i < len && src[i] != '\n') i++;
+        char line[400]; uint32_t n = i - a; if (n > 399) n = 399; for (uint32_t k = 0; k < n; k++) line[k] = src[a + k]; line[n] = 0; if (n && line[n - 1] == '\r') line[n - 1] = 0;
+        if (i < len) i++;
+        const char *v = 0;
+        if (!body) {
+            if (find(line, "TITLE:") == 0) { PUT("\\title{"); PUT(line + 6); PUT("}\n"); }
+            else if (find(line, "SUBTITLE:") == 0) { PUT("\\author{"); PUT(line + 9); PUT("}\n"); }
+            else if (find(line, "---") == 0) { body = 1; PUT("\\date{}\n\\begin{document}\n\\maketitle\n"); }
             continue;
         }
-        /* Secuencias UTF-8 comunes en español → ASCII */
-        if (p[0] == 0xC3 && p[1]) {
-            unsigned char c = p[1];
-            char rep = '?';
-            if (c == 0xA1 || c == 0x81) rep = 'a';      /* á Á */
-            else if (c == 0xA9 || c == 0x89) rep = 'e'; /* é É */
-            else if (c == 0xAD || c == 0x8D) rep = 'i'; /* í Í */
-            else if (c == 0xB3 || c == 0x93) rep = 'o'; /* ó Ó */
-            else if (c == 0xBA || c == 0x9A) rep = 'u'; /* ú Ú */
-            else if (c == 0xB1 || c == 0x91) rep = 'n'; /* ñ Ñ */
-            else if (c == 0xBC || c == 0x9C) rep = 'u'; /* ü Ü */
-            else if (c == 0x87 || c == 0xA7) rep = 'c'; /* Ç ç */
-            *d++ = rep;
-            p += 2;
-            continue;
-        }
-        if (p[0] == 0xE2 && p[1] == 0x80 && p[2]) {
-            /* comillas tipográficas / guiones */
-            unsigned char c = p[2];
-            if (c == 0x9C || c == 0x9D || c == 0x98 || c == 0x99) *d++ = '"';
-            else if (c == 0x93 || c == 0x94) *d++ = '-';
-            else if (c == 0xA6) { *d++ = '.'; *d++ = '.'; *d++ = '.'; }
-            else *d++ = ' ';
-            p += 3;
-            continue;
-        }
-        /* Multibyte desconocido: saltar 1-4 bytes */
-        if ((*p & 0xF8) == 0xF0) p += 4;
-        else if ((*p & 0xF0) == 0xE0) p += 3;
-        else if ((*p & 0xE0) == 0xC0) p += 2;
-        else p++;
-        *d++ = '?';
+        int is_list = find(line, "LIST:") == 0;
+        if (in_list && !is_list) { PUT("\\end{itemize}\n"); in_list = 0; }
+        if (find(line, "H1:") == 0) { PUT("\\section*{"); PUT(line + 3); PUT("}\n"); }
+        else if (find(line, "H2:") == 0) { PUT("\\subsection*{"); PUT(line + 3); PUT("}\n"); }
+        else if (find(line, "H3:") == 0) { PUT("\\subsubsection*{"); PUT(line + 3); PUT("}\n"); }
+        else if (find(line, "P:") == 0) { PUT(line + 2); PUT("\n\n"); }
+        else if (find(line, "QUOTE:") == 0) { PUT("\\begin{quote}"); PUT(line + 6); PUT("\\end{quote}\n"); }
+        else if (find(line, "HR") == 0) PUT("\\hrule\n");
+        else if (is_list) { if (!in_list) { PUT("\\begin{itemize}\n"); in_list = 1; } PUT("\\item "); PUT(line + 5); PUT("\n"); }
+        else if (find(line, "FOOTER:") == 0) s_cpy(foot, line + 7, sizeof foot);
+        else if (line[0]) { PUT(line); PUT("\n"); }
+        (void)v;
     }
-    *d = '\0';
+    if (in_list) PUT("\\end{itemize}\n");
+    if (foot[0]) { PUT("\\hrule\n\\begin{center}\\small "); PUT(foot); PUT("\\end{center}\n"); }
+    if (!body) PUT("\\begin{document}\n");
+    PUT("\\end{document}\n");
+    out[o] = 0;
+#undef PUT
+    for (uint32_t k = 0; k <= o && k < LY_SRC_MAX; k++) ly_src[k] = out[k];
+    ly_src_len = o;
 }
-
-static void ly_strip_list_prefix(char *s)
-{
-    if (!s) return;
-    while (*s == ' ' || *s == '\t') {
-        char *d = s;
-        while (d[1]) { *d = d[1]; d++; }
-        *d = '\0';
-    }
-    if (s[0] == '-' && (s[1] == ' ' || s[1] == '\t')) {
-        char *d = s;
-        const char *p = s + 2;
-        while (*p) *d++ = *p++;
-        *d = '\0';
-    }
-}
-
-
-/* ---- Paso 2: invocación del subagente maquetador ---- */
-
-static int ly_find_substr(const char *hay, const char *needle)
-{
-    if (!hay || !needle || !*needle) return -1;
-    for (int i = 0; hay[i]; ++i) {
-        int j = 0;
-        while (needle[j] && hay[i + j] && hay[i + j] == needle[j]) j++;
-        if (!needle[j]) return i;
-    }
-    return -1;
-}
-
-static int ly_extract_layout(const char *src, char *dst, uint32_t max)
-{
-    if (!src || !dst || max < 16) return 0;
-    dst[0] = '\0';
-
-    int start = ly_find_substr(src, "#SOMA-LAYOUT");
-    if (start < 0) start = ly_find_substr(src, "TITLE:");
-    if (start < 0) start = ly_find_substr(src, "H1:");
-    if (start < 0) start = ly_find_substr(src, "H2:");
-    if (start < 0) return 0;
-
-    const char *p = src + start;
-    uint32_t n = 0;
-    while (*p && n + 1 < max) {
-        if (p[0] == '`' && p[1] == '`' && p[2] == '`') break;
-        dst[n++] = *p++;
-    }
-    dst[n] = '\0';
-    if (n < 20) return 0;
-    return 1;
-}
-
-static void ly_append_blackboard(char *mission, uint32_t max, uint32_t *pos)
-{
-    char bb[1024];
-    int n = vfs_read("/agent/blackboard.txt", bb, sizeof(bb) - 1);
-    if (n <= 0) return;
-    bb[n] = '\0';
-    if (n > 400) { bb[400] = '\0'; n = 400; }
-    const char *hdr = "\n\nNotas de investigacion (blackboard):\n";
-    for (const char *h = hdr; *h && *pos + 1 < max; ++h) mission[(*pos)++] = *h;
-    for (int i = 0; i < n && *pos + 1 < max; ++i) mission[(*pos)++] = bb[i];
-    mission[*pos] = '\0';
-}
-
-static void ly_do_generate(void)
-{
-    if (ly_prompt_len == 0) {
-        ly_strcpy(ly_status, "Escribe un tema en el campo superior", sizeof(ly_status));
-        return;
-    }
-
-    ly_strcpy(ly_status, "Generando documento... (LLM en curso, espere)", sizeof(ly_status));
-
-    char mission[768];
-    uint32_t mp = 0;
-    const char *pre =
-        "Maquetar un documento profesional sobre el siguiente tema. "
-        "Responde UNICAMENTE con el documento en formato #SOMA-LAYOUT v1 "
-        "(empieza por la linea #SOMA-LAYOUT v1, meta TITLE/SUBTITLE/FONT/ALIGN/MARGIN, "
-        "separador ---, y bloques H1/H2/H3/P/QUOTE/LIST/HR/FOOTER). "
-        "Tema: ";
-    while (*pre && mp + 1 < sizeof(mission)) mission[mp++] = *pre++;
-    for (uint32_t i = 0; i < ly_prompt_len && mp + 1 < sizeof(mission); ++i)
-        mission[mp++] = ly_prompt[i];
-    mission[mp] = '\0';
-
-    ly_append_blackboard(mission, sizeof(mission), &mp);
-
-    agent_run("maquetador", mission);
-
-    if (agent_last_response[0] == '\0') {
-        ly_strcpy(ly_status, "Sin respuesta del maquetador (LLM vacio o error)", sizeof(ly_status));
-        return;
-    }
-
-    /* Paso 3: post-process respuesta + posible archivo escrito por el agente */
-    char extracted[LY_SRC_MAX];
-    int got = ly_extract_layout(agent_last_response, extracted, sizeof(extracted));
-
-    if (!got) {
-        /* Si el agente hizo write a un fichero layout del workspace, intentar cargarlo */
-        static const char *cands[] = {
-            "/workspace/avances_ai_layout.txt",
-            "/workspace/layout.txt",
-            "/workspace/documento_layout.txt",
-            0
-        };
-        for (int ci = 0; cands[ci]; ++ci) {
-            int n = vfs_read(cands[ci], extracted, sizeof(extracted) - 1);
-            if (n > 20) {
-                extracted[n] = '\0';
-                if (ly_find_substr(extracted, "#SOMA-LAYOUT") >= 0 ||
-                    ly_find_substr(extracted, "TITLE:") >= 0) {
-                    got = 1;
-                    break;
-                }
-            }
-        }
-    }
-
-    if (got) {
-        ly_utf8_to_ascii_inplace(extracted);
-        layout_set_source(extracted, 0);
-        ly_strcpy(ly_status, "Documento maquetado en el lienzo", sizeof(ly_status));
-    } else {
-        char fallback[LY_SRC_MAX];
-        uint32_t fp = 0;
-        const char *hdr =
-            "#SOMA-LAYOUT v1\n"
-            "TITLE: Resultado del maquetador\n"
-            "SUBTITLE: Respuesta sin formato estructurado (fallback)\n"
-            "FONT: modern\n"
-            "ALIGN: left\n"
-            "MARGIN: 20\n"
-            "---\n"
-            "H1: Contenido recibido\n";
-        while (*hdr && fp + 1 < sizeof(fallback)) fallback[fp++] = *hdr++;
-
-        const char *r = agent_last_response;
-        while (*r && fp + 8 < sizeof(fallback)) {
-            fallback[fp++] = 'P'; fallback[fp++] = ':'; fallback[fp++] = ' ';
-            int col = 0;
-            while (*r && *r != '\n' && col < 120 && fp + 2 < sizeof(fallback)) {
-                fallback[fp++] = *r++;
-                col++;
-            }
-            while (*r == '\n' || *r == '\r') r++;
-            fallback[fp++] = '\n';
-        }
-        const char *ft = "FOOTER: SOMA OS · fallback de maquetacion\n";
-        while (*ft && fp + 1 < sizeof(fallback)) fallback[fp++] = *ft++;
-        fallback[fp] = '\0';
-
-        layout_set_source(fallback, 0);
-        ly_strcpy(ly_status, "Respuesta sin #SOMA-LAYOUT; mostrado en fallback", sizeof(ly_status));
-    }
-}
-
 
 void layout_set_source(const char *src, uint32_t len)
 {
     if (!src) src = "";
-    if (len == 0) {
-        while (src[len]) len++;
-    }
+    if (len == 0) while (src[len]) len++;
     if (len >= LY_SRC_MAX) len = LY_SRC_MAX - 1;
-    for (uint32_t i = 0; i < len; ++i) ly_src[i] = src[i];
-    ly_src[len] = '\0';
-    ly_src_len = len;
-    ly_utf8_to_ascii_inplace(ly_src);
-    ly_scroll = 0;
-    ly_parse();
-    ly_strcpy(ly_status, "Documento cargado", sizeof(ly_status));
+    int legacy = 0; for (uint32_t i = 0; i + 12 <= len && i < 200; i++) if (src[i] == '#' && find(src + i, "#SOMA-LAYOUT") == 0) { legacy = 1; break; }
+    if (legacy && !tex_is_latex(src, len)) legacy_to_tex(src, len);
+    else { for (uint32_t i = 0; i < len; i++) ly_src[i] = src[i]; ly_src[len] = 0; ly_src_len = len; }
+    ly_scroll = 0; ly_dirty = 1;
+    status(legacy ? "Documento #SOMA-LAYOUT convertido a LaTeX" : "Documento cargado", 1);
+}
+static void load_path(void)
+{
+    static char buf[LY_SRC_MAX];                            /* PARCHE 087: documentos de hasta 32 KiB */
+    int n = vfs_read(ly_path, buf, sizeof buf - 1);
+    if (n <= 0) { char m[112] = "No se pudo leer "; s_cat(m, ly_path, sizeof m); status(m, 0); return; }
+    buf[n] = 0;
+    layout_set_source(buf, (uint32_t)n);
+    char m[112] = "Abierto: "; s_cat(m, ly_path, sizeof m); status(m, 1);
+}
+void layout_open_file(const char *path)
+{
+    if (!path || !*path) return;
+    s_cpy(ly_path, path, sizeof ly_path);
+    load_path();
+    ly_view = 0;
 }
 
 void layout_init(void)
 {
-    ly_prompt[0] = '\0';
-    ly_prompt_len = 0;
-    ly_prompt_focus = 1;
-    ly_scroll = 0;
-    ly_strcpy(ly_status, "Listo · escribe un tema y pulsa Generar (Paso 2: agente)", sizeof(ly_status));
-    layout_set_source(SAMPLE_DOC, 0);
+    ly_prompt[0] = 0; ly_prompt_len = 0; ly_prompt_focus = 0; ly_scroll = 0; ly_view = 0;
+    if (!ly_src_len) { layout_set_source(SAMPLE_TEX, 0); status("Documento de ejemplo. Abre un .tex o pide uno a la IA abajo.", 1); }
+}
+const char *layout_get_prompt(void) { return ly_prompt; }
+
+/* ---------------------------------------------------------------- IA */
+static void append_blackboard(char *mission, uint32_t max, uint32_t *pos)
+{
+    char bb[1024];
+    int n = vfs_read("/agent/blackboard.txt", bb, sizeof(bb) - 1);
+    if (n <= 0) return;
+    bb[n] = 0; if (n > 400) { bb[400] = 0; n = 400; }
+    const char *hdr = "\n\nNotas de investigacion (blackboard):\n";
+    for (const char *h = hdr; *h && *pos + 1 < max; ++h) mission[(*pos)++] = *h;
+    for (int i = 0; i < n && *pos + 1 < max; ++i) mission[(*pos)++] = bb[i];
+    mission[*pos] = 0;
+}
+static void do_generate(void)
+{
+    if (ly_prompt_len == 0) { status("Escribe primero el tema del documento", 0); return; }
+    status("El maquetador esta escribiendo el LaTeX...", 1);
+    char mission[900]; uint32_t mp = 0;
+    const char *pre = "Escribe un documento profesional en LaTeX sobre el tema indicado. Responde UNICAMENTE con el codigo LaTeX completo, "
+                      "desde \\documentclass{article} hasta \\end{document}, sin explicaciones. Usa \\title, \\author, \\maketitle, \\section, "
+                      "\\subsection, itemize/enumerate, tabular cuando ayude y formulas con $...$ o equation si el tema lo pide. Tema: ";
+    while (*pre && mp + 1 < sizeof mission) mission[mp++] = *pre++;
+    for (uint32_t i = 0; i < ly_prompt_len && mp + 1 < sizeof mission; ++i) mission[mp++] = ly_prompt[i];
+    mission[mp] = 0;
+    append_blackboard(mission, sizeof mission, &mp);
+    agent_run("maquetador", mission);
+    const char *r = agent_last_response;
+    if (!r || !r[0]) { status("Sin respuesta del maquetador (LLM vacio o error)", 0); return; }
+    int a = find(r, "\\documentclass"); if (a < 0) a = find(r, "\\begin{document}"); if (a < 0) a = find(r, "\\section");
+    if (a >= 0) {
+        int b = find(r + a, "\\end{document}"); int n = b >= 0 ? b + 14 : s_len(r + a);
+        int f = find(r + a, "```"); if (f >= 0 && (b < 0 || f < b)) n = f;
+        layout_set_source(r + a, (uint32_t)n);
+    } else if (find(r, "#SOMA-LAYOUT") >= 0 || find(r, "TITLE:") >= 0) layout_set_source(r + (find(r, "#SOMA-LAYOUT") >= 0 ? find(r, "#SOMA-LAYOUT") : 0), 0);
+    else {                                                  /* texto sin formato: parrafos */
+        static char t[LY_SRC_MAX]; t[0] = 0;
+        s_cat(t, "\\documentclass{article}\\begin{document}\\section*{Respuesta del maquetador}\n", sizeof t);
+        s_cat(t, r, sizeof t); s_cat(t, "\n\\end{document}\n", sizeof t);
+        layout_set_source(t, 0);
+    }
+    s_cpy(ly_path, "/workspace/documento.tex", sizeof ly_path);
+    int w = vfs_write(ly_path, ly_src, ly_src_len);
+    status(w >= 0 ? "Documento generado y guardado en /workspace/documento.tex" : "Documento generado (no cupo en RamFS para guardarlo)", 1);
 }
 
-const char *layout_get_prompt(void)
+/* ---------------------------------------------------------------- disposicion */
+enum { B_OPEN = 0, B_RELOAD, B_EDIT, B_DOC, B_SRC, B_SMALL, B_BIG, B_N };
+#define TB_H 48
+#define PR_H 52
+#define ST_H 26
+#define BTN 32
+struct ll { int x, y, w, h, bx[B_N], by, path_x, path_w, area_x, area_y, area_w, area_h, pr_y, st_y, paper_x, paper_w, col_x, col_w, sb_x, gen_x; };
+static void lay(struct ll *L, uint32_t wx, uint32_t wy, uint32_t ww, uint32_t wh)
 {
-    return ly_prompt;
+    L->x = (int)wx; L->y = (int)wy; L->w = (int)ww; L->h = (int)wh;
+    L->by = L->y + (TB_H - BTN) / 2;
+    int x = L->x + 12;
+    for (int i = 0; i < B_N; i++) {
+        L->bx[i] = x;
+        x += (i == B_DOC || i == B_SRC) ? 92 : BTN + 4;
+        if (i == B_EDIT || i == B_SRC) x += 14;
+    }
+    L->path_x = x + 10; L->path_w = L->x + L->w - 12 - L->path_x; if (L->path_w < 0) L->path_w = 0;
+    L->st_y = L->y + L->h - ST_H; L->pr_y = L->st_y - PR_H;
+    L->area_x = L->x; L->area_y = L->y + TB_H; L->area_w = L->w - 12; L->area_h = L->pr_y - L->area_y;
+    L->sb_x = L->x + L->w - 12;
+    L->paper_w = L->area_w - 40; if (L->paper_w > 860) L->paper_w = 860;
+    if (L->paper_w < 200) L->paper_w = L->area_w - 8;
+    L->paper_x = L->area_x + (L->area_w - L->paper_w) / 2;
+    int pad = L->paper_w > 600 ? 56 : L->paper_w > 400 ? 32 : 14;
+    L->col_x = L->paper_x + pad; L->col_w = L->paper_w - 2 * pad;
+    L->gen_x = L->x + L->w - 16 - 110;
+}
+static void typeset_if_needed(const struct ll *L)
+{
+    if (ly_font_gen != wf_ui_gen()) { ly_font_gen = wf_ui_gen(); ly_dirty = 1; }
+    if (!ly_dirty && ly_w_cached == L->col_w && ly_px_cached == ly_px) return;
+    ly_out.ops = ly_ops; ly_out.cap = OPS_CAP; ly_out.pool = ly_pool; ly_out.poolcap = POOL_CAP;
+    int r = tex_typeset(ly_src, ly_src_len, L->col_w, ly_px, &g_metrics, &ly_out);
+    ly_dirty = 0; ly_w_cached = L->col_w; ly_px_cached = ly_px;
+    ly_doc_h = ly_out.height + 112;
+    if (r < 0) status("Documento demasiado largo: se muestra lo que cabe", 0);
+}
+static int max_scroll(const struct ll *L, int content_h) { int m = content_h - L->area_h + 24; return m > 0 ? m : 0; }
+static int src_lines(void) { int n = 1; for (uint32_t i = 0; i < ly_src_len; i++) if (ly_src[i] == '\n') n++; return n; }
+static int content_height(const struct ll *L) { (void)L; return ly_view ? src_lines() * 18 + 24 : ly_doc_h + 24; }
+
+/* ---------------------------------------------------------------- iconos */
+#define LN(a, b, c, d, w, col) fb_line_aa((a) * 16, (b) * 16, (c) * 16, (d) * 16, (w), (col))
+static void icon(int b, int cx, int cy, uint32_t col)
+{
+    switch (b) {
+    case B_OPEN: fb_stroke_rrect_aa(cx - 9, cy - 6, 18, 13, 2, col); LN(cx - 9, cy - 3, cx - 2, cy - 3, 20, col); LN(cx - 9, cy - 6, cx - 4, cy - 6, 20, col); break;
+    case B_RELOAD: fb_stroke_rrect_aa(cx - 8, cy - 8, 16, 16, 8, col); fb_fill_rect((uint32_t)(cx + 2), (uint32_t)(cy - 10), 8, 7, KC_BAR); LN(cx + 3, cy - 8, cx + 8, cy - 8, 22, col); LN(cx + 8, cy - 8, cx + 8, cy - 3, 22, col); break;
+    case B_EDIT: LN(cx - 8, cy + 8, cx + 6, cy - 6, 36, col); LN(cx - 8, cy + 8, cx - 9, cy + 9, 24, col); LN(cx + 4, cy - 8, cx + 8, cy - 4, 24, col); break;
+    case B_SMALL: case B_BIG: {
+        int big = b == B_BIG; const char *t = "A";
+        if (has_wf()) wf_draw(cx - (big ? 8 : 6), cy + (big ? 6 : 5), t, 1, big ? 17 : 12, col & 0x00FFFFFFu, WF_BOLD, 255);
+        LN(cx + 4, cy - 6, cx + 10, cy - 6, 20, col); if (big) LN(cx + 7, cy - 9, cx + 7, cy - 3, 20, col); break; }
+    }
 }
 
-/* ---- word-wrap simple (8px por glifo * scale) ---- */
-
-static uint32_t ly_draw_wrapped(
-    uint32_t x, uint32_t y, uint32_t max_w,
-    const char *text, uint32_t color, int scale, int center)
+/* ---------------------------------------------------------------- dibujo */
+static void draw_ops(int ox, int oy, int y_min, int y_max)
 {
-    if (!text || !*text) return y;
-    int cw = 8 * scale;
-    int lh = 10 * scale;
-    uint32_t line_start = 0;
-    uint32_t i = 0;
-    uint32_t last_space = 0;
-    uint32_t col = 0;
-    char buf[LY_LINE_MAX];
-
-    while (text[i]) {
-        char ch = text[i];
-        if (ch == ' ') last_space = i;
-        if (ch == '\n' || (col + 1) * (uint32_t)cw > max_w) {
-            uint32_t end = (ch == '\n') ? i : ((last_space > line_start) ? last_space : i);
-            uint32_t n = 0;
-            for (uint32_t k = line_start; k < end && n + 1 < LY_LINE_MAX; ++k)
-                buf[n++] = text[k];
-            buf[n] = '\0';
-            uint32_t tw = n * (uint32_t)cw;
-            uint32_t dx = center && tw < max_w ? x + (max_w - tw) / 2 : x;
-            font_draw_string(dx, y, buf, color, scale);
-            y += (uint32_t)lh + 2;
-            if (ch == '\n') {
-                line_start = i + 1;
-            } else if (last_space > line_start) {
-                line_start = last_space + 1;
-            } else {
-                line_start = i;
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < ly_out.nops; i++) {
+            const struct tex_op *p = &ly_ops[i];
+            int bg = p->type == TOP_RECT && p->style == 1;
+            if ((pass == 0) != bg) continue;
+            if (p->type == TOP_TEXT) {
+                int y = oy + p->y;
+                if (y + p->px < y_min || y - p->px > y_max) continue;
+                int fl = (p->style & TS_BOLD ? WF_BOLD : 0) | (p->style & TS_ITALIC ? WF_ITALIC : 0) | (p->style & TS_MONO ? WF_MONO : 0);
+                if (has_wf()) wf_draw(ox + p->x, y, ly_pool + p->s, p->n, p->px, p->rgb, fl, 255);
+                else font_draw_string((uint32_t)(ox + p->x), (uint32_t)(y - 10), ly_pool + p->s, p->rgb, 1);
+            } else if (p->type == TOP_RECT) {
+                int y = oy + p->y;
+                if (y + p->h < y_min || y > y_max) continue;
+                fb_fill_rect((uint32_t)(ox + p->x), (uint32_t)y, (uint32_t)(p->w > 0 ? p->w : 1), (uint32_t)(p->h > 0 ? p->h : 1), p->rgb);
+            } else if (p->type == TOP_LINE) {
+                int y = oy + p->y / 16;
+                if (y < y_min - 200 || y > y_max + 200) continue;
+                fb_line_aa(ox * 16 + p->x, oy * 16 + p->y, ox * 16 + p->x + p->w, oy * 16 + p->y + p->h, p->px, 0xFF000000u | p->rgb);
+            } else if (p->type == TOP_IMAGE) {
+                int y = oy + p->y;
+                if (y + p->h < y_min || y > y_max) continue;
+                struct icache *c = img_get(ly_pool + p->s);
+                if (c->ok) fb_blit_scale(ox + p->x, y, p->w, p->h, c->im.px, c->im.w, c->im.h, c->im.w);
             }
-            last_space = line_start;
-            col = 0;
-            i = line_start;
-            continue;
         }
-        col++;
+}
+/* fuente con colores: comandos, formulas, comentarios, llaves */
+static void draw_source(const struct ll *L, int top)
+{
+    int px = 13, lh = 18, gut = 44, x0 = L->paper_x, y = L->area_y + 12 - top;
+    fb_fill_rect((uint32_t)x0, (uint32_t)L->area_y, (uint32_t)L->paper_w, (uint32_t)L->area_h, 0x000E1420);
+    fb_fill_rect((uint32_t)x0, (uint32_t)L->area_y, (uint32_t)gut, (uint32_t)L->area_h, 0x000B1019);
+    uint32_t i = 0; int line = 1, in_math = 0;
+    while (i <= ly_src_len) {
+        uint32_t a = i; while (i < ly_src_len && ly_src[i] != '\n') i++;
+        if (y + lh > L->area_y && y < L->area_y + L->area_h) {
+            char nb[8] = ""; s_num(nb, sizeof nb, line);
+            if (has_wf()) wf_draw(x0 + gut - 8 - wf_width(nb, (uint32_t)s_len(nb), 11, WF_MONO), y + 13, nb, (uint32_t)s_len(nb), 11, KC_FAINT, WF_MONO, 255);
+            int x = x0 + gut + 10;
+            uint32_t k = a;
+            while (k < i) {
+                uint32_t s = k; uint32_t col = KC_TXT;
+                char c = ly_src[k];
+                if (c == '%') { k = i; col = 0x006B7280; }
+                else if (c == '\\') { k++; if (k < i && ((ly_src[k] >= 'a' && ly_src[k] <= 'z') || (ly_src[k] >= 'A' && ly_src[k] <= 'Z'))) { while (k < i && ((ly_src[k] >= 'a' && ly_src[k] <= 'z') || (ly_src[k] >= 'A' && ly_src[k] <= 'Z'))) k++; } else if (k < i) k++; col = 0x0060A5FA; }
+                else if (c == '$') { k++; if (k < i && ly_src[k] == '$') k++; in_math = !in_math; col = 0x0034D399; }
+                else if (c == '{' || c == '}' || c == '[' || c == ']') { k++; col = 0x00FBBF24; }
+                else { while (k < i && ly_src[k] != '\\' && ly_src[k] != '$' && ly_src[k] != '%' && ly_src[k] != '{' && ly_src[k] != '}' && ly_src[k] != '[' && ly_src[k] != ']') k++; col = in_math ? 0x0086EFAC : KC_TXT; }
+                if (k > s && has_wf()) { wf_draw(x, y + 13, ly_src + s, k - s, px, col, WF_MONO, 255); x += wf_width(ly_src + s, k - s, px, WF_MONO); }
+                if (x > x0 + L->paper_w) break;
+            }
+        }
+        y += lh; line++;
+        if (i >= ly_src_len) break;
         i++;
     }
-    if (line_start < i) {
-        uint32_t n = 0;
-        for (uint32_t k = line_start; k < i && n + 1 < LY_LINE_MAX; ++k)
-            buf[n++] = text[k];
-        buf[n] = '\0';
-        uint32_t tw = n * (uint32_t)cw;
-        uint32_t dx = center && tw < max_w ? x + (max_w - tw) / 2 : x;
-        font_draw_string(dx, y, buf, color, scale);
-        y += (uint32_t)lh + 2;
-    }
-    return y;
 }
-
-/* ---- render ---- */
-
 void layout_render_window(uint32_t win_x, uint32_t win_y, uint32_t win_w, uint32_t win_h, int show_cursor)
 {
     (void)show_cursor;
-    if (win_w < 200 || win_h < 120) return;
+    if (win_w < 240 || win_h < 180) return;
+    if (!ly_src_len) layout_init();
+    struct ll L; lay(&L, win_x, win_y, win_w, win_h);
+    if (!ly_view) typeset_if_needed(&L);
+    int ms = max_scroll(&L, content_height(&L));
+    if (ly_scroll > ms) ly_scroll = ms;
+    if (ly_scroll < 0) ly_scroll = 0;
+    char b[128];
 
-    /* Marco ventana */
-    fb_fill_rect(win_x, win_y, win_w, win_h, 0x000F172A);
-    fb_draw_rect(win_x, win_y, win_w, win_h, 0x0038BDF8);
-
-    /* Barra título */
-    fb_fill_rect(win_x + 1, win_y + 1, win_w - 2, 28, 0x001E293B);
-    font_draw_string(win_x + 12, win_y + 8, "MAQUETADOR DE DOCUMENTOS", 0x0038BDF8, 1);
-    font_draw_string(win_x + win_w - 90, win_y + 8, "[ Esc ]", 0x0094A3B8, 1);
-
-    /* Barra de prompt */
-    uint32_t py = win_y + 32;
-    fb_fill_rect(win_x + 1, py, win_w - 2, 36, 0x00161F30);
-    font_draw_string(win_x + 10, py + 12, "Tema:", 0x0094A3B8, 1);
-
-    uint32_t field_x = win_x + 56;
-    uint32_t field_w = win_w - 180;
-    if (field_w < 80) field_w = 80;
-    fb_fill_rounded_rect(field_x, py + 6, field_w, 24, 4, 0x000F172A);
-    fb_draw_rounded_rect(field_x, py + 6, field_w, 24, 4,
-                         ly_prompt_focus ? 0x0038BDF8 : 0x00334155);
-
-    char vis[96];
-    uint32_t max_chars = field_w / 8;
-    if (max_chars > 90) max_chars = 90;
-    uint32_t start = 0;
-    if (ly_prompt_len > max_chars) start = ly_prompt_len - max_chars;
-    uint32_t vi = 0;
-    for (uint32_t i = start; i < ly_prompt_len && vi + 1 < sizeof(vis); ++i)
-        vis[vi++] = ly_prompt[i];
-    vis[vi] = '\0';
-    font_draw_string(field_x + 6, py + 12, vis[0] ? vis : "Describe el documento...", 
-                     vis[0] ? 0x00F8FAFC : 0x0064748B, 1);
-
-    /* Botón Generar (placeholder Paso 2) */
-    uint32_t bx = win_x + win_w - 110;
-    fb_fill_rounded_rect(bx, py + 6, 96, 24, 4, 0x000EA5E9);
-    font_draw_string(bx + 16, py + 12, "Generar", 0x000F172A, 1);
-
-    /* Lienzo del documento (papel) */
-    uint32_t paper_x = win_x + 8;
-    uint32_t paper_y = win_y + 72;
-    uint32_t paper_w = win_w - 16;
-    uint32_t paper_h = win_h - 72 - 26;
-    if ((int32_t)paper_h < 40) return;
-
-    fb_fill_rect(paper_x, paper_y, paper_w, paper_h, 0x00F8FAFC); /* papel claro */
-    fb_draw_rect(paper_x, paper_y, paper_w, paper_h, 0x00CBD5E1);
-
-    uint32_t content_x = paper_x + (uint32_t)ly_margin;
-    uint32_t content_w = paper_w - 2 * (uint32_t)ly_margin;
-    uint32_t cy = paper_y + 16 - (uint32_t)ly_scroll;
-    uint32_t bottom = paper_y + paper_h - 8;
-
-    font_set(ly_font_id);
-
-    /* Título */
-    if (ly_title[0] && cy + 20 > paper_y && cy < bottom) {
-        uint32_t tw = 0;
-        for (const char *t = ly_title; *t; ++t) tw += 16;
-        uint32_t dx = ly_align_center && tw < content_w
-                    ? content_x + (content_w - tw) / 2 : content_x;
-        if (cy >= paper_y)
-            font_draw_string(dx, cy, ly_title, 0x000F172A, 2);
-        cy += 28;
+    /* barra superior */
+    fb_fill_rect(win_x, win_y, win_w, TB_H, KC_BAR);
+    fb_fill_rect(win_x, win_y + TB_H - 1, win_w, 1, KC_LINE);
+    for (int i = 0; i < B_N; i++) {
+        if (i == B_DOC || i == B_SRC) continue;
+        icon(i, L.bx[i] + BTN / 2, L.by + BTN / 2, 0xFFC4CDDAu);
+        if (i == B_EDIT) fb_fill_rect((uint32_t)(L.bx[i] + BTN + 10), (uint32_t)(L.by + 6), 1, BTN - 12, KC_LINE);
     }
-    if (ly_subtitle[0] && cy + 12 > paper_y && cy < bottom) {
-        if (cy >= paper_y)
-            cy = ly_draw_wrapped(content_x, cy, content_w, ly_subtitle, 0x00475569, 1, ly_align_center);
-        else
-            cy += 14;
-        cy += 6;
-        /* línea bajo subtítulo */
-        if (cy >= paper_y && cy < bottom)
-            fb_fill_rect(content_x, cy, content_w, 1, 0x00E2E8F0);
-        cy += 12;
+    /* selector Documento / Fuente */
+    fb_fill_rounded_rect(L.bx[B_DOC] - 2, L.by - 2, 184 + 4, BTN + 4, 10, 0x000C1119);
+    fb_fill_rounded_rect(L.bx[ly_view ? B_SRC : B_DOC], L.by, 92 - 2, BTN, 8, 0x00283449);
+    tx(L.bx[B_DOC] + (90 - tw("Documento", 12, 1)) / 2, L.by, BTN, "Documento", 12, ly_view ? KC_DIM : 0x00FFFFFF, 1);
+    tx(L.bx[B_SRC] + (90 - tw("Fuente", 12, 1)) / 2, L.by, BTN, "Fuente", 12, ly_view ? 0x00FFFFFF : KC_DIM, 1);
+    fb_fill_rect((uint32_t)(L.bx[B_SRC] + 92 + 8), (uint32_t)(L.by + 6), 1, BTN - 12, KC_LINE);
+    if (L.path_w > 80) {
+        fb_fill_rounded_rect(L.path_x, L.by, L.path_w, BTN, BTN / 2, KC_FIELD);
+        fb_stroke_rrect_aa(L.path_x, L.by, L.path_w, BTN, BTN / 2, 0xFF263142u);
+        fb_fill_rrect_aa(L.path_x + 12, L.by + 9, 12, 15, 2, 0xFF38BDF8u);
+        if (has_wf()) wf_draw(L.path_x + 14, L.by + 21, "T", 1, 9, 0x000C111B, WF_BOLD, 255);
+        fb_set_clip(L.path_x + 30, L.by, L.path_w - 40, BTN);
+        tx(L.path_x + 32, L.by, BTN, ly_path, 13, KC_TXT, 0);
+        fb_reset_clip();
     }
 
-    for (int i = 0; i < ly_block_count; ++i) {
-        if (cy > bottom + 40) break;
-        struct ly_block *b = &ly_blocks[i];
-        int scale = 1;
-        uint32_t color = 0x001E293B;
-        uint32_t gap_before = 6;
-        uint32_t gap_after = 4;
-        int center = ly_align_center;
-
-        switch (b->kind) {
-        case LY_H1:
-            scale = 2; color = 0x000F172A; gap_before = 16; gap_after = 8; break;
-        case LY_H2:
-            scale = 1; color = 0x001E3A5F; gap_before = 14; gap_after = 6; break;
-        case LY_H3:
-            scale = 1; color = 0x00334155; gap_before = 10; gap_after = 4; break;
-        case LY_QUOTE:
-            color = 0x00475569; gap_before = 10; gap_after = 8; break;
-        case LY_LIST:
-            color = 0x001E293B; gap_before = 4; gap_after = 2; break;
-        case LY_HR:
-            gap_before = 10; gap_after = 10; break;
-        case LY_FOOTER:
-            color = 0x0094A3B8; gap_before = 16; gap_after = 4; center = 1; break;
-        default:
-            break;
+    /* area */
+    fb_fill_rect((uint32_t)L.area_x, (uint32_t)L.area_y, (uint32_t)L.w, (uint32_t)L.area_h, KC_AREA);
+    fb_set_clip(L.area_x, L.area_y, L.area_w, L.area_h);
+    if (ly_view) draw_source(&L, ly_scroll);
+    else {
+        int py = L.area_y + 20 - ly_scroll, ph = ly_doc_h;
+        fb_draw_shadow(L.paper_x, py, L.paper_w, ph, 4, 26, 10, 0xA0000000u);
+        fb_fill_rect((uint32_t)L.paper_x, (uint32_t)(py > L.area_y ? py : L.area_y), (uint32_t)L.paper_w,
+                     (uint32_t)((py + ph) - (py > L.area_y ? py : L.area_y) > 0 ? (py + ph) - (py > L.area_y ? py : L.area_y) : 0), 0x00FFFFFF);
+        draw_ops(L.col_x, py + 56, L.area_y, L.area_y + L.area_h);
+    }
+    fb_reset_clip();
+    /* barra de desplazamiento */
+    {
+        int ch = content_height(&L), track = L.area_h - 8;
+        fb_fill_rect((uint32_t)L.sb_x, (uint32_t)L.area_y, 12, (uint32_t)L.area_h, KC_AREA);
+        if (ch > L.area_h) {
+            int th = track * L.area_h / ch; if (th < 30) th = 30;
+            int ty = L.area_y + 4 + (track - th) * ly_scroll / (ms ? ms : 1);
+            fb_fill_rounded_rect(L.sb_x + 3, ty, 6, th, 3, ly_drag_sb ? 0x005B6B85 : 0x00334155);
         }
-
-        cy += gap_before;
-        if (cy > bottom) break;
-
-        if (b->kind == LY_HR) {
-            if (cy >= paper_y && cy < bottom)
-                fb_fill_rect(content_x, cy, content_w, 1, 0x00CBD5E1);
-            cy += gap_after;
-            continue;
-        }
-
-        if (b->kind == LY_QUOTE) {
-            if (cy >= paper_y && cy < bottom)
-                fb_fill_rect(content_x, cy, 3, 36, 0x0038BDF8);
-            if (cy >= paper_y)
-                cy = ly_draw_wrapped(content_x + 12, cy, content_w - 12, b->text, color, 1, 0);
-            else
-                cy += 14;
-            cy += gap_after;
-            continue;
-        }
-
-        if (b->kind == LY_LIST) {
-            char line[LY_LINE_MAX];
-            line[0] = '-'; line[1] = ' ';
-            ly_strcpy(line + 2, b->text, sizeof(line) - 2);
-            if (cy >= paper_y)
-                cy = ly_draw_wrapped(content_x, cy, content_w, line, color, 1, 0);
-            else
-                cy += 12;
-            cy += gap_after;
-            continue;
-        }
-
-        if (cy >= paper_y)
-            cy = ly_draw_wrapped(content_x, cy, content_w, b->text, color, scale, center);
-        else
-            cy += (uint32_t)(10 * scale + 2);
-        cy += gap_after;
     }
 
-    /* Status bar */
-    fb_fill_rect(win_x + 1, win_y + win_h - 24, win_w - 2, 23, 0x001E293B);
-    font_draw_string(win_x + 10, win_y + win_h - 16, ly_status, 0x0094A3B8, 1);
+    /* peticion a la IA */
+    fb_fill_rect(win_x, (uint32_t)L.pr_y, win_w, PR_H, KC_BAR);
+    fb_fill_rect(win_x, (uint32_t)L.pr_y, win_w, 1, KC_LINE);
+    {
+        int fx = L.x + 16, fw = L.gen_x - 10 - fx, fy = L.pr_y + 10, fh = 32;
+        fb_fill_rounded_rect(fx, fy, fw, fh, fh / 2, KC_FIELD);
+        fb_stroke_rrect_aa(fx, fy, fw, fh, fh / 2, ly_prompt_focus ? (0xFF000000u | KC_ACC) : 0xFF263142u);
+        /* chispa */
+        int sx = fx + 18, sy = fy + fh / 2;
+        LN(sx, sy - 7, sx, sy + 7, 22, 0xFFA5B4FCu); LN(sx - 7, sy, sx + 7, sy, 22, 0xFFA5B4FCu); LN(sx - 4, sy - 4, sx + 4, sy + 4, 14, 0xFFA5B4FCu); LN(sx - 4, sy + 4, sx + 4, sy - 4, 14, 0xFFA5B4FCu);
+        fb_set_clip(fx + 34, fy, fw - 46, fh);
+        if (ly_prompt_len || ly_prompt_focus) {
+            tx(fx + 36, fy, fh, ly_prompt, 13, 0x00FFFFFF, 0);
+            if (ly_prompt_focus && ((timer_get_uptime_ms() / 530) & 1) == 0) fb_fill_rect((uint32_t)(fx + 37 + tw(ly_prompt, 13, 0)), (uint32_t)(fy + 8), 2, 16, KC_ACC);
+        } else tx(fx + 36, fy, fh, "Pide un documento a la IA: tema, publico, extension...", 13, KC_FAINT, 0);
+        fb_reset_clip();
+        fb_fill_rounded_rect(L.gen_x, fy, 110, fh, fh / 2, KC_PRIMARY);
+        tx(L.gen_x + (110 - tw("Generar", 13, 1)) / 2, fy, fh, "Generar", 13, 0x00FFFFFF, 1);
+    }
 
-    char meta[48];
-    int mi = 0;
-    const char *ms = "bloques:";
-    while (*ms) meta[mi++] = *ms++;
-    int n = ly_block_count;
-    char tb[8]; int tn = 0;
-    if (n == 0) tb[tn++] = '0';
-    else { int t = n; while (t) { tb[tn++] = '0' + (t % 10); t /= 10; } }
-    while (tn) meta[mi++] = tb[--tn];
-    meta[mi] = '\0';
-    font_draw_string(win_x + win_w - 100, win_y + win_h - 16, meta, 0x0064748B, 1);
+    /* estado */
+    fb_fill_rect(win_x, (uint32_t)L.st_y, win_w, ST_H, KC_BAR);
+    fb_fill_rect(win_x, (uint32_t)L.st_y, win_w, 1, KC_LINE);
+    fb_fill_rrect_aa(L.x + 12, L.st_y + 9, 8, 8, 4, ly_status_ok ? 0xFF34D399u : 0xFFF87171u);
+    fb_set_clip(L.x + 26, L.st_y, L.w / 2, ST_H);
+    tx(L.x + 26, L.st_y, ST_H, ly_status, 12, KC_TXT, 0);
+    fb_reset_clip();
+    b[0] = 0;
+    if (!ly_view) {
+        s_num(b, sizeof b, ly_out.sections); s_cat(b, " secciones  ", sizeof b); s_num(b, sizeof b, ly_out.equations); s_cat(b, " ecuaciones  ", sizeof b);
+        if (ly_out.errors) { s_num(b, sizeof b, ly_out.errors); s_cat(b, " sin reconocer  ", sizeof b); }
+    } else { s_num(b, sizeof b, src_lines()); s_cat(b, " lineas  ", sizeof b); s_num(b, sizeof b, (int)ly_src_len); s_cat(b, " bytes  ", sizeof b); }
+    s_num(b, sizeof b, ly_px); s_cat(b, " px", sizeof b);
+    tx(L.x + L.w - 14 - tw(b, 12, 0), L.st_y, ST_H, b, 12, ly_out.errors && !ly_view ? 0x00FBBF24 : KC_DIM, 0);
 }
 
+/* ---------------------------------------------------------------- raton y teclado */
+static void set_px(int px) { if (px < 11) px = 11; if (px > 24) px = 24; if (px != ly_px) { ly_px = px; ly_dirty = 1; } }
 int layout_handle_click(int32_t mx, int32_t my, uint32_t win_x, uint32_t win_y, uint32_t win_w, uint32_t win_h)
 {
-    /* Cerrar si clic en zona Esc (esquina superior derecha) */
-    if (mx >= (int32_t)(win_x + win_w - 90) && mx <= (int32_t)(win_x + win_w - 8) &&
-        my >= (int32_t)(win_y + 2) && my <= (int32_t)(win_y + 28)) {
-        return 1; /* pedir cierre */
-    }
-
-    /* Focus en campo prompt */
-    uint32_t py = win_y + 32;
-    uint32_t field_x = win_x + 56;
-    uint32_t field_w = win_w - 180;
-    if (mx >= (int32_t)field_x && mx <= (int32_t)(field_x + field_w) &&
-        my >= (int32_t)(py + 6) && my <= (int32_t)(py + 30)) {
-        ly_prompt_focus = 1;
-        return 0;
-    }
-
-    /* Botón Generar — invoca subagente maquetador (Paso 2) */
-    uint32_t bx = win_x + win_w - 110;
-    if (mx >= (int32_t)bx && mx <= (int32_t)(bx + 96) &&
-        my >= (int32_t)(py + 6) && my <= (int32_t)(py + 30)) {
-        ly_prompt_focus = 0;
-        ly_do_generate();
-        return 0;
-    }
-
-    /* Scroll rueda simulada: clic en mitad superior/inferior del papel */
-    uint32_t paper_y = win_y + 72;
-    uint32_t paper_h = win_h - 72 - 26;
-    if (mx >= (int32_t)(win_x + 8) && mx <= (int32_t)(win_x + win_w - 8) &&
-        my >= (int32_t)paper_y && my <= (int32_t)(paper_y + paper_h)) {
-        if (my < (int32_t)(paper_y + paper_h / 2)) {
-            if (ly_scroll > 24) ly_scroll -= 24;
-            else ly_scroll = 0;
-        } else {
-            ly_scroll += 24;
+    struct ll L; lay(&L, win_x, win_y, win_w, win_h);
+    ly_drag_sb = 0;
+    if (my >= L.by && my < L.by + BTN) {
+        for (int i = 0; i < B_N; i++) {
+            int w = (i == B_DOC || i == B_SRC) ? 90 : BTN;
+            if (mx < L.bx[i] || mx >= L.bx[i] + w) continue;
+            switch (i) {
+            case B_OPEN: case B_RELOAD: load_path(); break;
+            case B_EDIT:   /* lo que se ve se guarda en la ruta y se abre en el Bloc de notas */
+                (void)vfs_write(ly_path, ly_src, ly_src_len);
+                status("Editando en el Bloc de notas: guarda alli y pulsa Recargar", 1); gui_open_notepad(ly_path); break;
+            case B_DOC: ly_view = 0; ly_scroll = 0; break;
+            case B_SRC: ly_view = 1; ly_scroll = 0; break;
+            case B_SMALL: set_px(ly_px - 1); break;
+            case B_BIG: set_px(ly_px + 1); break;
+            }
+            ly_prompt_focus = 0;
+            return 0;
         }
         return 0;
     }
-
+    if (my >= L.pr_y && my < L.st_y) {
+        if (mx >= L.gen_x) { ly_prompt_focus = 0; do_generate(); }
+        else ly_prompt_focus = 1;
+        return 0;
+    }
+    ly_prompt_focus = 0;
+    if (mx >= L.sb_x && my >= L.area_y && my < L.pr_y) { ly_drag_sb = 1; ly_drag_y0 = my; ly_drag_s0 = ly_scroll; return 0; }
     return 0;
 }
-
+int layout_mouse(int32_t mx, int32_t my, uint32_t win_x, uint32_t win_y, uint32_t win_w, uint32_t win_h, int wheel, int held)
+{
+    struct ll L; lay(&L, win_x, win_y, win_w, win_h);
+    int old = ly_scroll, ms = max_scroll(&L, content_height(&L));
+    if (wheel && mx >= L.area_x && mx < L.x + L.w && my >= L.area_y && my < L.pr_y) ly_scroll += wheel * 48;
+    if (ly_drag_sb) {
+        if (!held) ly_drag_sb = 0;
+        else { int track = L.area_h - 8, ch = content_height(&L); if (ch > 0 && track > 0) ly_scroll = ly_drag_s0 + (my - ly_drag_y0) * ch / track; }
+    }
+    if (ly_scroll > ms) ly_scroll = ms;
+    if (ly_scroll < 0) ly_scroll = 0;
+    return ly_scroll != old || ly_drag_sb;
+}
 void layout_handle_key(char c)
 {
-    if (c == 27) { /* Esc — el GUI puede cerrar; aquí solo quitamos focus */
-        ly_prompt_focus = 0;
-        return;
-    }
-
+    if (c == 27) { ly_prompt_focus = 0; return; }
     if (!ly_prompt_focus) {
-        /* Scroll con teclas */
-        if (c == 16 /* Ctrl+P */ || c == 'k') {
-            if (ly_scroll > 16) ly_scroll -= 16; else ly_scroll = 0;
-        } else if (c == 14 /* Ctrl+N */ || c == 'j') {
-            ly_scroll += 16;
-        }
+        if (c == 'k' || c == 16) ly_scroll -= 40;
+        else if (c == 'j' || c == 14) ly_scroll += 40;
+        else if (c == ' ') ly_scroll += 300;
+        else if (c == 'b') ly_scroll -= 300;
+        else if (c == '+' || c == '=') set_px(ly_px + 1);
+        else if (c == '-') set_px(ly_px - 1);
+        else if (c == 'f' || c == '\t') { ly_view = !ly_view; ly_scroll = 0; }
+        else if (c == 'r' || c == 18) load_path();
+        else if (c == 'g' || c == '\r' || c == '\n') ly_prompt_focus = 1;
+        if (ly_scroll < 0) ly_scroll = 0;
         return;
     }
-
-    if (c == '\b' || c == 127) {
-        if (ly_prompt_len > 0) {
-            ly_prompt[--ly_prompt_len] = '\0';
-        }
-        return;
-    }
-
-    if (c == '\r' || c == '\n') {
-        ly_prompt_focus = 0;
-        ly_do_generate();
-        return;
-    }
-
-    if ((uint8_t)c >= 32 && (uint8_t)c < 127) {
-        if (ly_prompt_len + 1 < LY_PROMPT_MAX) {
-            ly_prompt[ly_prompt_len++] = c;
-            ly_prompt[ly_prompt_len] = '\0';
-        }
-    }
+    if (c == '\b' || c == 127) { while (ly_prompt_len > 0 && ((uint8_t)ly_prompt[ly_prompt_len - 1] & 0xC0) == 0x80) ly_prompt_len--; if (ly_prompt_len) ly_prompt_len--; ly_prompt[ly_prompt_len] = 0; return; }
+    if (c == '\r' || c == '\n') { ly_prompt_focus = 0; do_generate(); return; }
+    uint8_t u = (uint8_t)c;
+    if (u >= 32 && u < 127) { if (ly_prompt_len + 1 < LY_PROMPT_MAX) { ly_prompt[ly_prompt_len++] = c; ly_prompt[ly_prompt_len] = 0; } }
+    else if (u >= 0xA0 && ly_prompt_len + 2 < LY_PROMPT_MAX) { ly_prompt[ly_prompt_len++] = (char)(0xC0 | (u >> 6)); ly_prompt[ly_prompt_len++] = (char)(0x80 | (u & 0x3F)); ly_prompt[ly_prompt_len] = 0; }   /* latin-1 -> UTF-8 */
 }

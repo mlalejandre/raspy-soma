@@ -69,5 +69,9 @@ int vfs_read(const char *n, char *out, uint32_t max)
     memcpy(out, hf[i].data, k); out[k] = 0;
     return (int)k;
 }
+int vfs_size(const char *n) { int i = h_find(n); return i < 0 ? -1 : (int)hf[i].size; }   /* PARCHE 087 */
 int vfs_search_bm25(const char *q, const char *p, char *out, uint32_t max)
 { (void)q; (void)p; if (max) out[0] = 0; return 0; }
+
+/* PARCHE 098: la VM cede la CPU periodicamente */
+void thread_preempt_point(void) { }

@@ -27,10 +27,12 @@ OBJS_ARCH = \
 	$(BUILD)/pmm.o \
 	$(BUILD)/vmm.o \
 	$(BUILD)/usermode.o \
-	$(BUILD)/hda.o
+	$(BUILD)/hda.o \
+	$(BUILD)/smp.o \
+	$(BUILD)/hwmon.o
 
 ifeq ($(ARCH),aarch64)
-OBJS_ARCH += $(BUILD)/rpi_fb.o $(BUILD)/mmu.o $(BUILD)/gic.o $(BUILD)/sdhci.o $(BUILD)/blk_glue.o $(BUILD)/pcie.o $(BUILD)/rp1.o $(BUILD)/rp1_gpio.o $(BUILD)/gem.o $(BUILD)/xhci.o $(BUILD)/xhci2.o      # PARCHE 060 / 061 / 062 / 077
+OBJS_ARCH += $(BUILD)/rpi_fb.o $(BUILD)/mmu.o $(BUILD)/gic.o $(BUILD)/sdhci.o $(BUILD)/blk_glue.o $(BUILD)/pcie.o $(BUILD)/rp1.o $(BUILD)/rp1_gpio.o $(BUILD)/gem.o $(BUILD)/xhci.o $(BUILD)/xhci2.o $(BUILD)/wifi.o      # PARCHE 060 / 061 / 062 / 077 / 079
 endif
 ifeq ($(ARCH),x86_64)
 OBJS_ARCH += $(BUILD)/apic.o $(BUILD)/ahci.o $(BUILD)/nvme.o $(BUILD)/blk_glue.o $(BUILD)/xhci.o      # PARCHE 037 / 040 / 043 / 045 / 046
@@ -46,6 +48,9 @@ OBJS_CORE = \
 	$(BUILD)/console.o \
 	$(BUILD)/virtio_net.o \
 	$(BUILD)/net.o \
+	$(BUILD)/netif.o \
+	$(BUILD)/dhcp.o \
+	$(BUILD)/dhcp_proto.o \
 	$(BUILD)/ip.o \
 	$(BUILD)/udp.o \
 	$(BUILD)/dns.o \
@@ -72,7 +77,7 @@ OBJS_CORE = \
 	$(BUILD)/fm.o \
 	$(BUILD)/notepad.o \
 	$(BUILD)/memview.o $(BUILD)/js_runtime.o \
-	$(BUILD)/layout.o \
+	$(BUILD)/layout.o $(BUILD)/tex.o $(BUILD)/settings.o $(BUILD)/savedlg.o $(BUILD)/codeedit.o $(BUILD)/textfield.o $(BUILD)/coder_core.o $(BUILD)/pdf.o $(BUILD)/pdfview.o $(BUILD)/sysmon.o \
 	$(BUILD)/paint.o \
 	$(BUILD)/coder_app.o \
 	$(BUILD)/vm.o \
@@ -126,7 +131,7 @@ OBJS_CORE += $(BUILD)/ssp.o
 endif
 
 # PARCHE 032: descripcion del hardware (ACPI / FDT)
-OBJS_CORE += $(BUILD)/hwinfo.o $(BUILD)/nvme_proto.o $(BUILD)/blk.o $(BUILD)/xhci_proto.o $(BUILD)/hid_proto.o $(BUILD)/msc_proto.o $(BUILD)/fat.o $(BUILD)/sd_proto.o $(BUILD)/pcie_proto.o $(BUILD)/mbox_proto.o $(BUILD)/rp1_proto.o $(BUILD)/gem_proto.o $(BUILD)/dma_pool.o $(BUILD)/gpio_proto.o
+OBJS_CORE += $(BUILD)/hwinfo.o $(BUILD)/nvme_proto.o $(BUILD)/blk.o $(BUILD)/xhci_proto.o $(BUILD)/hid_proto.o $(BUILD)/msc_proto.o $(BUILD)/fat.o $(BUILD)/sd_proto.o $(BUILD)/pcie_proto.o $(BUILD)/mbox_proto.o $(BUILD)/rp1_proto.o $(BUILD)/gem_proto.o $(BUILD)/dma_pool.o $(BUILD)/gpio_proto.o $(BUILD)/sdio_proto.o $(BUILD)/crypto.o $(BUILD)/wpa.o $(BUILD)/brcm_proto.o $(BUILD)/png_enc.o
 
 OBJS = $(OBJS_ARCH) $(OBJS_CORE)
 HEADERS = $(wildcard src/*.h) $(wildcard src/*/*.h) $(wildcard src/cursors/*.h) $(wildcard src/fonts/*.h) $(wildcard src/icons/*.h) $(wildcard src/arch/$(ARCH)/*.h)
@@ -251,6 +256,7 @@ test:
 	$(HOST_CC) $(TEST_CFLAGS) tests/test_lexer.c src/lang/lexer.c -o build/tests/test_lexer
 	$(HOST_CC) $(TEST_CFLAGS) tests/test_sbuf.c -o build/tests/test_sbuf
 	$(HOST_CC) $(TEST_CFLAGS) tests/test_lang.c tests/stubs_common.c tests/stubs_lang.c src/lang/lang.c src/lang/vm.c src/lang/lexer.c -o build/tests/test_lang
+	$(HOST_CC) $(TEST_CFLAGS) tests/test_coder_sim.c src/apps/coder_core.c tests/stubs_common.c tests/stubs_lang.c src/lang/lang.c src/lang/vm.c src/lang/lexer.c -o build/tests/test_coder_sim
 	$(HOST_CC) $(TEST_CFLAGS) tests/test_fs.c tests/stubs_common.c tests/stubs_fs.c src/fs/fs.c -o build/tests/test_fs
 	$(HOST_CC) $(TEST_CFLAGS) -include tests/host_heap_cfg.h tests/test_heap.c tests/stubs_common.c tests/stubs_heap.c tests/stubs_vmm.c src/core/mem.c -o build/tests/test_heap
 	$(HOST_CC) $(TEST_CFLAGS) -include tests/host_sched_cfg.h tests/test_sched.c src/core/thread.c src/core/panic.c src/core/mutex.c tests/stubs_common.c tests/stubs_vmm.c tests/stubs_sched.c -o build/tests/test_sched
@@ -258,6 +264,8 @@ test:
 	$(HOST_CC) $(TEST_CFLAGS) -include tests/host_sched_cfg.h tests/test_mutex.c src/core/mutex.c src/core/thread.c src/core/panic.c tests/stubs_common.c tests/stubs_vmm.c tests/stubs_sched.c -o build/tests/test_mutex
 	$(HOST_CC) $(TEST_CFLAGS) tests/test_srcfs.c src/fs/srcfs.c tests/stubs_common.c tests/stubs_fs.c -o build/tests/test_srcfs
 	$(HOST_CC) $(TEST_CFLAGS) tests/test_elf.c src/core/elf.c -o build/tests/test_elf
+	$(HOST_CC) $(TEST_CFLAGS) -Isrc/arch/x86_64 tests/test_uaccess.c -o build/tests/test_uaccess
+	$(HOST_CC) $(TEST_CFLAGS) -DVMM_HOST_TEST tests/test_vmm.c tests/stubs_common.c src/arch/x86_64/vmm.c -o build/tests/test_vmm
 	$(HOST_CC) $(TEST_CFLAGS) tests/test_bigfs.c src/fs/bigfs.c -o build/tests/test_bigfs
 	$(HOST_CC) $(TEST_CFLAGS) tests/test_audio.c src/core/audio.c -o build/tests/test_audio
 	$(HOST_CC) $(TEST_CFLAGS) tests/test_wav.c src/core/wav.c -o build/tests/test_wav
@@ -267,6 +275,7 @@ test:
 	./build/tests/test_lexer
 	./build/tests/test_sbuf
 	./build/tests/test_lang
+	./build/tests/test_coder_sim
 	./build/tests/test_fs
 	./build/tests/test_fs persist-write build/tests/disk.img
 	./build/tests/test_fs persist-check build/tests/disk.img
@@ -295,6 +304,20 @@ test:
 	ASAN_OPTIONS=detect_leaks=0 ./build/tests/test_gem
 	$(HOST_CC) $(TEST_CFLAGS) tests/test_gpio.c src/core/gpio_proto.c -o build/tests/test_gpio
 	ASAN_OPTIONS=detect_leaks=0 ./build/tests/test_gpio
+	$(HOST_CC) $(TEST_CFLAGS) tests/test_sdio.c src/core/sdio_proto.c -o build/tests/test_sdio
+	ASAN_OPTIONS=detect_leaks=0 ./build/tests/test_sdio
+	$(HOST_CC) $(TEST_CFLAGS) tests/test_wpa.c src/core/crypto.c src/core/wpa.c src/net/netif.c -o build/tests/test_wpa
+	ASAN_OPTIONS=detect_leaks=0 ./build/tests/test_wpa
+	$(HOST_CC) $(TEST_CFLAGS) tests/test_brcm.c src/core/brcm_proto.c src/net/dhcp_proto.c -o build/tests/test_brcm
+	ASAN_OPTIONS=detect_leaks=0 ./build/tests/test_brcm
+	$(HOST_CC) $(TEST_CFLAGS) tests/test_png.c src/core/png_enc.c -o build/tests/test_png
+	ASAN_OPTIONS=detect_leaks=0 ./build/tests/test_png
+	python3 tests/check_png.py build/tests
+	$(HOST_CC) $(TEST_CFLAGS) tests/test_tex.c src/apps/tex.c -o build/tests/test_tex
+	ASAN_OPTIONS=detect_leaks=0 ./build/tests/test_tex
+	$(HOST_CC) -O1 -g -w -fsanitize=address,undefined -fno-sanitize-recover=undefined -DWEB_HOST_TEST -Isrc -Isrc/core -Isrc/apps -Isrc/arch/x86_64 tests/test_pdf.c src/apps/pdf.c src/apps/web_inflate.c src/apps/web_img.c src/apps/web_jpeg.c src/core/jpeg.c -o build/tests/test_pdf
+	python3 tests/pdf_seeds.py build/tests/pdf
+	ASAN_OPTIONS=detect_leaks=0 ./build/tests/test_pdf --check build/tests/pdf/clasico.pdf build/tests/pdf/xrefstm.pdf
 	$(HOST_CC) $(TEST_CFLAGS) tests/test_dma_pool.c src/core/dma_pool.c -o build/tests/test_dma_pool
 	ASAN_OPTIONS=detect_leaks=0 ./build/tests/test_dma_pool
 	@mkdir -p build/tests/fat
@@ -304,6 +327,8 @@ test:
 	./build/tests/test_sched
 	./build/tests/test_panic
 	./build/tests/test_mutex
+	./build/tests/test_uaccess
+	./build/tests/test_vmm
 	./build/tests/test_elf $(wildcard build/x86_64/user/*.elf)
 	./build/tests/test_bigfs
 	python3 tests/test_bigfs_xcheck.py build/tests/test_bigfs
@@ -327,6 +352,13 @@ fuzz-net:
 	$(HOST_CC) -std=gnu11 -O1 -g -w -fsanitize=address,undefined -fno-sanitize-recover=undefined $(TEST_INC) tests/fuzz_net.c src/net/net.c src/net/ip.c src/net/udp.c src/net/tcp.c -o build/fuzz/fuzz_net
 	./build/fuzz/fuzz_net $(or $(FUZZ_ITERS),20000) $(or $(FUZZ_SEED),1)
 	@echo "FUZZ-NET OK"
+
+# PARCHE 088: fuzzing del lector de PDF
+fuzz-pdf:
+	@mkdir -p build/fuzz
+	python3 tests/pdf_seeds.py build/fuzz/pdf
+	$(HOST_CC) -O1 -g -w -fsanitize=address,undefined -fno-sanitize-recover=undefined -DWEB_HOST_TEST -Isrc -Isrc/core -Isrc/apps -Isrc/arch/x86_64 tests/test_pdf.c src/apps/pdf.c src/apps/web_inflate.c src/apps/web_img.c src/apps/web_jpeg.c src/core/jpeg.c -o build/fuzz/test_pdf
+	ASAN_OPTIONS=detect_leaks=0 ./build/fuzz/test_pdf --fuzz $(or $(FUZZ_ITERS),3000) $(or $(FUZZ_SEED),1) build/fuzz/pdf/*.pdf
 
 # PARCHE 029: fuzzing de decodificadores con ASAN+UBSAN (necesita Pillow para crear las semillas)
 fuzz:

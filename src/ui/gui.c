@@ -27,6 +27,10 @@
 #include "rtc.h"
 #include "fs.h"
 #include "mem.h"
+#include "settings.h"
+#include "pdfview.h"   /* PARCHE 088 */
+#include "acct.h"      /* PARCHE 089 */
+#include "sysmon.h"                                /* PARCHE 085 */
 
 enum app_mode {
     APP_DESKTOP = 0,
@@ -42,7 +46,10 @@ enum app_mode {
     APP_PAINT,
     APP_CODER_APP,
     APP_MEDIA,
-    APP_SOMA_APP /*PL12_APP_MODE*/
+    APP_SOMA_APP, /*PL12_APP_MODE*/
+    APP_SETTINGS,  /* PARCHE 085: Ajustes */
+    APP_PDF,       /* PARCHE 088: lector de PDF */
+    APP_SYSMON     /* PARCHE 089: monitor del sistema */
 };
 
 static enum app_mode current_app = APP_DESKTOP;
@@ -188,9 +195,12 @@ static uint32_t her_app_min_w(enum app_mode app)
     case APP_FILE_MANAGER:   return 480u;
     case APP_IMAGE_VIEWER:   return 460u;
     case APP_NOTEPAD:        return 400u;
-    case APP_LAYOUT:         return 420u;
-    case APP_PAINT:          return 420u;
-    case APP_CODER_APP:      return 560u;
+    case APP_LAYOUT:         return 820u;   /* PARCHE 084: hoja + barra */
+    case APP_SETTINGS:       return 760u;   /* PARCHE 085 */
+    case APP_PDF:            return 760u;   /* PARCHE 088 */
+    case APP_SYSMON:         return 900u;   /* PARCHE 089 */
+    case APP_PAINT:          return 860u;   /* PARCHE 083: lienzo + herramientas + panel de color */
+    case APP_CODER_APP:      return 720u;   /* PARCHE 093 */
     case APP_MEDIA:          return 560u;
     case APP_SOMA_APP:       return 320u; /*PL12_APP_MIN_W*/
     case APP_TERMINAL_SHELL: return 360u;
@@ -1056,7 +1066,7 @@ static void her_draw_agent_zone(uint32_t cur_w, uint32_t cur_h, uint32_t orb_cy)
 /* SOMA ASYNC MATERIALIZE PATCH v4 */
 /* SOMA ORBITAL CALM PATCH v3 */
 /* SOMA ORBITAL ICONS PATCH v2: iconos como cuerpos en orbita estable. */
-#define HER_DOCK_ITEM_COUNT 12
+#define HER_DOCK_ITEM_COUNT 15
 #define HER_ICON_ANIM_MAX   256u
 #define HER_ICON_BOX_SIZE   44
 
@@ -1080,6 +1090,9 @@ static const struct her_dock_item her_dock_items[HER_DOCK_ITEM_COUNT] = {
     { ICON_PAINT,    0x00F59E0B,  "PAINT",   APP_PAINT },           /* Ámbar / Pintura */
     { ICON_AGENTS,   0x00BAE6FD,  "AGENTES", APP_AGENTS },          /* Éter orbital */
     { ICON_MEDIA,    0x00FB7185,  "MEDIA",   APP_MEDIA },           /* Rosa estelar: pulsar */
+    { ICON_PDF,      0x00F87171,  "PDF",     APP_PDF },             /* PARCHE 088: lector de PDF */
+    { ICON_MONITOR,  0x0034D399,  "MONITOR", APP_SYSMON },          /* PARCHE 089: monitor del sistema */
+    { ICON_SETTINGS, 0x0094A3B8,  "AJUSTES", APP_SETTINGS },        /* PARCHE 085: engranaje */
 };
 
 /* La aparicion se escalona ligeramente para que los iconos escapen uno tras
@@ -1360,6 +1373,24 @@ static void her_icon_dist(int icon, int32_t X, int32_t Y, int32_t *dm, int32_t *
         IC_M(ic_circ(X, Y, 25, 40, 4));
         IC_A(ic_seg(X, Y, 44, 16, 52, 8, 20));
         break;
+    case ICON_MONITOR:                                   /* PARCHE 089: pantalla con una grafica */
+        IC_M(ic_seg(X, Y, 12, 16, 52, 16, 20)); IC_M(ic_seg(X, Y, 52, 16, 52, 44, 20)); IC_M(ic_seg(X, Y, 52, 44, 12, 44, 20)); IC_M(ic_seg(X, Y, 12, 44, 12, 16, 20));
+        IC_M(ic_seg(X, Y, 26, 52, 38, 52, 20)); IC_M(ic_seg(X, Y, 32, 44, 32, 52, 18));
+        IC_A(ic_seg(X, Y, 17, 36, 25, 30, 18)); IC_A(ic_seg(X, Y, 25, 30, 31, 34, 18)); IC_A(ic_seg(X, Y, 31, 34, 39, 23, 18)); IC_A(ic_seg(X, Y, 39, 23, 47, 27, 18));
+        break;
+    case ICON_PDF:                                       /* PARCHE 088: hoja con esquina doblada y renglones */
+        IC_M(ic_seg(X, Y, 20, 12, 38, 12, 22)); IC_M(ic_seg(X, Y, 20, 12, 20, 52, 22)); IC_M(ic_seg(X, Y, 20, 52, 44, 52, 22));
+        IC_M(ic_seg(X, Y, 44, 52, 44, 20, 22)); IC_M(ic_seg(X, Y, 38, 12, 44, 20, 22)); IC_M(ic_seg(X, Y, 38, 12, 38, 20, 18)); IC_M(ic_seg(X, Y, 38, 20, 44, 20, 18));
+        IC_A(ic_seg(X, Y, 26, 28, 38, 28, 16)); IC_A(ic_seg(X, Y, 26, 35, 38, 35, 16)); IC_A(ic_seg(X, Y, 26, 42, 34, 42, 16));
+        break;
+    case ICON_SETTINGS:                                  /* PARCHE 085: engranaje de 8 dientes */
+        IC_M(IC_RING(ic_circ(X, Y, 32, 32, 15), 22));
+        IC_M(ic_seg(X, Y, 32, 12, 32, 16, 34)); IC_M(ic_seg(X, Y, 32, 48, 32, 52, 34));
+        IC_M(ic_seg(X, Y, 12, 32, 16, 32, 34)); IC_M(ic_seg(X, Y, 48, 32, 52, 32, 34));
+        IC_M(ic_seg(X, Y, 18, 18, 21, 21, 34)); IC_M(ic_seg(X, Y, 43, 43, 46, 46, 34));
+        IC_M(ic_seg(X, Y, 46, 18, 43, 21, 34)); IC_M(ic_seg(X, Y, 18, 46, 21, 43, 34));
+        IC_A(ic_circ(X, Y, 32, 32, 6));
+        break;
     case ICON_AGENTS:
     default:
         IC_M(ic_seg(X, Y, 32, 17, 15, 46, 18));
@@ -1606,6 +1637,9 @@ static void her_draw_one_window_chrome(struct her_win_node *win, int is_active)
         case APP_PAINT:          title = "SOMA Paint"; break;
         case APP_CODER_APP:      title = "SOMA Studio :: Coder IDE"; break;
         case APP_MEDIA:          title = "SOMA Media"; break;
+        case APP_SETTINGS:       title = "Ajustes"; break;
+        case APP_PDF:            title = "Lector PDF"; break;
+        case APP_SYSMON:         title = "Monitor del sistema"; break;
         case APP_SOMA_APP:       title = gui_soma_win_get_title(); break; /*PL12_CHROME_TITLE*/
         default: break;
     }
@@ -1640,6 +1674,16 @@ static void her_draw_window_chrome(uint32_t cur_w, uint32_t cur_h)
         her_draw_one_window_chrome(&her_windows[i], (i == her_num_windows - 1));
     }
 }
+
+/* PARCHE 085: puntero de redimension segun el borde (1 izq, 2 der, 4 arriba, 8 abajo) */
+static int her_resize_cursor(int edge)
+{
+    if (!edge) return -1;
+    int h = edge & 3, v = edge & 12;
+    if (h && v) return ((edge & 1) && (edge & 4)) || ((edge & 2) && (edge & 8)) ? CURSOR_RESIZE_NWSE : CURSOR_RESIZE_NESW;
+    return h ? CURSOR_RESIZE_H : CURSOR_RESIZE_V;
+}
+static int her_is_resize_cursor(int c) { return c == CURSOR_CROSSHAIR || c == CURSOR_RESIZE_H || c == CURSOR_RESIZE_V || c == CURSOR_RESIZE_NWSE || c == CURSOR_RESIZE_NESW; }
 
 static int her_win_hit_target(struct her_win_node *win, int32_t mx, int32_t my, int *out_edge)
 {
@@ -1874,6 +1918,56 @@ static void render_agent_global_rail(uint32_t cur_w, uint32_t cur_h)
     her_refresh_all();
 }
 
+/* ====================================================================
+ * PARCHE 091: la mision del agente corre en su propio hilo ("soma_agente") y la GUI sigue viva: se pueden mover y
+ * redimensionar ventanas, usar otras aplicaciones y escribir mientras SOMA piensa.
+ * Cuando el agente necesita la pantalla (abre una ventana, escribe un archivo "en vivo", ejecuta un programa grafico)
+ * pide turno con gui_enter(): el bucle principal se detiene en un punto seguro (al principio de la vuelta), le cede la
+ * pantalla y, cuando el agente la devuelve con gui_leave(), vuelve a leer la geometria y repinta todo.
+ * ==================================================================== */
+static volatile int g_agent_thr_on;        /* hay una mision en marcha en el hilo del agente */
+static volatile int g_agent_thr_done;      /* la mision termino: el bucle principal cierra el turno */
+static volatile uint32_t g_agent_tid;
+static volatile int g_gui_loop_on;         /* el bucle principal de la GUI esta corriendo */
+static volatile int g_gui_req, g_gui_grant; static int g_gui_depth;
+static char g_agent_mission[SOMA_AGENT_CMD_MAX];
+static int gui_in_agent_thread(void) { struct tcb *t = thread_current(); return g_agent_thr_on && t && t->tid == g_agent_tid; }
+int gui_enter(void)
+{
+    if (!gui_in_agent_thread() || !g_gui_loop_on) return 0;
+    if (g_gui_depth++ > 0) return 1;
+    g_gui_req = 1;
+    for (uint32_t i = 0; !g_gui_grant && g_gui_loop_on && i < 60000u; i++) thread_sleep(1);
+    return 1;
+}
+void gui_leave(int tok)
+{
+    if (!tok) return;
+    if (--g_gui_depth > 0) return;
+    g_gui_req = 0;
+}
+static void agent_thread_main(void *arg)
+{
+    (void)arg;
+    agent_run("soma", g_agent_mission);
+    g_agent_thr_done = 1;
+}
+/* cierre del turno (lo hace el bucle principal) */
+static void agent_turn_finish(void)
+{
+    const uint32_t wrap = 76;
+    her_agent_busy = 0;
+    her_finish_turn(agent_last_response);
+    if (agent_last_response[0] != '\0')
+        log_add(agent_log, &agent_log_count, "[soma]: ", agent_last_response, 0x0034D399, wrap);
+    else
+        log_add(agent_log, &agent_log_count, "[soma]: ", "Mision ejecutada en hardware.", 0x0034D399, wrap);
+    agent_global_scroll = 0;
+    g_agent_thr_on = 0; g_agent_thr_done = 0; g_gui_depth = 0; g_gui_req = 0; g_gui_grant = 0;
+}
+int gui_is_running(void) { return g_gui_loop_on; }   /* PARCHE 097 */
+int gui_agent_busy(void) { return g_agent_thr_on; }
+
 static void submit_global_agent_prompt(uint32_t win_x, uint32_t win_y, uint32_t win_w, uint32_t win_h)
 {
     (void)win_x; (void)win_y; (void)win_w; (void)win_h;
@@ -1886,6 +1980,11 @@ static void submit_global_agent_prompt(uint32_t win_x, uint32_t win_y, uint32_t 
     mission_copy[n] = '\0';
 
     const uint32_t wrap = 76;
+    if (g_agent_thr_on) {   /* PARCHE 091: una mision a la vez */
+        log_add(agent_log, &agent_log_count, "[soma]: ", "Sigo trabajando en la mision anterior; espera a que termine.", 0x00FBBF24, wrap);
+        her_refresh_all(); fb_present();
+        return;
+    }
     log_add(agent_log, &agent_log_count, "user> ", mission_copy, COLOR_CYAN, wrap);
     her_begin_turn(mission_copy);
 
@@ -1900,6 +1999,15 @@ static void submit_global_agent_prompt(uint32_t win_x, uint32_t win_y, uint32_t 
     her_refresh_all();
     fb_present();
 
+    /* PARCHE 091: la mision va a su hilo; si no se puede crear, como antes (bloqueando) */
+    if (g_gui_loop_on) {
+        for (uint32_t i = 0; i < sizeof(g_agent_mission); i++) { g_agent_mission[i] = mission_copy[i]; if (!mission_copy[i]) break; }
+        g_agent_thr_done = 0; g_gui_req = 0; g_gui_grant = 0; g_gui_depth = 0;
+        her_agent_busy = 1; g_agent_thr_on = 1;
+        struct tcb *at = thread_create("soma_agente", agent_thread_main, 0);
+        if (at) { g_agent_tid = at->tid; thread_set_owner(at, ACCT_AGENT); return; }
+        g_agent_thr_on = 0; her_agent_busy = 0;
+    }
     her_anim_start();
     agent_run("soma", mission_copy);
     her_anim_stop();
@@ -2576,6 +2684,7 @@ static void agents_render_window(uint32_t wx, uint32_t wy, uint32_t ww, uint32_t
 
 static void her_render_app_body(enum app_mode app, uint32_t wx, uint32_t wy, uint32_t ww, uint32_t wh, int is_focused)
 {
+    uint8_t own_prev = acct_set_owner((uint8_t)(ACCT_APP0 + app));   /* PARCHE 089 */
     fb_set_clip((int32_t)wx, (int32_t)wy, (int32_t)ww, (int32_t)wh);
     switch (app) {
     case APP_TERMINAL_SHELL:
@@ -2599,9 +2708,13 @@ static void her_render_app_body(enum app_mode app, uint32_t wx, uint32_t wy, uin
     case APP_MEDIA:          media_render_window(wx, wy, ww, wh, is_focused);   break;
     case APP_AGENTS:        agents_render_window(wx, wy, ww, wh, is_focused);  break;
     case APP_SOMA_APP:      gui_soma_win_render_body(wx, wy, ww, wh);          break; /*PL12_RENDER_BODY*/
+    case APP_SETTINGS:      settings_render_window(wx, wy, ww, wh, is_focused); break;
+    case APP_PDF:           pdfview_render_window(wx, wy, ww, wh, is_focused); break;   /* PARCHE 088 */
+    case APP_SYSMON:        sysmon_render_window(wx, wy, ww, wh, is_focused);  break;   /* PARCHE 089 */
     default: break;
     }
     fb_reset_clip();
+    acct_set_owner(own_prev);
 }
 
 static void her_refresh_all(void)
@@ -2610,7 +2723,8 @@ static void her_refresh_all(void)
     render_desktop();
     her_in_refresh = 0;
     fb_cguard_keep(0);
-    if (her_num_windows == 0) return;
+    if (settings_opacity() >= 100) fb_tr_release();             /* PARCHE 086: sin transparencia no se guardan las dos capas de pantalla */
+    if (her_num_windows == 0) { fb_tr_off(); return; }
 
     for (int i = 0; i < her_num_windows; ++i) {
         struct her_win_node *win = &her_windows[i];
@@ -2619,11 +2733,19 @@ static void her_refresh_all(void)
 
         /* SOMA_PARCHE_028_UI: sombra -> se guarda el fondo de las esquinas inferiores -> marco -> cuerpo -> se recompone el arco */
         her_draw_window_shadow(win, top);
+        /* PARCHE 085: transparencia. La activa se mezcla en cada volcado (fb_tr_*); las de detras, una vez aqui. */
+        uint32_t alpha = (uint32_t)settings_opacity() * 255u / 100u;
+        uint32_t *under = 0;
+        if (alpha < 255 && !(top && settings_active_opaque())) {
+            if (top) fb_tr_begin((int32_t)win->x, (int32_t)win->y, (int32_t)win->w, (int32_t)win->h, alpha);
+            else under = fb_rect_save((int32_t)win->x, (int32_t)win->y, (int32_t)win->w, (int32_t)win->h);
+        } else if (top) fb_tr_off();
         fb_cguard_capture(cg, (int32_t)win->x, (int32_t)win->y, (int32_t)win->w, (int32_t)win->h, HER_WIN_R);
         her_draw_one_window_chrome(win, top);
 
         her_render_app_body(win->app, HER_CLI_X(win->x), HER_CLI_Y(win->y), HER_CLI_W(win->w), HER_CLI_H(win->h), top);
 
+        if (under) fb_rect_blend_saved(under, (int32_t)win->x, (int32_t)win->y, (int32_t)win->w, (int32_t)win->h, alpha);
         fb_cguard_apply(cg, her_win_border_color(top));
         if (top) fb_cguard_keep(cg);          /* la ventana activa se repinta sola entre fotogramas: fb_present repone sus esquinas */
     }
@@ -2652,10 +2774,20 @@ static void her_open_app(enum app_mode app, uint32_t cur_w, uint32_t cur_h)
     her_windows[idx].w = her_win_w;
     her_windows[idx].h = her_win_h;
     {   /* SOMA_PARCHE_V2_GUI: tamano minimo por aplicacion al abrir */
-        uint32_t mw = her_app_min_w(app), mh = HER_MIN_H + 60u;
+        uint32_t mw = her_app_min_w(app), mh = (app == APP_PAINT || app == APP_LAYOUT || app == APP_SETTINGS || app == APP_PDF || app == APP_SYSMON || app == APP_CODER_APP) ? 600u : HER_MIN_H + 60u;
         if (cur_w > 64u && mw > cur_w - 32u) mw = cur_w - 32u;
+        if ((app == APP_PAINT || app == APP_LAYOUT || app == APP_SETTINGS || app == APP_PDF || app == APP_SYSMON || app == APP_CODER_APP) && cur_h > 96u && mh > cur_h - 60u) mh = cur_h - 60u;
         if (her_windows[idx].w < mw) her_windows[idx].w = mw;
         if (cur_h > 96u && mh <= cur_h - 48u && her_windows[idx].h < mh) her_windows[idx].h = mh;
+        if ((app == APP_WEB_BROWSER || app == APP_PDF || app == APP_IMAGE_VIEWER || app == APP_SYSMON || app == APP_CODER_APP) && cur_w > 400u && cur_h > 300u) {   /* PARCHE 088: tambien PDF e imagenes */   /* PARCHE 086: el navegador abre grande (2/3 de ancho, 85 % de alto) */
+            uint32_t bw = cur_w * 2u / 3u, bh = cur_h * 85u / 100u;
+            if (bw > 1400u) bw = 1400u;
+            if (bw < mw) bw = mw;
+            if (bw > cur_w - 32u) bw = cur_w - 32u;
+            if (bh > cur_h - 56u) bh = cur_h - 56u;
+            if (her_windows[idx].w < bw) her_windows[idx].w = bw;
+            if (her_windows[idx].h < bh) her_windows[idx].h = bh;
+        }
     }
 
     uint32_t cascade_off = (uint32_t)(idx * 28);
@@ -2687,8 +2819,10 @@ static void her_open_app(enum app_mode app, uint32_t cur_w, uint32_t cur_h)
     case APP_IMAGE_VIEWER: imgview_init();  break;
     case APP_NOTEPAD:      notepad_init();  break;
     case APP_AGENT_MEMORY: memview_init();  break;
-    case APP_LAYOUT:       layout_init();   break;
-    case APP_PAINT:        paint_init();    break;
+    case APP_LAYOUT:       layout_init();   break;          /* PARCHE 084: conserva el documento abierto */
+    case APP_PDF:          pdfview_init();  break;          /* PARCHE 088 */
+    case APP_SYSMON:       sysmon_init();   break;          /* PARCHE 089 */
+    case APP_PAINT:        paint_ensure();  break;          /* PARCHE 083: conserva el dibujo al reabrir */
     case APP_CODER_APP:   coder_app_init(); break;
     case APP_MEDIA:       media_init();     break;
     default: break;
@@ -3298,16 +3432,68 @@ void gui_soma_win_on_close(void)
     soma_app_active_flag = 0;
 }
 
+/* PARCHE 098: un programa SOMA-LANG corre en su propio hilo y dibuja en su superficie; el escritorio sigue vivo y es SU bucle quien
+ * abre, compone y cierra la ventana. Antes el programa corria dentro del hilo del escritorio (todo congelado) o se adueñaba de la
+ * pantalla. */
+static volatile uint32_t g_gui_tid;
+static volatile int g_soma_req_open, g_soma_req_close, g_soma_dirty;
+static char g_soma_req_title[64]; static int g_soma_req_w, g_soma_req_h;
+static int gui_on_gui_thread(void) { if (!g_gui_loop_on) return 1; struct tcb *t = thread_current(); return t && t->tid == g_gui_tid; }
+static int gui_soma_win_open_impl(const char *title, int w, int h);
+static void gui_soma_win_close_impl(void);
+int gui_soma_win_open(const char *title, int w, int h)
+{
+    if (gui_on_gui_thread()) return gui_soma_win_open_impl(title, w, h);
+    uint32_t i = 0; if (!title) title = "";
+    while (title[i] && i < sizeof g_soma_req_title - 1) { g_soma_req_title[i] = title[i]; i++; }
+    g_soma_req_title[i] = 0; g_soma_req_w = w; g_soma_req_h = h;
+    soma_app_ensure_surf();
+    g_soma_req_open = 1;
+    for (uint32_t k = 0; g_soma_req_open && g_gui_loop_on && k < 3000u; k++) thread_sleep(1);
+    return gui_soma_win_is_active();
+}
+static int g_soma_win_tok;   /* PARCHE 091: un programa grafico lanzado por el agente tiene la pantalla hasta que cierra */
 void gui_soma_win_close(void)
+{
+    if (!gui_on_gui_thread()) {                       /* PARCHE 098 */
+        soma_app_active_flag = 0; g_soma_req_close = 1;
+        for (uint32_t k = 0; g_soma_req_close && g_gui_loop_on && k < 2000u; k++) thread_sleep(1);
+        return;
+    }
+    gui_soma_win_close_impl();
+}
+static void gui_soma_win_close_impl(void)
 {
     soma_app_active_flag = 0;
     int idx = her_find_window(APP_SOMA_APP);
     if (idx >= 0) {
         her_close_target_window_vortex(idx);
     }
+    if (g_soma_win_tok) { int t = g_soma_win_tok; g_soma_win_tok = 0; gui_leave(t); }
 }
 
-int gui_soma_win_open(const char *title, int w, int h)
+static void gui_soma_service(int32_t cmx, int32_t cmy)   /* llamado en cada vuelta del bucle del escritorio */
+{
+    if (g_soma_req_open) { gui_soma_win_open_impl(g_soma_req_title, g_soma_req_w, g_soma_req_h); g_soma_req_open = 0; }
+    if (g_soma_req_close) { gui_soma_win_close_impl(); g_soma_req_close = 0; her_refresh_all(); fb_present(); }
+    if (g_soma_dirty) {
+        g_soma_dirty = 0;
+        int si = her_find_window(APP_SOMA_APP);
+        if (si >= 0 && !her_dragging && !her_resizing) {
+            struct her_win_node *sw = &her_windows[si];
+            int covered = 0;
+            for (int j = si + 1; j < her_num_windows; j++) {
+                struct her_win_node *o = &her_windows[j];
+                if (o->x < sw->x + sw->w && sw->x < o->x + o->w && o->y < sw->y + sw->h && sw->y < o->y + o->h) { covered = 1; break; }
+            }
+            if (!covered && settings_opacity() >= 100) her_render_app_body(APP_SOMA_APP, HER_CLI_X(sw->x), HER_CLI_Y(sw->y), HER_CLI_W(sw->w), HER_CLI_H(sw->h), si == her_num_windows - 1);
+            else her_refresh_all();
+            if (her_cursor_should_show()) mouse_draw_cursor(cmx, cmy);
+            fb_present();
+        }
+    }
+}
+static int gui_soma_win_open_impl(const char *title, int w, int h)
 {
     if (!fb_is_active()) return 0;
     soma_app_ensure_surf();
@@ -3470,6 +3656,7 @@ void gui_soma_win_text(int x, int y, const char *str, uint32_t color)
 void gui_soma_win_present(void)
 {
     if (!fb_is_active()) return;
+    if (!gui_on_gui_thread()) { g_soma_dirty = 1; return; }   /* PARCHE 098: el escritorio compone el fotograma */
     int idx = her_find_window(APP_SOMA_APP);
     if (idx >= 0) {
         struct her_win_node *win = &her_windows[idx];
@@ -3539,6 +3726,7 @@ int gui_soma_win_get_key(void)
         soma_app_key_tail = (soma_app_key_tail + 1) % 32;
         return k;
     }
+    if (!gui_on_gui_thread()) return 0;                /* PARCHE 098: con el escritorio vivo, las teclas llegan por la cola */
     if (kgetc_ready()) {
         return (unsigned char)kgetc();
     }
@@ -3563,13 +3751,21 @@ void gui_soma_win_render_body(uint32_t wx, uint32_t wy, uint32_t ww, uint32_t wh
     }
 }
 
+static void gui_live_file_hook_body(const char *name, const char *data, uint32_t len);
 static void gui_live_file_hook(const char *name, const char *data, uint32_t len)
+{
+    int tok = gui_enter();              /* PARCHE 091 */
+    gui_live_file_hook_body(name, data, len);
+    gui_leave(tok);
+}
+static void gui_live_file_hook_body(const char *name, const char *data, uint32_t len)
 {
     if (!g_live_ready || g_live_busy || !name || !name[0]) return;
     if (!fb_is_active()) return;
 
     struct tcb *self = thread_current();
-    if (!self || self->tid != 0 || !self->agent_mode) return;
+    if (!self || !self->agent_mode) return;
+    if (self->tid != 0 && !gui_in_agent_thread()) return;   /* PARCHE 091: tambien desde el hilo del agente */
 
     if (!live_path_allowed(name)) return;
     if (!data) { data = ""; len = 0; }
@@ -3579,7 +3775,7 @@ static void gui_live_file_hook(const char *name, const char *data, uint32_t len)
     uint32_t cw = fb_get_width(), ch = fb_get_height();
 
     if (live_has(data, "#SOMA-LAYOUT") || live_has(name, "_layout.txt") ||
-        live_has(name, "layout.txt")) {
+        live_has(name, "layout.txt") || live_has(name, ".tex") || live_has(data, "\\documentclass")) {   /* PARCHE 084: LaTeX */
         her_open_app(APP_LAYOUT, cw, ch);
         layout_set_source(data, len);
         gui_live_paint();
@@ -3711,7 +3907,7 @@ static int gui_win_open(enum app_mode app)
     return 1;
 }
 
-void gui_open_browser(const char *url)
+static void gui_open_browser__impl(const char *url)
 {
     if (!url || !*url) return;
     char local_url[160];
@@ -3737,10 +3933,18 @@ void gui_open_browser(const char *url)
     browser_init();
     browser_load_url(url);
     for (int i = 0; i < 30 && browser_is_loading(); ++i) thread_sleep(10);
+    g_pending_app = APP_WEB_BROWSER;                    /* PARCHE 086: antes se abria el escritorio sin la ventana */
     cmd_vsoma("", 0, 0);
+    g_pending_app = APP_DESKTOP;
+}
+void gui_open_browser(const char *url)   /* PARCHE 091: el hilo del agente pide turno de pantalla */
+{
+    int tok = gui_enter();
+    gui_open_browser__impl(url);
+    gui_leave(tok);
 }
 
-void gui_open_file_manager(const char *folder)
+static void gui_open_file_manager__impl(const char *folder)
 {
     if (gui_win_open(APP_FILE_MANAGER)) {
         if (folder && *folder) fm_open_folder(folder);
@@ -3751,10 +3955,18 @@ void gui_open_file_manager(const char *folder)
     current_app = APP_FILE_MANAGER;
     agent_global_focus = 0;
     if (folder && *folder) fm_open_folder(folder); else fm_init();
+    g_pending_app = APP_FILE_MANAGER;                   /* PARCHE 086 */
     cmd_vsoma("", 0, 0);
+    g_pending_app = APP_DESKTOP;
+}
+void gui_open_file_manager(const char *folder)   /* PARCHE 091: el hilo del agente pide turno de pantalla */
+{
+    int tok = gui_enter();
+    gui_open_file_manager__impl(folder);
+    gui_leave(tok);
 }
 
-void gui_open_memview(void)
+static void gui_open_memview__impl(void)
 {
     if (gui_win_open(APP_AGENT_MEMORY)) return;
     ensure_window_geom();
@@ -3763,28 +3975,150 @@ void gui_open_memview(void)
     memview_init();
     cmd_vsoma("", 0, 0);
 }
+void gui_open_memview(void)   /* PARCHE 091: el hilo del agente pide turno de pantalla */
+{
+    int tok = gui_enter();
+    gui_open_memview__impl();
+    gui_leave(tok);
+}
 
-void gui_open_layout(void)
+/* PARCHE 085: Ajustes */
+static void gui_open_settings__impl(void)
+{
+    if (gui_win_open(APP_SETTINGS)) return;
+    ensure_window_geom();
+    settings_load();
+    g_pending_app = APP_SETTINGS;
+    cmd_vsoma("", 0, 0);
+    g_pending_app = APP_DESKTOP;
+}
+void gui_open_settings(void)   /* PARCHE 091: el hilo del agente pide turno de pantalla */
+{
+    int tok = gui_enter();
+    gui_open_settings__impl();
+    gui_leave(tok);
+}
+
+/* PARCHE 085: "navegador" desde la consola (con la GUI apagada abre el escritorio con el navegador) */
+static void gui_open_web__impl(void)
+{
+    if (gui_win_open(APP_WEB_BROWSER)) return;
+    ensure_window_geom();
+    g_pending_app = APP_WEB_BROWSER;
+    cmd_vsoma("", 0, 0);
+    g_pending_app = APP_DESKTOP;
+}
+void gui_open_web(void)   /* PARCHE 091: el hilo del agente pide turno de pantalla */
+{
+    int tok = gui_enter();
+    gui_open_web__impl();
+    gui_leave(tok);
+}
+
+/* PARCHE 088: lector de PDF (con la GUI apagada abre el escritorio con la ventana) */
+static void gui_open_pdf__impl(const char *path)
+{
+    if (gui_win_open(APP_PDF)) { if (path && *path) pdfview_open_file(path); gui_live_paint(); return; }
+    ensure_window_geom();
+    pdfview_init();
+    if (path && *path) pdfview_open_file(path);
+    g_pending_app = APP_PDF;
+    cmd_vsoma("", 0, 0);
+    g_pending_app = APP_DESKTOP;
+}
+void gui_open_pdf(const char *path)   /* PARCHE 091: el hilo del agente pide turno de pantalla */
+{
+    int tok = gui_enter();
+    gui_open_pdf__impl(path);
+    gui_leave(tok);
+}
+
+/* PARCHE 089: para el Monitor del sistema */
+const int gui_app_sysmon = APP_SYSMON;
+const char *gui_app_title(int app)
+{
+    switch ((enum app_mode)app) {
+    case APP_AGENT_CHAT: return "SOMA (agente)"; case APP_TERMINAL_SHELL: return "Terminal"; case APP_WEB_BROWSER: return "Navegador";
+    case APP_FILE_MANAGER: return "Archivos"; case APP_IMAGE_VIEWER: return "Imagenes"; case APP_NOTEPAD: return "Bloc de notas";
+    case APP_AGENT_MEMORY: return "Memoria de agentes"; case APP_LAYOUT: return "Maquetador"; case APP_AGENTS: return "Agentes";
+    case APP_PAINT: return "Paint"; case APP_CODER_APP: return "Coder"; case APP_MEDIA: return "Media"; case APP_SETTINGS: return "Ajustes";
+    case APP_PDF: return "Lector PDF"; case APP_SYSMON: return "Monitor del sistema"; case APP_SOMA_APP: return "Programa SOMA"; case APP_DESKTOP: return "Escritorio";
+    default: return "Aplicacion";
+    }
+}
+int gui_app_list(int *apps, int max) { int n = 0; for (int i = 0; i < her_num_windows && n < max; i++) apps[n++] = (int)her_windows[i].app; return n; }
+int gui_close_app(int app)
+{
+    for (int i = 0; i < her_num_windows; i++) if ((int)her_windows[i].app == app) { her_close_target_window_vortex(i); return 1; }   /* el bucle principal resincroniza y repinta */
+    return 0;
+}
+static void gui_open_sysmon__impl(void)
+{
+    if (gui_win_open(APP_SYSMON)) return;
+    ensure_window_geom();
+    g_pending_app = APP_SYSMON;
+    cmd_vsoma("", 0, 0);
+    g_pending_app = APP_DESKTOP;
+}
+void gui_open_sysmon(void)   /* PARCHE 091: el hilo del agente pide turno de pantalla */
+{
+    int tok = gui_enter();
+    gui_open_sysmon__impl();
+    gui_leave(tok);
+}
+
+static void gui_open_layout__impl(void)
 {
     if (gui_win_open(APP_LAYOUT)) return;
     ensure_window_geom();
-    current_app = APP_LAYOUT;
-    agent_global_focus = 0;
     layout_init();
+    g_pending_app = APP_LAYOUT;                         /* PARCHE 084: abre de verdad la ventana al arrancar la GUI */
     cmd_vsoma("", 0, 0);
+    g_pending_app = APP_DESKTOP;
+}
+void gui_open_layout(void)   /* PARCHE 091: el hilo del agente pide turno de pantalla */
+{
+    int tok = gui_enter();
+    gui_open_layout__impl();
+    gui_leave(tok);
 }
 
-void gui_open_coder_app(void)
+static void gui_open_layout_file__impl(const char *path)
+{
+    if (gui_win_open(APP_LAYOUT)) { layout_open_file(path); gui_live_paint(); return; }
+    ensure_window_geom();
+    layout_init();
+    layout_open_file(path);
+    g_pending_app = APP_LAYOUT;
+    cmd_vsoma("", 0, 0);
+    g_pending_app = APP_DESKTOP;
+}
+void gui_open_layout_file(const char *path)   /* PARCHE 091: el hilo del agente pide turno de pantalla */
+{
+    int tok = gui_enter();
+    gui_open_layout_file__impl(path);
+    gui_leave(tok);
+}
+
+static void gui_open_coder_app__impl(void)
 {
     if (gui_win_open(APP_CODER_APP)) return;
     ensure_window_geom();
     current_app = APP_CODER_APP;
     agent_global_focus = 0;
     coder_app_init();
+    g_pending_app = APP_CODER_APP;                      /* PARCHE 093: abre de verdad la ventana al arrancar la GUI */
     cmd_vsoma("", 0, 0);
+    g_pending_app = APP_DESKTOP;
+}
+void gui_open_coder_app(void)   /* PARCHE 091: el hilo del agente pide turno de pantalla */
+{
+    int tok = gui_enter();
+    gui_open_coder_app__impl();
+    gui_leave(tok);
 }
 
-void gui_open_notepad(const char *path)
+static void gui_open_notepad__impl(const char *path)
 {
     if (gui_win_open(APP_NOTEPAD)) {
         if (path && *path) notepad_load_file(path);
@@ -3798,9 +4132,15 @@ void gui_open_notepad(const char *path)
     if (path && *path) notepad_load_file(path);
     cmd_vsoma("", 0, 0);
 }
+void gui_open_notepad(const char *path)   /* PARCHE 091: el hilo del agente pide turno de pantalla */
+{
+    int tok = gui_enter();
+    gui_open_notepad__impl(path);
+    gui_leave(tok);
+}
 
 /* SOMA_PARCHE_ARCHIVOS: abre el visor de imagenes con un archivo (lo usa el explorador de archivos) */
-void gui_open_imgview(const char *path)
+static void gui_open_imgview__impl(const char *path)
 {
     if (gui_win_open(APP_IMAGE_VIEWER)) {
         if (path && *path) imgview_load_file(path);
@@ -3812,10 +4152,18 @@ void gui_open_imgview(const char *path)
     agent_global_focus = 0;
     imgview_init();
     if (path && *path) imgview_load_file(path);
+    g_pending_app = APP_IMAGE_VIEWER;                   /* PARCHE 088: abria el escritorio sin la ventana */
     cmd_vsoma("", 0, 0);
+    g_pending_app = APP_DESKTOP;
+}
+void gui_open_imgview(const char *path)   /* PARCHE 091: el hilo del agente pide turno de pantalla */
+{
+    int tok = gui_enter();
+    gui_open_imgview__impl(path);
+    gui_leave(tok);
 }
 
-void gui_open_paint(const char *path)
+static void gui_open_paint__impl(const char *path)
 {
     if (gui_win_open(APP_PAINT)) {
         if (path && *path) paint_open_file(path);
@@ -3823,14 +4171,20 @@ void gui_open_paint(const char *path)
         return;
     }
     ensure_window_geom();
-    current_app = APP_PAINT;
-    agent_global_focus = 0;
     paint_init();
     if (path && *path) paint_open_file(path);
+    g_pending_app = APP_PAINT;                          /* PARCHE 083: la orden 'paint' abre de verdad la ventana al arrancar la GUI */
     cmd_vsoma("", 0, 0);
+    g_pending_app = APP_DESKTOP;
+}
+void gui_open_paint(const char *path)   /* PARCHE 091: el hilo del agente pide turno de pantalla */
+{
+    int tok = gui_enter();
+    gui_open_paint__impl(path);
+    gui_leave(tok);
 }
 
-void gui_open_terminal(int debug)
+static void gui_open_terminal__impl(int debug)
 {
     term_set_debug(debug);
     if (gui_win_open(APP_TERMINAL_SHELL)) return;
@@ -3839,8 +4193,14 @@ void gui_open_terminal(int debug)
     cmd_vsoma("", 0, 0);
     g_pending_app = APP_DESKTOP;
 }
+void gui_open_terminal(int debug)   /* PARCHE 091: el hilo del agente pide turno de pantalla */
+{
+    int tok = gui_enter();
+    gui_open_terminal__impl(debug);
+    gui_leave(tok);
+}
 
-void gui_open_media(const char *path)
+static void gui_open_media__impl(const char *path)
 {
     if (gui_win_open(APP_MEDIA)) {
         if (path && *path) media_play(path);
@@ -3852,14 +4212,26 @@ void gui_open_media(const char *path)
     cmd_vsoma("", 0, 0);
     g_pending_app = APP_DESKTOP;
 }
+void gui_open_media(const char *path)   /* PARCHE 091: el hilo del agente pide turno de pantalla */
+{
+    int tok = gui_enter();
+    gui_open_media__impl(path);
+    gui_leave(tok);
+}
 
-void gui_open_agents(void)
+static void gui_open_agents__impl(void)
 {
     if (gui_win_open(APP_AGENTS)) return;
     ensure_window_geom();
     current_app = APP_AGENTS;
     agent_global_focus = 0;
     cmd_vsoma("", 0, 0);
+}
+void gui_open_agents(void)   /* PARCHE 091: el hilo del agente pide turno de pantalla */
+{
+    int tok = gui_enter();
+    gui_open_agents__impl();
+    gui_leave(tok);
 }
 
 /* El estado del raton es compartido con el hilo de fondo */
@@ -3894,6 +4266,8 @@ static int soma_clip_apply(int op)
     switch (current_app) {
     case APP_NOTEPAD:      return notepad_clip_op(op);
     case APP_IMAGE_VIEWER: return imgview_clip_op(op);
+    case APP_PDF:          return pdfview_clip_op(op);   /* PARCHE 088 */
+    case APP_CODER_APP:    if (coder_app_clip_op(op)) { her_refresh_all(); fb_present(); return 1; } return 0;   /* PARCHE 093 */
     case APP_PAINT:        return paint_clip_op(op);
     case APP_FILE_MANAGER: return fm_clip_op(op);
     case APP_WEB_BROWSER:
@@ -4011,6 +4385,7 @@ int cmd_vsoma(const char *args, char *out_buf, uint32_t max_out)
     agent_global_focus = 1;
     render_desktop();
     fb_present_full();
+    settings_load();                                        /* PARCHE 085: transparencia y fuente guardadas */
     if (g_pending_app != APP_DESKTOP) {
         enum app_mode pa = g_pending_app; g_pending_app = APP_DESKTOP;
         her_open_app(pa, cur_w, cur_h);
@@ -4035,6 +4410,25 @@ int cmd_vsoma(const char *args, char *out_buf, uint32_t max_out)
     uint64_t last_clock_time = timer_get_uptime_ms();
 
     while (1) {
+        acct_set_owner(ACCT_DESKTOP);   /* PARCHE 089: el bucle y la animacion son del escritorio; cada aplicacion se cuenta al dibujarse y al recibir eventos */
+        g_gui_loop_on = 1;
+        { struct tcb *gt = thread_current(); if (gt) g_gui_tid = gt->tid; }   /* PARCHE 098 */
+        { extern void shell_lock_drop(void); shell_lock_drop(); }             /* PARCHE 100 */
+        gui_soma_service(mouse_x, mouse_y);
+        if (g_gui_req) {                /* PARCHE 091: el agente pide la pantalla; se la cedemos en este punto seguro */
+            g_gui_grant = 1;
+            while (g_gui_req && g_agent_thr_on) thread_sleep(1);
+            g_gui_grant = 0;
+            HER_SYNC_WIN(); her_refresh_all(); fb_present();
+        }
+        if (g_agent_thr_done) {         /* PARCHE 091: la mision termino */
+            agent_turn_finish();
+            HER_SYNC_WIN(); her_refresh_all(); fb_present();
+        }
+        /* PARCHE 089: el bucle de la GUI ya no gira sin parar. Si no hay tecla pendiente ni fotograma de la animacion a punto, cede
+         * la CPU 1 ms (el hilo inactivo detiene el procesador): el uso de CPU que muestra el Monitor es real y QEMU deja de consumir
+         * un nucleo entero del anfitrion. El raton se sigue leyendo cada milisegundo. */
+        if (!kgetc_ready() && timer_get_uptime_ms() - her_last_anim < 30 && !her_dragging && !her_resizing && !mouse_left_held()) thread_sleep(1);
         uint64_t now = timer_get_uptime_ms();
 
         /* SOMA_PARCHE_021_FPU: un proceso de usuario tiene la pantalla; la GUI espera sin dibujar */
@@ -4084,6 +4478,27 @@ int cmd_vsoma(const char *args, char *out_buf, uint32_t max_out)
             fb_fill_rect(140, system_y + 10, 120, 20, 0x000B0F19);
             font_draw_string(140, system_y + 14, cstr, 0x00F8FAFC, 1);
         }
+        if (!her_dragging && !her_resizing) {   /* PARCHE 089/090: el Monitor se actualiza cada segundo aunque no sea la ventana activa */
+            int si = -1;
+            for (int i = 0; i < her_num_windows; i++) if (her_windows[i].app == APP_SYSMON) si = i;
+            if (si >= 0) {
+                uint8_t own = acct_set_owner((uint8_t)(ACCT_APP0 + APP_SYSMON));
+                if (sysmon_tick()) {
+                    struct her_win_node *sw = &her_windows[si];
+                    int covered = 0;   /* alguna ventana de encima lo tapa: hay que recomponer todo para no pintar sobre ella */
+                    for (int j = si + 1; j < her_num_windows; j++) {
+                        struct her_win_node *o = &her_windows[j];
+                        if (o->x < sw->x + sw->w && sw->x < o->x + o->w && o->y < sw->y + sw->h && sw->y < o->y + o->h) { covered = 1; break; }
+                    }
+                    int opaque = settings_opacity() >= 100;
+                    if (!covered && opaque) her_render_app_body(APP_SYSMON, HER_CLI_X(sw->x), HER_CLI_Y(sw->y), HER_CLI_W(sw->w), HER_CLI_H(sw->h), si == her_num_windows - 1);
+                    else her_refresh_all();
+                    if (her_cursor_should_show()) mouse_draw_cursor(mouse_x, mouse_y);
+                    fb_present();
+                }
+                acct_set_owner(own);
+            }
+        }
 
         if (now - last_cursor_time >= 400) {
             cursor_visible = !cursor_visible;
@@ -4125,12 +4540,13 @@ int cmd_vsoma(const char *args, char *out_buf, uint32_t max_out)
                     for (int wi = her_num_windows - 1; wi >= 0; --wi) {
                         int edge = 0;
                         int h = her_win_hit_target(&her_windows[wi], mouse_x, mouse_y, &edge);
-                        if (h == 2) { over_edge = 1; break; }
+                        if (h == 2) { over_edge = edge; break; }
                         else if (h > 0) { break; }
                     }
-                    if (over_edge) {
-                        mouse_set_cursor(CURSOR_CROSSHAIR);
-                    } else if (mouse_get_current_cursor() == CURSOR_CROSSHAIR) {
+                    int rc = her_resize_cursor(over_edge);           /* PARCHE 085: flecha doble segun el borde */
+                    if (rc >= 0) {
+                        if (mouse_get_current_cursor() != rc) mouse_set_cursor(rc);
+                    } else if (her_is_resize_cursor(mouse_get_current_cursor())) {
                         mouse_set_cursor(CURSOR_ARROW);
                     }
                 }
@@ -4149,6 +4565,7 @@ int cmd_vsoma(const char *args, char *out_buf, uint32_t max_out)
                     mouse_erase_cursor();
             }
 
+            acct_set_owner((uint8_t)(ACCT_APP0 + current_app));   /* PARCHE 089 */
             {   /* SOMA_PARCHE_024_TERM: rueda y boton derecho */
                 int wheel = mouse_wheel_take();
                 int rclick = mouse_right_take_click();
@@ -4156,6 +4573,27 @@ int cmd_vsoma(const char *args, char *out_buf, uint32_t max_out)
                 if (current_app == APP_FILE_MANAGER && !her_dragging && !her_resizing) {   /* SOMA_PARCHE_028_UI */
                     if (fm_mouse(mouse_x, mouse_y, win_x, win_y, win_w, win_h, wheel, mouse_left_held(), rclick))
                         fm_render_window(win_x, win_y, win_w, win_h, 1);
+                }
+                if (current_app == APP_CODER_APP && !her_dragging && !her_resizing) {   /* PARCHE 093: arrastre de seleccion y rueda */
+                    if (coder_app_mouse(mouse_x, mouse_y, wheel, mouse_left_held())) { coder_app_render_window(win_x, win_y, win_w, win_h, 1); fb_present(); }
+                }
+                if (current_app == APP_SYSMON && !her_dragging && !her_resizing) {   /* PARCHE 089: muestra por segundo y rueda */
+                    int rd = sysmon_tick();
+                    if (sysmon_mouse(mouse_x, mouse_y, win_x, win_y, win_w, win_h, wheel)) rd = 1;
+                    if (rd) { sysmon_render_window(win_x, win_y, win_w, win_h, 1); fb_present(); }
+                }
+                if (current_app == APP_PDF && !her_dragging && !her_resizing) {      /* PARCHE 088: rueda y arrastre del lector PDF */
+                    if (pdfview_mouse(mouse_x, mouse_y, win_x, win_y, win_w, win_h, wheel, mouse_left_held())) { pdfview_render_window(win_x, win_y, win_w, win_h, 1); fb_present(); }
+                }
+                if (current_app == APP_IMAGE_VIEWER && !her_dragging && !her_resizing) {   /* PARCHE 088: rueda y arrastre del visor */
+                    if (imgview_mouse(mouse_x, mouse_y, win_x, win_y, win_w, win_h, wheel, mouse_left_held())) { imgview_render_window(win_x, win_y, win_w, win_h, 1); fb_present(); }
+                }
+                if (current_app == APP_SETTINGS && !her_dragging && !her_resizing) {  /* PARCHE 085: deslizador de opacidad */
+                    if (settings_mouse(mouse_x, mouse_y, win_x, win_y, win_w, win_h, mouse_left_held())) { her_refresh_all(); fb_present(); }
+                }
+                if (current_app == APP_LAYOUT && !her_dragging && !her_resizing) {   /* PARCHE 084: rueda y barra del maquetador */
+                    if (layout_mouse(mouse_x, mouse_y, win_x, win_y, win_w, win_h, wheel, mouse_left_held()))
+                        layout_render_window(win_x, win_y, win_w, win_h, 1);
                 }
                 if (current_app == APP_NOTEPAD && !her_dragging && !her_resizing) {   /* SOMA_PARCHE_028_UI: arrastre, rueda y menu contextual del Notepad con la posicion real del puntero */
                     if (notepad_mouse(mouse_x, mouse_y, win_x, win_y, win_w, win_h, wheel, mouse_left_held(), rclick))
@@ -4166,6 +4604,9 @@ int cmd_vsoma(const char *args, char *out_buf, uint32_t max_out)
                     if (wheel && term_wheel(wheel)) redraw = 1;
                     if (rclick && term_mouse_right(mouse_x, mouse_y, win_x, win_y, win_w, win_h)) redraw = 1;
                     if (redraw) render_real_terminal(win_x, win_y, win_w, win_h, cur_cmd, cur_cmd_len, cur_cursor_pos, 1);
+                }
+                if (current_app == APP_WEB_BROWSER && rclick && point_in_rect(mouse_x, mouse_y, win_x, win_y, win_w, win_h)) {   /* PARCHE 085 */
+                    if (browser_right_click(mouse_x, mouse_y, win_x, win_y, win_w, win_h)) her_refresh_all();
                 }
             }
 
@@ -4205,6 +4646,7 @@ int cmd_vsoma(const char *args, char *out_buf, uint32_t max_out)
                     }
                     if (win_hit_code == 1) {
                         her_dragging = 1; her_resizing = 0;
+                        mouse_set_cursor(CURSOR_MOVE);                 /* PARCHE 085 */
                         her_drag_ox = mouse_x - (int32_t)top_win->x;
                         her_drag_oy = mouse_y - (int32_t)top_win->y;
                         her_refresh_all();
@@ -4214,10 +4656,10 @@ int cmd_vsoma(const char *args, char *out_buf, uint32_t max_out)
                     if (win_hit_code == 2) {
                         her_resizing = 1; her_dragging = 0;
                         her_resize_edge = win_edge_code;
+                        { int rc = her_resize_cursor(win_edge_code); if (rc >= 0) mouse_set_cursor(rc); }
                         her_resize_start_mx = mouse_x; her_resize_start_my = mouse_y;
                         her_resize_start_x = (int32_t)top_win->x; her_resize_start_y = (int32_t)top_win->y;
                         her_resize_start_w = (int32_t)top_win->w; her_resize_start_h = (int32_t)top_win->h;
-                        mouse_set_cursor(CURSOR_CROSSHAIR);
                         her_refresh_all();
                         fb_present();
                         continue;
@@ -4254,7 +4696,18 @@ int cmd_vsoma(const char *args, char *out_buf, uint32_t max_out)
 
                 if (current_app != APP_DESKTOP) {
                     agent_global_focus = (current_app == APP_AGENT_CHAT) ? 1 : 0;
-                    if (current_app == APP_WEB_BROWSER) {
+                    if (current_app == APP_SYSMON) {                 /* PARCHE 089 */
+                        if (sysmon_handle_click(mouse_x, mouse_y, win_x, win_y, win_w, win_h) == 2) { HER_SYNC_WIN(); her_refresh_all(); }
+                        else sysmon_render_window(win_x, win_y, win_w, win_h, 1);
+                    } else
+                    if (current_app == APP_PDF) {                    /* PARCHE 088 */
+                        pdfview_handle_click(mouse_x, mouse_y, win_x, win_y, win_w, win_h);
+                        pdfview_render_window(win_x, win_y, win_w, win_h, 1);
+                    } else
+                    if (current_app == APP_SETTINGS) {               /* PARCHE 085 */
+                        if (settings_handle_click(mouse_x, mouse_y, win_x, win_y, win_w, win_h)) her_refresh_all();
+                        else settings_render_window(win_x, win_y, win_w, win_h, 1);
+                    } else if (current_app == APP_WEB_BROWSER) {
                         int act = browser_handle_click(mouse_x, mouse_y, win_x, win_y, win_w, win_h);
                         if (act == 1) { her_close_current_app_vortex(); continue; }
                         browser_render_window(win_x, win_y, win_w, win_h, 1);
@@ -4326,6 +4779,7 @@ int cmd_vsoma(const char *args, char *out_buf, uint32_t max_out)
         if (kgetc_ready()) {
             char c = kgetc();
             if (soma_clip_gui_key(c)) continue;   /* SOMA_PARCHE_PORTAPAPELES */
+            acct_set_owner((uint8_t)(ACCT_APP0 + current_app));   /* PARCHE 089 */
             if (c == 27) {
                 if (current_app == APP_TERMINAL_SHELL && term_popup_open()) {      /* SOMA_PARCHE_024_TERM: Esc cierra el menu */
                     term_popup_close();
@@ -4335,6 +4789,10 @@ int cmd_vsoma(const char *args, char *out_buf, uint32_t max_out)
                 if (current_app == APP_FILE_MANAGER && fm_escape()) {              /* SOMA_PARCHE_028_UI */
                     fm_render_window(win_x, win_y, win_w, win_h, 1);
                     fb_present(); continue;
+                }
+                if (current_app == APP_CODER_APP) {                                 /* PARCHE 093: Esc cierra barras/seleccion del editor, no sale del escritorio */
+                    if (coder_app_escape()) { coder_app_render_window(win_x, win_y, win_w, win_h, 1); fb_present(); }
+                    continue;
                 }
                 if (current_app == APP_NOTEPAD && notepad_escape()) {              /* SOMA_PARCHE_028_UI: Esc cierra el menu o el dialogo del Notepad */
                     notepad_render_window(win_x, win_y, win_w, win_h, 1);
@@ -4507,7 +4965,6 @@ int cmd_vsoma(const char *args, char *out_buf, uint32_t max_out)
                 continue;
             }
             if (current_app == APP_CODER_APP) {
-                if (c == 27) { her_close_current_app_vortex(); continue; }
                 coder_app_handle_key(c);
                 coder_app_render_window(win_x, win_y, win_w, win_h, 1);
                 fb_present();
@@ -4519,6 +4976,19 @@ int cmd_vsoma(const char *args, char *out_buf, uint32_t max_out)
                 continue;
             }
 
+            if (current_app == APP_SYSMON) {                     /* PARCHE 089 */
+                if (c == 27) { her_close_current_app_vortex(); continue; }
+                sysmon_handle_key(c); sysmon_render_window(win_x, win_y, win_w, win_h, 1); fb_present(); continue;
+            }
+            if (current_app == APP_PDF) {                        /* PARCHE 088 */
+                if (c == 27) { her_close_current_app_vortex(); continue; }
+                pdfview_handle_key(c); pdfview_render_window(win_x, win_y, win_w, win_h, 1); fb_present(); continue;
+            }
+            if (current_app == APP_SETTINGS) {                   /* PARCHE 085 */
+                if (c == 27) { her_close_current_app_vortex(); continue; }
+                if (settings_handle_key(c)) her_refresh_all(); else settings_render_window(win_x, win_y, win_w, win_h, 1);
+                fb_present(); continue;
+            }
             if (current_app == APP_WEB_BROWSER) {
                 browser_handle_key(c); browser_render_window(win_x, win_y, win_w, win_h, 1); fb_present(); continue;
             }
@@ -4671,6 +5141,15 @@ int cmd_vsoma(const char *args, char *out_buf, uint32_t max_out)
                     cur_cmd_len = 0; cur_cursor_pos = 0; cur_cmd[0] = '\0';
 
                     if (cmd_run[0] == 'c' && cmd_run[1] == 'l' && cmd_run[2] == 'e') term_clear();
+                    else if (cmd_run[0] == 's' && cmd_run[1] == 'o' && cmd_run[2] == 'm' && cmd_run[3] == 'a' && cmd_run[4] == ' ' && cmd_run[5]) {
+                        /* PARCHE 091: "soma <mision>" tambien va al hilo del agente; la terminal no se bloquea */
+                        const char *ms = cmd_run + 5; uint32_t k = 0;
+                        while (ms[k] && k < sizeof(agent_global_cmd) - 1) { agent_global_cmd[k] = ms[k]; k++; }
+                        agent_global_cmd[k] = '\0'; agent_global_len = k; agent_global_cursor = k;
+                        int was_busy = g_agent_thr_on;
+                        submit_global_agent_prompt(win_x, win_y, win_w, win_h);
+                        term_add_line(was_busy ? "SOMA sigue con la mision anterior: espera a que termine." : "Mision enviada a SOMA: trabaja en segundo plano y la respuesta sale en su ventana. Puedes seguir usando el sistema.", max_visible_terminal);
+                    }
                     else {
                         static char cmd_out[4096]; cmd_out[0] = '\0';
                         int ret = dispatch_command(cmd_run, cmd_out, sizeof(cmd_out));

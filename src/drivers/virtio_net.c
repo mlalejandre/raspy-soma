@@ -5,9 +5,9 @@
 #include "virtio_net.h"
 #include "arch.h"
 #include "net.h"
+#include "netif.h"          /* PARCHE 080: varias interfaces de red (virtio, Ethernet del RP1, Wi-Fi) */
 #if defined(PLATFORM_rpi5)
 #include "gem.h"            /* PARCHE 069: en la Pi 5 la tarjeta de red es la GEM del RP1 */
-static int use_gem;
 #endif
 
 #define VIRTIO_VENDOR_ID       0x1AF4
@@ -238,14 +238,11 @@ static int fail_device(const char *message)
     return 0;
 }
 
-int virtio_net_init(void)
+static int vnet_init(void)
 {
     kprint("\nVIRTIO-NET INIT\n");
     kprint("---------------\n");
 
-#if defined(PLATFORM_rpi5)
-    if (gem_init()) { use_gem = 1; return 1; }
-#endif
 #ifdef __aarch64__
 #include "platform.h"
 #if !SOMA_HAVE_VIRTIO
@@ -345,19 +342,13 @@ int virtio_net_init(void)
 #endif
 }
 
-const uint8_t *virtio_net_mac(void)
+static const uint8_t *vnet_mac(void)
 {
-#if defined(PLATFORM_rpi5)
-    if (use_gem) return gem_mac();
-#endif
     return mac_addr;
 }
 
-int virtio_net_send(const void *frame, uint16_t len)
+static int vnet_send(const void *frame, uint16_t len)
 {
-#if defined(PLATFORM_rpi5)
-    if (use_gem) { net_lock(); int r = gem_send(frame, len); net_unlock(); return r; }
-#endif
     net_lock();
     if (!ready || len == 0 || len > (TX_BUFFER_SIZE - NET_HDR_SIZE)) { net_unlock(); return -1; }
     uint16_t frame_len = len < ETH_MIN_FRAME ? ETH_MIN_FRAME : len;
@@ -396,11 +387,8 @@ int virtio_net_send(const void *frame, uint16_t len)
     return 0;
 }
 
-int virtio_net_poll(void *out, uint16_t max, uint16_t *len_out)
+static int vnet_poll(void *out, uint16_t max, uint16_t *len_out)
 {
-#if defined(PLATFORM_rpi5)
-    if (use_gem) return gem_poll(out, max, len_out);
-#endif
     if (!ready) return 0;
     if (rxq.used->idx == (uint16_t)rxq.last_used) return 0;
 
@@ -434,13 +422,37 @@ int virtio_net_poll(void *out, uint16_t max, uint16_t *len_out)
     return received;
 }
 
-void virtio_net_stats(uint32_t *tx_pkts, uint32_t *rx_pkts, uint64_t *tx_b, uint64_t *rx_b)
+static void vnet_stats(uint32_t *tx_pkts, uint32_t *rx_pkts, uint64_t *tx_b, uint64_t *rx_b)
 {
-#if defined(PLATFORM_rpi5)
-    if (use_gem) { gem_stats(tx_pkts, rx_pkts, tx_b, rx_b); return; }
-#endif
     if (tx_pkts) *tx_pkts = stat_tx_packets;
     if (rx_pkts) *rx_pkts = stat_rx_packets;
     if (tx_b)    *tx_b    = stat_tx_bytes;
     if (rx_b)    *rx_b    = stat_rx_bytes;
 }
+
+/* ------------------------------------------------------------------------------------------------------------------------------
+ * PARCHE 080: las funciones publicas virtio_net_* (las que usa la pila IP) pasan por la capa netif. Se registran los dispositivos de la
+ * plataforma por orden de preferencia y se usa el primero que arranca; 'netif usar <nombre>' cambia de dispositivo en caliente. */
+static int vnet_link(void) { return ready; }
+static const struct netif_ops if_virtio = { "virtio0", "virtio-net (QEMU)", vnet_init, vnet_send, vnet_poll, vnet_mac, vnet_link, vnet_stats };
+#if defined(PLATFORM_rpi5)
+static int g_send_locked(const void *f, uint16_t n) { net_lock(); int r = gem_send(f, n); net_unlock(); return r; }
+static const struct netif_ops if_gem = { "eth0", "Ethernet del RP1 (GEM)", gem_init, g_send_locked, gem_poll, gem_mac, gem_link_up, gem_stats };
+#endif
+static int g_registered;
+static void register_all(void)
+{
+    if (g_registered) return;
+    g_registered = 1;
+#if defined(PLATFORM_rpi5)
+    netif_register(&if_gem);
+    netif_register(&netif_wlan0);           /* Wi-Fi: no arranca hasta la fase 3 (asociacion WPA2) */
+#endif
+    netif_register(&if_virtio);
+}
+
+int virtio_net_init(void) { register_all(); return netif_start_first(); }
+const uint8_t *virtio_net_mac(void) { return netif_mac(); }
+int virtio_net_send(const void *frame, uint16_t len) { return netif_send(frame, len); }
+int virtio_net_poll(void *out, uint16_t max, uint16_t *len_out) { return netif_poll(out, max, len_out); }
+void virtio_net_stats(uint32_t *tx_pkts, uint32_t *rx_pkts, uint64_t *tx_b, uint64_t *rx_b) { netif_stats(tx_pkts, rx_pkts, tx_b, rx_b); }

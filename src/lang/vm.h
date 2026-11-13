@@ -80,7 +80,15 @@ enum soma_opcode {
     OP_SYS_WIN_PRESENT,
     OP_SYS_WIN_CLOSE,
     OP_SYS_WIN_ACTIVE,
-    OP_SYS_WIN_MOUSE
+    OP_SYS_WIN_MOUSE,
+    OP_ABS,
+    OP_MIN,
+    OP_MAX,
+    OP_CLAMP,
+    OP_SQRT,
+    OP_STR_FIND,
+    OP_CHR,
+    OP_ORD
 };
 
 /* Capacidades escaladas para aplicaciones complejas */

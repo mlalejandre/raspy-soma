@@ -8,6 +8,19 @@ void gui_open_browser(const char *url);
 void gui_open_file_manager(const char *folder);
 void gui_open_memview(void);
 void gui_open_layout(void);
+void gui_open_settings(void);
+void gui_open_web(void);
+void gui_open_pdf(const char *path);        /* PARCHE 088 */
+void gui_open_sysmon(void);                  /* PARCHE 089 */
+const char *gui_app_title(int app);
+int  gui_app_list(int *apps, int max);
+int  gui_close_app(int app);
+extern const int gui_app_sysmon;
+/* PARCHE 091: el agente corre en su hilo; para tocar la pantalla pide turno (0 = no hacia falta) */
+int  gui_enter(void);
+void gui_leave(int tok);
+int  gui_agent_busy(void);                   /* PARCHE 085 */
+void gui_open_layout_file(const char *path);   /* PARCHE 084: abre un .tex en el maquetador */
 void gui_open_agents(void);
 void gui_open_notepad(const char *path);
 void gui_open_paint(const char *path);

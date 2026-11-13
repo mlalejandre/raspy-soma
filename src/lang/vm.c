@@ -835,6 +835,7 @@ static int vm_run_inner(struct soma_vm *vm, const uint8_t *bytecode, uint32_t le
             kprint("[VM ERROR] Limite de instrucciones sin pausa excedido (bucle infinito?). Usa sys.sleep() en bucles largos.\n");
             return -1;
         }
+        if ((vm_steps & 4095u) == 0) thread_preempt_point();   /* PARCHE 098: un programa sin pausas no congela el sistema */
         uint8_t op = vm->code[vm->ip++];
 
         switch (op) {
@@ -1736,6 +1737,71 @@ static int vm_run_inner(struct soma_vm *vm, const uint8_t *bytecode, uint32_t le
             break;
         }
 
+        /* PARCHE 101: funciones matematicas y de texto basicas */
+        case OP_ABS: {
+            struct vm_val a = pop_val(vm);
+            struct vm_val res = { VAL_INT, (a.i < 0) ? -a.i : a.i, {0}, 0, 0 };
+            if (!push_val(vm, res)) return -1;
+            break;
+        }
+        case OP_MIN: case OP_MAX: {
+            struct vm_val b = pop_val(vm), a = pop_val(vm);
+            int64_t r = (op == OP_MIN) ? (a.i < b.i ? a.i : b.i) : (a.i > b.i ? a.i : b.i);
+            struct vm_val res = { VAL_INT, r, {0}, 0, 0 };
+            if (!push_val(vm, res)) return -1;
+            break;
+        }
+        case OP_CLAMP: {
+            struct vm_val hi = pop_val(vm), lo = pop_val(vm), x = pop_val(vm);
+            int64_t r = x.i;
+            if (r < lo.i) r = lo.i;
+            if (r > hi.i) r = hi.i;
+            struct vm_val res = { VAL_INT, r, {0}, 0, 0 };
+            if (!push_val(vm, res)) return -1;
+            break;
+        }
+        case OP_SQRT: {
+            struct vm_val a = pop_val(vm);
+            int64_t n = a.i, r = 0;
+            if (n > 0) { r = 0; while ((r + 1) * (r + 1) <= n && r < 3037000499LL) r++; }
+            struct vm_val res = { VAL_INT, r, {0}, 0, 0 };
+            if (!push_val(vm, res)) return -1;
+            break;
+        }
+        case OP_STR_FIND: {
+            struct vm_val sub = pop_val(vm), str = pop_val(vm);
+            int64_t pos = -1;
+            if (str.type == VAL_STR && sub.type == VAL_STR) {
+                const char *h = vm_sdata(vm, &str), *nd = vm_sdata(vm, &sub);
+                uint32_t hl = vm_slen(vm, &str), nl = vm_slen(vm, &sub);
+                if (nl == 0) pos = 0;
+                else for (uint32_t i = 0; i + nl <= hl; i++) {
+                    uint32_t k = 0; while (k < nl && h[i + k] == nd[k]) k++;
+                    if (k == nl) { pos = (int64_t)i; break; }
+                }
+            }
+            struct vm_val res = { VAL_INT, pos, {0}, 0, 0 };
+            if (!push_val(vm, res)) return -1;
+            break;
+        }
+        case OP_CHR: {
+            struct vm_val a = pop_val(vm);
+            struct vm_val res;
+            res.type = VAL_STR; res.i = 0; res.arr_id = 0; res.tab_id = 0; res.s[0] = '\0';
+            char ch[2]; ch[0] = (char)(a.i & 0x7F); ch[1] = 0;
+            if (ch[0]) vm_str_make2(vm, &res, ch, 1, "", 0);
+            if (!push_val(vm, res)) return -1;
+            break;
+        }
+        case OP_ORD: {
+            struct vm_val idx = pop_val(vm), str = pop_val(vm);
+            int64_t r = 0;
+            if (str.type == VAL_STR && idx.i >= 0 && idx.i < (int64_t)vm_slen(vm, &str)) r = (uint8_t)vm_sdata(vm, &str)[idx.i];
+            struct vm_val res = { VAL_INT, r, {0}, 0, 0 };
+            if (!push_val(vm, res)) return -1;
+            break;
+        }
+
         case OP_STR_SUB: {
             struct vm_val v_len = pop_val(vm);
             struct vm_val v_start = pop_val(vm);
@@ -1896,9 +1962,10 @@ static int vm_run_inner(struct soma_vm *vm, const uint8_t *bytecode, uint32_t le
             v.arr_id = 0;
             v.s[0] = '\0';
 
-            char *fbuf = (char *)kmalloc(FS_DATA_MAX + 1);
+            int fsz = vfs_size(path.s); if (fsz < FS_DATA_MAX) fsz = FS_DATA_MAX;   /* PARCHE 087 */
+            char *fbuf = (char *)kmalloc((size_t)fsz + 1);
             if (fbuf) {
-                int r = vfs_read(path.s, fbuf, FS_DATA_MAX);
+                int r = vfs_read(path.s, fbuf, (uint32_t)fsz + 1);
                 if (r <= 0) {
                     if (path.s[0] != '/') {
                         char alt[64];

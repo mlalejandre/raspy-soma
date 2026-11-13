@@ -341,9 +341,20 @@ static void test_autotest_interno(void)
     CHECK_EQ_INT(kheap_check(), 0);
 }
 
+static void test_reentrada(void)
+{
+    /* PARCHE 103: una llamada reentrante se rechaza y se cuenta, sin tocar las listas */
+    CHECK_EQ_INT(kheap_test_reentry(), 1);
+    CHECK_EQ_INT(kheap_check(), 0);
+    struct kheap_counters c = ctr();
+    CHECK(c.reentries >= 2);
+    CHECK_EQ_INT(c.corruptions, 0);
+}
+
 int main(void)
 {
     test_autotest_interno();
+    test_reentrada();
     test_basico();
     test_tamanos_imposibles();
     test_coalescencia();

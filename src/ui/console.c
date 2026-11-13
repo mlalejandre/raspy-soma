@@ -277,16 +277,19 @@ void kprint_ip(const uint8_t *ip)
 static volatile char kbd_buf[KBD_BUF_SIZE];
 static volatile uint32_t kbd_head = 0;
 static volatile uint32_t kbd_tail = 0;
-static int shift_active = 0;
 static int caps_active = 0;
-static int ctrl_active = 0;
 static int e0_prefix = 0;
 static int kbd_dead_key = 0; /* 0: ninguna, 1: agudo (´ / '), 2: dieresis (¨ / "), 3: tilde (~) */
 
+static volatile uint8_t kbd_mod[KBD_BUF_SIZE];   /* PARCHE 094: Ctrl/Mayus en el momento de cada pulsacion */
+static volatile uint8_t kbd_last_mod;
+static int shift_active;
+static int ctrl_active;
 static void kbd_push_byte(char ch)
 {
     uint32_t next = (kbd_head + 1) % KBD_BUF_SIZE;
     if (next != kbd_tail) {
+        kbd_mod[kbd_head] = (uint8_t)((ctrl_active ? 1 : 0) | (shift_active ? 2 : 0));
         kbd_buf[kbd_head] = ch;
         kbd_head = next;
     }
@@ -397,13 +400,7 @@ static void keyboard_scancode(uint8_t sc)
         else if (sc == 0x49) k = 28;          /* SOMA_PARCHE_024_TERM: RePag */
         else if (sc == 0x51) k = 29;          /* AvPag */
         else if (sc == 0x53) k = 4;           /* Supr */
-        if (k != 0) {
-            uint32_t next = (kbd_head + 1) % KBD_BUF_SIZE;
-            if (next != kbd_tail) {
-                kbd_buf[kbd_head] = k;
-                kbd_head = next;
-            }
-        }
+        if (k != 0) kbd_push_byte(k);   /* PARCHE 094: con sus modificadores */
         return;
     }
     if (sc == 0x1D) {
@@ -549,6 +546,7 @@ char kgetc(void)
 #ifdef __x86_64__
     if (kbd_head != kbd_tail) {
         char ch = kbd_buf[kbd_tail];
+        kbd_last_mod = kbd_mod[kbd_tail];
         kbd_tail = (kbd_tail + 1) % KBD_BUF_SIZE;
         return ch;
     }
@@ -556,6 +554,7 @@ char kgetc(void)
 #else
     if (kbd_head != kbd_tail) {
         char ch = kbd_buf[kbd_tail];
+        kbd_last_mod = kbd_mod[kbd_tail];
         kbd_tail = (kbd_tail + 1) % KBD_BUF_SIZE;
         return ch;
     }
@@ -973,3 +972,6 @@ int keyboard_shift_held(void)
     return 0;
 #endif
 }
+
+/* PARCHE 094: modificadores que acompanaban a la ultima tecla leida con kgetc (no dependen de cuando se procese) */
+int keyboard_last_mods(void) { return kbd_last_mod; }

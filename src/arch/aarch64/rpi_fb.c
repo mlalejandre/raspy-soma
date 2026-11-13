@@ -51,6 +51,9 @@ static int mbox_call(uint32_t *buf, uint32_t bytes)
     return 0;
 }
 
+/* PARCHE 079: acceso publico al canal de propiedades (revision de la placa, etc.) */
+int rpi_mbox_prop(uint32_t *buf, uint32_t bytes) { return mbox_call(buf, bytes); }
+
 /* PARCHE 075 (primera prueba en una Pi 5 real: pantalla negra). Dos causas corregidas aqui:
  *  1. SOMA no dibujaba nada en HDMI hasta ejecutar 'vsoma': ahora hay una consola de texto en HDMI desde el principio del arranque.
  *  2. El firmware de la Pi 5 NO deja elegir la resolucion (impone la del monitor) y no atiende todas las etiquetas: se acepta lo que de. */

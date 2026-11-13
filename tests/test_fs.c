@@ -80,9 +80,29 @@ static void test_limites_de_tamano(void)
 {
     memset(g_buf, 'x', sizeof(g_buf));
     CHECK_EQ_INT(vfs_write("/t/max", g_buf, FS_DATA_MAX - 1), FS_DATA_MAX - 1);
-    CHECK_EQ_INT(vfs_write("/t/max", g_buf, FS_DATA_MAX), -2);
-    /* El rechazo no debe dejar el archivo danado. */
-    CHECK_EQ_INT(vfs_read("/t/max", g_buf, sizeof(g_buf)), FS_DATA_MAX - 1);
+    /* PARCHE 087: 16 KiB ya no es el limite */
+    CHECK_EQ_INT(vfs_write("/t/max", g_buf, FS_DATA_MAX), FS_DATA_MAX);
+    CHECK_EQ_INT(vfs_size("/t/max"), FS_DATA_MAX);
+    {
+        uint32_t n = 300000u; char *big = (char *)malloc(n), *r; uint32_t rl = 0;
+        for (uint32_t i = 0; i < n; i++) big[i] = (char)('a' + (i * 7) % 26);
+        CHECK_EQ_INT(vfs_write("/t/grande.bin", big, n), (int)n);
+        CHECK_EQ_INT(vfs_size("/t/grande.bin"), (int)n);
+        r = vfs_read_alloc("/t/grande.bin", &rl);
+        CHECK(r != 0 && rl == n && memcmp(r, big, n) == 0);
+        free(r);
+        /* encoge por debajo de una ranura: vuelve a la ranura y sigue bien */
+        CHECK_EQ_INT(vfs_write("/t/grande.bin", big, 100), 100);
+        r = vfs_read_alloc("/t/grande.bin", &rl);
+        CHECK(r != 0 && rl == 100 && memcmp(r, big, 100) == 0);
+        free(r);
+        vfs_delete("/t/grande.bin");
+        CHECK_EQ_INT(vfs_size("/t/grande.bin"), -1);
+        free(big);
+    }
+    /* por encima del maximo absoluto: rechazado sin danar el anterior */
+    CHECK_EQ_INT(vfs_write("/t/max", g_buf, FS_FILE_MAX + 1), -2);
+    CHECK_EQ_INT(vfs_read("/t/max", g_buf, sizeof(g_buf)), FS_DATA_MAX);
     vfs_delete("/t/max");
 }
 
@@ -132,7 +152,7 @@ static void test_tabla_llena(void)
 
     fresh();
     vfs_init();
-    for (i = 0; i < 200; ++i) {
+    for (i = 0; i < FS_MAX_FILES + 20; ++i) {
         snprintf(nombre, sizeof(nombre), "/lleno/f%03d", i);
         if (vfs_write(nombre, "x", 1) < 0) { primer_fallo = i; break; }
         ++creados;
@@ -216,6 +236,11 @@ static int persist_write(const char *img)
     vfs_write("/persist/dos.txt", "contenido dos", 13);
     vfs_delete("/persist/dos.txt");
     vfs_write("/tmp/volatil", "no debe persistir", 17);
+    {   /* PARCHE 087: un archivo grande y archivos mas alla de las 64 ranuras */
+        static char big[200000]; for (int i = 0; i < (int)sizeof big; i++) big[i] = (char)(i * 31 + 7);
+        CHECK_EQ_INT(vfs_write("/persist/grande.bin", big, sizeof big), (int)sizeof big);
+        char nm[48]; for (int i = 0; i < 90; i++) { snprintf(nm, sizeof nm, "/persist/n%03d.txt", i); CHECK_EQ_INT(vfs_write(nm, nm, (uint32_t)strlen(nm)), (int)strlen(nm)); }
+    }
     CHECK_EQ_INT(vfs_sync(), 0);
     if (host_disk_save(img) != 0) { printf("  no se pudo guardar %s\n", img); return 1; }
     TEST_MAIN_END("fs persist-write");
@@ -233,6 +258,12 @@ static int persist_check(const char *img)
     CHECK_STR(b, "contenido uno");
     CHECK_EQ_INT(vfs_read("/persist/dos.txt", b, sizeof(b)), -1);   /* borrado persistio */
     CHECK_EQ_INT(vfs_read("/tmp/volatil", b, sizeof(b)), -1);       /* efimero no persistio */
+    {   /* PARCHE 087 */
+        uint32_t rl = 0; char *r = vfs_read_alloc("/persist/grande.bin", &rl); int ok = r && rl == 200000;
+        for (int i = 0; ok && i < 200000; i++) if (r[i] != (char)(i * 31 + 7)) ok = 0;
+        CHECK(ok); free(r);
+        char nm[48]; for (int i = 0; i < 90; i++) { snprintf(nm, sizeof nm, "/persist/n%03d.txt", i); CHECK_EQ_INT(vfs_read(nm, b, sizeof b), (int)strlen(nm)); CHECK_STR(b, nm); }
+    }
     TEST_MAIN_END("fs persist-check");
 }
 

@@ -14,6 +14,7 @@
 static struct bigfs *g_fs;
 static struct kmutex g_lock;
 static int g_lock_ready;
+static int g_spill_state;           /* PARCHE 087: almacen de RamFS: 0 sin probar, 1 listo, -1 no disponible */
 
 static uint64_t region_sectors(void)
 {
@@ -70,10 +71,75 @@ int bigfs_sys_format(void)
     struct bigfs_dev d;
     if (!make_dev(&d)) return BIGFS_E_NOSPC;
     if (g_fs) { bigfs_unmount(g_fs); g_fs = 0; }
+    g_spill_state = 0;                                   /* PARCHE 087 */
     int r = bigfs_format(&d, 0);
     if (r) return r;
     int e; g_fs = bigfs_mount(&d, &e);
     return g_fs ? 0 : e;
+}
+
+/* ================================================================== PARCHE 087: almacen de RamFS para archivos grandes
+ * Cada archivo que no cabe en una ranura de SOMAFS02 (16 KiB) o que no tiene ranura (mas de 64 archivos) se guarda en BIGFS como
+ * /.ramfs/NNN = cabecera de 64 bytes ("RFS1", nombre, tamano) + contenido. Si la region BIGFS esta en blanco (todo ceros) se formatea
+ * sola; si tiene otra cosa no se toca. */
+#define RFS_DIR "/.ramfs"
+static void spill_path(int slot, char *p)
+{
+    const char *d = RFS_DIR "/"; int k = 0; while (*d) p[k++] = *d++;
+    p[k++] = (char)('0' + (slot / 100) % 10); p[k++] = (char)('0' + (slot / 10) % 10); p[k++] = (char)('0' + slot % 10); p[k] = 0;
+}
+int fs_spill_ready(void)
+{
+    if (g_spill_state) return g_spill_state > 0;
+    if (!region_sectors()) { g_spill_state = -1; return 0; }
+    int e = 0;
+    struct bigfs *fs = bigfs_sys(&e);
+    if (!fs && e == BIGFS_E_NOTFMT) {
+        uint8_t sec[512]; int blank = virtio_blk_read_n(SOMA_LBA_BIGFS_START, sec, 1) == 0;
+        for (int i = 0; blank && i < 512; i++) if (sec[i]) blank = 0;
+        if (blank && bigfs_sys_format() == 0) { kprint("BIGFS: region en blanco formateada para los archivos grandes de RamFS\n"); fs = bigfs_sys(&e); }
+    }
+    if (!fs) { g_spill_state = -1; return 0; }
+    uint32_t ino; if (bigfs_lookup(fs, RFS_DIR, &ino) < 0 && bigfs_mkdir(fs, RFS_DIR) != 0) { g_spill_state = -1; return 0; }
+    g_spill_state = 1;
+    return 1;
+}
+int fs_spill_put(int slot, const char *name, const char *data, uint32_t len)
+{
+    struct bigfs *fs = g_spill_state > 0 ? g_fs : 0; if (!fs) return -1;
+    char p[32]; spill_path(slot, p);
+    uint32_t ino;
+    if (bigfs_lookup(fs, p, &ino) < 0) { if (bigfs_create(fs, p, &ino) != 0) return -1; }
+    uint8_t h[64]; memset(h, 0, sizeof h); memcpy(h, "RFS1", 4);
+    for (int i = 0; i < FS_NAME_MAX - 1 && name[i]; i++) h[4 + i] = (uint8_t)name[i];
+    h[52] = (uint8_t)len; h[53] = (uint8_t)(len >> 8); h[54] = (uint8_t)(len >> 16); h[55] = (uint8_t)(len >> 24);
+    if (bigfs_truncate(fs, ino, 0) != 0) return -1;
+    if (bigfs_write(fs, ino, 0, h, 64) != 64) return -1;
+    if (len && bigfs_write(fs, ino, 64, data, len) != (int64_t)len) return -1;
+    return 0;
+}
+int fs_spill_stat(int slot, char *name_out, uint32_t *len_out)
+{
+    struct bigfs *fs = g_spill_state > 0 ? g_fs : 0; if (!fs) return -1;
+    char p[32]; spill_path(slot, p); uint32_t ino;
+    if (bigfs_lookup(fs, p, &ino) < 0) return -1;
+    uint8_t h[64];
+    if (bigfs_read(fs, ino, 0, h, 64) != 64 || memcmp(h, "RFS1", 4) != 0) return -1;
+    if (name_out) { memcpy(name_out, h + 4, FS_NAME_MAX); name_out[FS_NAME_MAX - 1] = 0; }
+    if (len_out) *len_out = (uint32_t)h[52] | ((uint32_t)h[53] << 8) | ((uint32_t)h[54] << 16) | ((uint32_t)h[55] << 24);
+    return 0;
+}
+int fs_spill_get(int slot, char *buf, uint32_t len)
+{
+    struct bigfs *fs = g_spill_state > 0 ? g_fs : 0; if (!fs) return -1;
+    char p[32]; spill_path(slot, p); uint32_t ino;
+    if (bigfs_lookup(fs, p, &ino) < 0) return -1;
+    return bigfs_read(fs, ino, 64, buf, len) == (int64_t)len ? 0 : -1;
+}
+void fs_spill_del(int slot)
+{
+    struct bigfs *fs = g_spill_state > 0 ? g_fs : 0; if (!fs) return;
+    char p[32]; spill_path(slot, p); (void)bigfs_unlink(fs, p);
 }
 
 int bigfs_sys_autoexec(void (*run)(const char *line))
@@ -248,10 +314,10 @@ int bigfs_sys_command(const char *args, char *out, uint32_t max)
     } else if (str_eq(sub, "put")) {          /* copia un archivo del VFS pequeno al almacen grande */
         if (!next_tok(&p, a1, sizeof a1) || !next_tok(&p, a2, sizeof a2)) ob_s(&o, "uso: big put <archivo_vfs> <ruta_big>");
         else {
-            char *b = (char *)kmalloc(FS_DATA_MAX);
-            if (!b) ob_s(&o, "sin memoria");
+            uint32_t ul = 0; char *b = vfs_read_alloc(a1, &ul);   /* PARCHE 087 */
+            if (!b) ob_s(&o, "no se puede leer el origen (no existe o sin memoria)");
             else {
-                int n = vfs_read(a1, b, FS_DATA_MAX);
+                int n = (int)ul;
                 if (n < 0) ob_s(&o, "no se puede leer el origen");
                 else {
                     uint32_t id; int r = bigfs_create(fs, a2, &id);
@@ -269,9 +335,10 @@ int bigfs_sys_command(const char *args, char *out, uint32_t max)
             if (t < 0) ob_err(&o, a1, t);
             else if (t != (int)BIGFS_T_FILE) ob_s(&o, "no es un archivo");
             else { bigfs_stat(fs, id, &st);
-                if (st.size > FS_DATA_MAX - 1) ob_s(&o, "el archivo no cabe en el VFS pequeno (max 16 KiB)");
-                else { char *b = (char *)kmalloc(FS_DATA_MAX);
-                    if (b) { int64_t g = bigfs_read(fs, id, 0, b, st.size); if (g < 0) ob_err(&o, a1, (int)g); else { vfs_write(a2, b, (uint32_t)g); ob_s(&o, "copiado"); } kfree(b); } } }
+                if (st.size > FS_FILE_MAX) ob_s(&o, "el archivo no cabe en el VFS (max 32 MiB)");
+                else { char *b = (char *)kmalloc((size_t)st.size + 1);
+                    if (!b) ob_s(&o, "sin memoria");
+                    else { int64_t g = bigfs_read(fs, id, 0, b, st.size); if (g < 0) ob_err(&o, a1, (int)g); else if (vfs_write(a2, b, (uint32_t)g) < 0) ob_s(&o, "no se pudo escribir en el VFS"); else ob_s(&o, "copiado"); kfree(b); } } }
         }
     } else if (str_eq(sub, "write")) {        /* big write <ruta> <texto...> : crea o sustituye */
         if (!next_tok(&p, a1, sizeof a1)) ob_s(&o, "uso: big write <ruta> <texto>");

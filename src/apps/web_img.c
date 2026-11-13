@@ -7,8 +7,11 @@
 #endif
 #include "jpeg.h"
 #include "web_jpeg.h"
+int wi_oom;
+static void *wi_alloc(size_t n) { void *p = kmalloc(n); if (!p) wi_oom = 1; return p; }   /* PARCHE 086 */
+#define kmalloc(n) wi_alloc(n)
 
-void wi_free(struct wimg *o) { if (o && o->px) kfree(o->px); if (o) { o->px = 0; o->w = o->h = 0; } }
+void wi_free(struct wimg *o) { if (o && o->px) kfree(o->px); if (o) { o->px = 0; o->w = o->h = 0; o->nw = o->nh = 0; } }
 
 /* ------------------------------ PNG ------------------------------ */
 static uint32_t be32(const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
@@ -188,12 +191,35 @@ static int gif_decode(const uint8_t *d, uint32_t n, struct wimg *o)
 }
 
 /* ------------------------------ JPEG / BMP ------------------------------ */
-static int jpeg_to_img(const uint8_t *d, uint32_t n, struct wimg *o)
+/* PARCHE 086: tamano natural de un JPEG (SOF) sin decodificarlo */
+static int jpeg_dims(const uint8_t *d, uint32_t n, int *w, int *h, int *nc)
+{
+    uint32_t i = 2;
+    while (i + 9 < n) {
+        if (d[i] != 0xFF) { i++; continue; }
+        int m = d[i + 1]; if (m == 0xFF || m == 0 || (m >= 0xD0 && m <= 0xD8) || m == 0x01) { i++; continue; }
+        uint32_t l = ((uint32_t)d[i + 2] << 8) | d[i + 3];
+        if ((m >= 0xC0 && m <= 0xCF) && m != 0xC4 && m != 0xC8 && m != 0xCC) { *h = (d[i + 5] << 8) | d[i + 6]; *w = (d[i + 7] << 8) | d[i + 8]; if (nc) *nc = d[i + 9]; return *w > 0 && *h > 0; }
+        if (m == 0xDA || m == 0xD9 || l < 2) return 0;
+        i += 2 + l;
+    }
+    return 0;
+}
+
+static int jpeg_to_img(const uint8_t *d, uint32_t n, struct wimg *o, int scale)
 {
     struct jpeg_info inf;
+    int jw = 0, jh = 0, nc = 3;
+    if (scale > 1) return wj_decode(d, n, o, scale);              /* PARCHE 086: reducida al decodificar */
+    /* PARCHE 086: CMYK/YCCK y las fotos normales (hasta 2,5 Mpx) van por el decodificador propio: croma con interpolacion
+     * (el del sistema repite pixeles: bordes en escalera). Las enormes, por el del sistema, que gasta menos memoria. */
+    if (jpeg_dims(d, n, &jw, &jh, &nc) && (nc == 4 || (uint64_t)jw * jh <= 2500000u)) {
+        if (wj_decode(d, n, o, 1) == 0) return 0;
+        if (wi_oom || nc == 4) return -1;
+    }
     int r = jpeg_get_info(d, n, &inf);
-    if (r == JPEG_E_UNSUPPORTED) return wj_decode_progressive(d, n, o);
-    if (r != JPEG_OK) return -1;
+    if (r == JPEG_E_UNSUPPORTED) return wj_decode(d, n, o, 1);
+    if (r != JPEG_OK) return wi_oom ? -1 : wj_decode(d, n, o, 1);   /* PARCHE 086: CMYK y raros -> decodificador propio */
     if (inf.width == 0 || inf.height == 0 || (uint64_t)inf.width * inf.height > WI_MAX_PIXELS) return -1;
     o->px = (uint32_t *)kmalloc((size_t)inf.width * inf.height * 4); if (!o->px) return -1;
     r = jpeg_decode(d, n, o->px, inf.width, inf.height, &inf);
@@ -203,13 +229,25 @@ static int jpeg_to_img(const uint8_t *d, uint32_t n, struct wimg *o)
     return 0;
 }
 
-int wi_decode(const uint8_t *d, uint32_t n, struct wimg *o)
+static int wi_decode_s(const uint8_t *d, uint32_t n, struct wimg *o, int scale);
+int wi_decode(const uint8_t *d, uint32_t n, struct wimg *o) { return wi_decode_s(d, n, o, 1); }
+int wi_decode_fit(const uint8_t *d, uint32_t n, struct wimg *o, int maxw, int maxh)
 {
-    o->w = o->h = 0; o->px = 0;
+    int scale = 1, w, h;
+    if (n >= 4 && d[0] == 0xFF && d[1] == 0xD8 && maxw > 0 && maxh > 0 && jpeg_dims(d, n, &w, &h, 0))
+        while (scale < 8 && (w + scale * 2 - 1) / (scale * 2) >= maxw && (h + scale * 2 - 1) / (scale * 2) >= maxh) scale *= 2;
+    wi_oom = 0;
+    int r = wi_decode_s(d, n, o, scale);
+    if (r != 0 && wi_oom) return -2;
+    return r;
+}
+static int wi_decode_s(const uint8_t *d, uint32_t n, struct wimg *o, int scale)
+{
+    o->w = o->h = 0; o->px = 0; o->nw = o->nh = 0;
     if (n < 8) return -1;
     if (!memcmp(d, "\x89PNG\r\n\x1a\n", 8)) return png_decode(d, n, o);
     if (!memcmp(d, "GIF8", 4)) return gif_decode(d, n, o);
-    if (d[0] == 0xFF && d[1] == 0xD8) return jpeg_to_img(d, n, o);
+    if (d[0] == 0xFF && d[1] == 0xD8) return jpeg_to_img(d, n, o, scale);
 #ifndef WEB_HOST_TEST
     if (d[0] == 'B' && d[1] == 'M') {
         struct image im; memset(&im, 0, sizeof im);

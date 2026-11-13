@@ -1,6 +1,7 @@
 /* Pruebas en host del planificador real (src/core/thread.c).
  * Se compila con -include tests/host_sched_cfg.h. switch_context es un stub: cada
  * prueba actua como "el hilo actual" y comprueba que decision toma el planificador. */
+#define TSP 15 /* paginas de pila por hilo (THREAD_STACK_PAGES) */
 #include <string.h>
 #include <stdint.h>
 #include "soma_test.h"
@@ -30,7 +31,7 @@ static void test_estado_inicial(void)
     CHECK_EQ_INT(cur(), 0);
     CHECK_STR(thread_current()->name, "kernel_main");
     CHECK_EQ_INT(thread_current()->state, THREAD_STATE_RUNNING);
-    CHECK_EQ_INT(host_pmm_frames_live(), 4 * 8);    /* idle, netd, sysmon, httpd: 8 marcos cada uno */
+    CHECK_EQ_INT(host_pmm_frames_live(), 4 * TSP);    /* idle, netd, sysmon, httpd: 8 marcos cada uno */
 }
 
 static void test_round_robin(void)
@@ -122,7 +123,7 @@ static void test_recoleccion_con_hilo_ocupado(void)
 
     CHECK(w != 0);
     tid = w->tid;
-    CHECK_EQ_INT(host_pmm_frames_live(), base + 8);
+    CHECK_EQ_INT(host_pmm_frames_live(), base + TSP);
     CHECK_EQ_INT(thread_kill(tid), 1);
     thread_yield();                                 /* un solo planificado basta */
     CHECK_EQ_INT(host_pmm_frames_live(), base);     /* pila liberada */
@@ -193,9 +194,9 @@ static void test_agotar_ranuras_y_fallo_de_pmm(void)
 
     n1 = llenar(hs, HOST_STACK_SLOTS + 4);
     CHECK(n1 > 0 && n1 < HOST_STACK_SLOTS);         /* hay un limite y se alcanza */
-    CHECK_EQ_INT(host_pmm_frames_live(), base + 8 * n1);
+    CHECK_EQ_INT(host_pmm_frames_live(), base + TSP * n1);
     CHECK(thread_create("de_mas", worker, 0) == 0); /* lleno: NULL, sin colgarse */
-    CHECK_EQ_INT(host_pmm_frames_live(), base + 8 * n1);
+    CHECK_EQ_INT(host_pmm_frames_live(), base + TSP * n1);
     vaciar(hs, n1);
     CHECK_EQ_INT(host_pmm_frames_live(), base);
 
@@ -239,7 +240,7 @@ static void test_ganchos_de_arquitectura(void)
     struct tcb *w = thread_create("G", worker, 0);
     CHECK(w != 0);
     /* la cima de la pila de kernel queda registrada: 1 pagina de guarda + 8 de pila por encima de la ranura */
-    CHECK_EQ_INT(w->kstack_top, w->stack_slot + 9 * 4096);
+    CHECK_EQ_INT(w->kstack_top, w->stack_slot + (TSP + 1) * 4096);
     CHECK(w->uproc == 0);
 
     struct tcb *antes = thread_current();

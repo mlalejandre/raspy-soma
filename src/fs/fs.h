@@ -3,17 +3,25 @@
 
 #include <stdint.h>
 
-#define FS_MAX_FILES 64
-#define FS_NAME_MAX  48
-#define FS_DATA_MAX  16384
+/* PARCHE 087: los archivos ya no tienen tope de 16 KiB. Cada uno ocupa en memoria lo que mide (antes 16 KiB fijos) y puede llegar a
+ * FS_FILE_MAX (lo que permita el heap). En disco, los de menos de 16 KiB siguen en su ranura de SOMAFS02 (compatible); los mayores, y los
+ * archivos por encima de las 64 ranuras, se guardan solos en el almacen BIGFS (/.ramfs/NNN). Sin disco (Pi 5) viven en memoria. */
+#define FS_MAX_FILES  256
+#define FS_DISK_SLOTS 64          /* ranuras fijas del disco (SOMAFS02) */
+#define FS_NAME_MAX   48
+#define FS_DATA_MAX   16384       /* tamano de una ranura del disco; ya NO es el maximo de un archivo */
+#define FS_FILE_MAX   (32u * 1024u * 1024u)
 
 struct vfs_file {
     char     name[FS_NAME_MAX]; /* 48 bytes (offset 0..47) */
     uint32_t size;              /* 4 bytes (offset 48..51) */
     uint8_t  used;              /* 1 byte (offset 52) */
     uint8_t  dirty;             /* 1 byte (offset 53) */
-    uint8_t  pad[10];           /* 10 bytes (offset 54..63) -> cabecera = 64 B */
-    char     *data;             /* 8 bytes -> buffer de 16 KiB en KHeap */
+    uint8_t  spilled;           /* PARCHE 087: el contenido esta en BIGFS (/.ramfs/NNN) */
+    uint8_t  ram_only;          /* PARCHE 087: no se pudo guardar en disco (sin BIGFS): solo en memoria */
+    uint8_t  pad[4];
+    uint32_t cap;               /* PARCHE 087: bytes reservados en data */
+    char     *data;             /* contenido (+ '\0') en KHeap */
 } __attribute__((aligned(8)));
 
 void vfs_init(void);
@@ -25,6 +33,17 @@ int  vfs_write(const char *name, const char *data, uint32_t len);
 extern void (*vfs_live_hook)(const char *name, const char *data, uint32_t len);
 int  vfs_read(const char *name, char *buf_out, uint32_t max_len);
 int  vfs_delete(const char *name);
+/* PARCHE 087: tamano de un archivo (-1 si no existe) y lectura completa en un bufer nuevo (kfree al acabar; termina en '\0') */
+int   vfs_size(const char *name);
+char *vfs_read_alloc(const char *name, uint32_t *len_out);
+/* PARCHE 087: estado del guardado de archivos grandes: 1 en disco (BIGFS), 0 solo memoria, -1 sin disco */
+int   vfs_big_persist(void);
+/* PARCHE 087: almacen para lo que no cabe en las ranuras (lo implementa bigfs_glue.c; las pruebas usan uno en memoria) */
+int  fs_spill_ready(void);
+int  fs_spill_put(int slot, const char *name, const char *data, uint32_t len);
+int  fs_spill_stat(int slot, char *name_out, uint32_t *len_out);
+int  fs_spill_get(int slot, char *buf, uint32_t len);
+void fs_spill_del(int slot);
 
 void vfs_list(void);
 void vfs_list_ext(int show_all, const char *filter_dir);

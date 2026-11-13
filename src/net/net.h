@@ -6,6 +6,8 @@
 extern uint8_t net_mac[6];
 extern uint8_t net_ip[4];
 extern uint8_t net_gateway[4];
+extern uint8_t net_netmask[4];    /* PARCHE 081 */
+extern uint8_t net_dns[4];
 
 /* Inicializa el driver y la capa Ethernet. 1 = OK. */
 int net_init(void);

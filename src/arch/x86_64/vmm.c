@@ -11,7 +11,18 @@
 #define PD_INDEX(va)   (((va) >> 21) & 0x1FFULL)
 #define PT_INDEX(va)   (((va) >> 12) & 0x1FFULL)
 
-/* Simbolos de delimitacion definidos en linker.ld */
+/* Simbolos de delimitacion definidos en linker.ld. En pruebas en host (VMM_HOST_TEST) se renombran para no chocar con los
+ * del sistema (glibc define __data_start y __bss_start; macOS no define ninguno): el test aporta los suyos. */
+#ifdef VMM_HOST_TEST
+#define __text_start __host_text_start
+#define __text_end __host_text_end
+#define __rodata_start __host_rodata_start
+#define __rodata_end __host_rodata_end
+#define __data_start __host_data_start
+#define __data_end __host_data_end
+#define __bss_start __host_bss_start
+#define __bss_end __host_bss_end
+#endif
 extern char __text_start[];
 extern char __text_end[];
 extern char __rodata_start[];
@@ -23,6 +34,15 @@ extern char __bss_end[];
 
 static uint64_t *kernel_pml4 = 0;
 
+/* PARCHE 104: con VMM_HOST_TEST (solo pruebas en host) las instrucciones privilegiadas se sustituyen; el kernel no cambia. */
+#ifdef VMM_HOST_TEST
+extern uint64_t vmm_host_cr3(void);
+extern void vmm_host_loaded(uint64_t as);
+static inline void invlpg(uint64_t va) { (void)va; }
+static inline uint64_t read_cr3(void) { return vmm_host_cr3(); }
+static inline uint64_t read_cr0(void) { return 0; }
+static inline void write_cr0(uint64_t val) { (void)val; }
+#else
 static inline void invlpg(uint64_t va)
 {
     __asm__ volatile ("invlpg (%0)" : : "r"(va) : "memory");
@@ -46,6 +66,7 @@ static inline void write_cr0(uint64_t val)
 {
     __asm__ volatile ("mov %0, %%cr0" : : "r"(val));
 }
+#endif
 
 void vmm_init(void)
 {
@@ -200,6 +221,8 @@ uint64_t vmm_as_get_pte(uint64_t as, uint64_t virt_addr)
 void vmm_as_destroy(uint64_t as)
 {
     if (!as) return;
+    /* PARCHE 104: nunca liberar las tablas del espacio activo (CR3 apuntaria a memoria reutilizable): primero volver al del kernel. */
+    if (as == cur_cr3_cache && kernel_pml4 && as != (uint64_t)(uintptr_t)kernel_pml4) vmm_load_as((uint64_t)(uintptr_t)kernel_pml4);
     uint64_t *pml4 = (uint64_t *)(uintptr_t)as;
     if (pml4[VMM_USER_PML4_INDEX] & VMM_FLAG_PRESENT) {
         uint64_t *pdpt = (uint64_t *)(uintptr_t)(pml4[VMM_USER_PML4_INDEX] & PAGE_MASK);
@@ -219,7 +242,11 @@ void vmm_load_as(uint64_t as)
 {
     if (!cur_cr3_cache) cur_cr3_cache = read_cr3() & PAGE_MASK;
     if (as == cur_cr3_cache) return;
+#ifndef VMM_HOST_TEST
     __asm__ volatile ("mov %0, %%cr3" : : "r"(as) : "memory");
+#else
+    vmm_host_loaded(as);
+#endif
     cur_cr3_cache = as;
 }
 

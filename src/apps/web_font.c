@@ -14,6 +14,15 @@ int wf_init(void)
     return wf_state == 1;
 }
 
+/* PARCHE 085: ajustes de fuente de la interfaz */
+static int g_ui_mono, g_ui_scale = 100; static uint32_t g_ui_gen = 1;
+void wf_ui_set(int mono, int scale) { if (scale < 80) scale = 80; if (scale > 130) scale = 130; if (mono != g_ui_mono || scale != g_ui_scale) { g_ui_mono = mono ? 1 : 0; g_ui_scale = scale; g_ui_gen++; } }
+int wf_ui_mono(void) { return g_ui_mono; }
+int wf_ui_scale(void) { return g_ui_scale; }
+uint32_t wf_ui_gen(void) { return g_ui_gen; }
+int wf_ui_px(int px) { return g_ui_scale == 100 ? px : (px * g_ui_scale + 50) / 100; }
+static void ui_adj(int *px, int *fl) { if (*fl & WF_RAW) { *fl &= ~WF_RAW; return; } if (g_ui_scale != 100) *px = (*px * g_ui_scale + 50) / 100; if (g_ui_mono) *fl |= WF_MONO; }
+
 static int clamp_px(int px) { return px < 5 ? 5 : (px > VF_MAX_EM ? VF_MAX_EM : px); }
 
 static uint32_t glyph_of(uint32_t cp)
@@ -39,6 +48,7 @@ int wf_cp_adv64(uint32_t cp, int px, int fl)
 
 int wf_width64(const char *s, uint32_t n, int px, int fl)
 {
+    ui_adj(&px, &fl);
     int w = 0; uint32_t i = 0;
     while (i < n && s[i]) { uint32_t adv; uint32_t cp = wu_utf8_next(s + i, &adv); i += adv; w += wf_cp_adv64(cp, px, fl); }
     return w;
@@ -67,6 +77,7 @@ static void draw_glyph(int32_t x, int32_t by, struct vf_ce *ce, uint32_t rgb, in
 void wf_draw(int32_t x, int32_t baseline_y, const char *s, uint32_t n, int px, uint32_t rgb, int fl, int alpha)
 {
     if (!s || alpha <= 0) return;
+    ui_adj(&px, &fl);
     px = clamp_px(px);
     int64_t pen = (int64_t)x * 64; uint32_t i = 0;
     int mono_ok = (fl & WF_MONO) && font_vec_available();

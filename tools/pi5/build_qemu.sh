@@ -12,6 +12,10 @@ git clone --depth 1 --branch v11.1.1 https://github.com/qemu/qemu qemu
 git clone https://github.com/qemu/keycodemapdb qemu/subprojects/keycodemapdb
 git -C qemu/subprojects/keycodemapdb checkout -q f5772a62ec52591ff6870b7e8ef32482371f22c6
 scripts/qemu-tree apply
+# PARCHE 095: la memoria de video del VideoCore emulado era de 4 MiB (cabe como mucho 1024x768 a 32 bits). Con 12 MiB la Pi 5 emulada
+# da 1920x1080 como la placa real con su monitor HDMI. La ventana sigue acabando en 1 GiB (el modelo lo exige).
+sed -i 's/^#define BCM2712_VC_RAM_SIZE .*/#define BCM2712_VC_RAM_SIZE         (12 * MiB)/; s/^#define BCM2712_VC_RAM_BASE .*/#define BCM2712_VC_RAM_BASE         0x3f400000/' qemu/include/hw/arm/bcm2712.h
+grep -q "(12 \* MiB)" qemu/include/hw/arm/bcm2712.h && grep -q "0x3f400000" qemu/include/hw/arm/bcm2712.h
 # PARCHE 068: RP1 minimo (dispositivo "soma-rp1": SYSINFO + xHCI0) para probar el USB de la Pi 5 real sin placa
 cp /opt/rp1_stub.c qemu/hw/arm/rp1_stub.c
 sed -i "s/files('bcm2712.c')/files('bcm2712.c', 'rp1_stub.c')/" qemu/hw/arm/meson.build

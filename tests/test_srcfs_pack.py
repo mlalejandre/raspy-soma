@@ -92,11 +92,11 @@ def test_muchos_archivos():
 
 def test_tope_de_entradas():
     with tempfile.TemporaryDirectory() as td:
-        files = {f"m/f{i:04d}.h": b"x\n" for i in range(300)}
+        files = {f"m/f{i:04d}.h": b"x\n" for i in range(600)}
         ns, hdd, log = pack(tree(Path(td), files))
         img = read_image(hdd, ns)
         cap = ns["SRCFS_INDEX_SECTORS"] * SECTOR // 64 - 1
-        check(cap == 255, f"capacidad del indice = 255 (es {cap})")
+        check(cap == 511, f"capacidad del indice = 511 (es {cap})")
         check(len(img) == cap, f"se empaquetan exactamente {cap} (hay {len(img)})")
         check("solo caben" in log, "avisa de que no caben todos")
 
@@ -134,9 +134,13 @@ def test_fuentes_reales():
     ns, hdd, log = pack(src)
     img = read_image(hdd, ns)
     reales = [p for p in src.rglob("*") if p.is_file() and p.suffix.lower() in {".c", ".h", ".s"}]
-    check(img is not None and len(img) >= min(len(reales), 255) - 5,
+    check(img is not None and len(img) >= len(reales) - 5,
           f"las fuentes reales caben casi todas ({len(img or {})} de {len(reales)})")
     check("src/core/mem.c".replace("src/", "") in img, "core/mem.c esta empaquetado")
+    # PARCHE 107: ninguna carpeta de src/ puede quedar fuera (antes el corte alfabetico dejaba sin net/, lang/, ui/ y user/)
+    en_src = {p.relative_to(src).parts[0] for p in reales if len(p.relative_to(src).parts) > 1}
+    en_img = {n.split("/")[0] for n in img if "/" in n}
+    check(en_src <= en_img, f"todas las carpetas de src/ estan en la imagen (faltan {sorted(en_src - en_img)})")
     bad = [n for n, (_, _, data) in img.items() if data != (src / n).read_bytes()]
     check(not bad, f"contenido distinto en {bad[:3]}")
 

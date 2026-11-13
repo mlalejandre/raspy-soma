@@ -1,4 +1,5 @@
 #include "fb.h"
+#include "smp.h"                                     /* PARCHE 082 */
 #include "clipboard.h"   /* SOMA_PARCHE_PORTAPAPELES */
 #include "console.h"
 #include "pci.h"
@@ -258,6 +259,26 @@ static void rect_add(struct fb_dirty_rect *list, int *count, int32_t x0, int32_t
     }
 }
 
+/* PARCHE 088: dibujar en un bufer propio con las primitivas de siempre (texto, lineas suavizadas...). Mientras dura, el
+ * backbuffer, su tamano y el recorte son los del bufer; los rectangulos sucios se restauran al terminar. Solo hilo de la GUI. */
+static uint32_t *tg_bb; static uint32_t tg_w, tg_h; static int32_t tg_c[4]; static int tg_dc, tg_dn, tg_on;
+static struct fb_dirty_rect tg_dr[FB_MAX_DIRTY_RECTS], tg_dn_r[FB_MAX_DIRTY_RECTS];
+void fb_target_begin(uint32_t *buf, uint32_t w, uint32_t h)
+{
+    if (tg_on || !buf || !w || !h) return;
+    tg_on = 1; tg_bb = fb_backbuffer; tg_w = fb_cur_w; tg_h = fb_cur_h;
+    tg_c[0] = clip_x0; tg_c[1] = clip_y0; tg_c[2] = clip_x1; tg_c[3] = clip_y1;
+    tg_dc = dirty_count; tg_dn = drawn_count; memcpy(tg_dr, dirty_rects, sizeof tg_dr); memcpy(tg_dn_r, drawn_rects, sizeof tg_dn_r);
+    fb_backbuffer = buf; fb_cur_w = w; fb_cur_h = h;
+    clip_x0 = 0; clip_y0 = 0; clip_x1 = (int32_t)w; clip_y1 = (int32_t)h;
+}
+void fb_target_end(void)
+{
+    if (!tg_on) return;
+    tg_on = 0; fb_backbuffer = tg_bb; fb_cur_w = tg_w; fb_cur_h = tg_h;
+    clip_x0 = tg_c[0]; clip_y0 = tg_c[1]; clip_x1 = tg_c[2]; clip_y1 = tg_c[3];
+    dirty_count = tg_dc; drawn_count = tg_dn; memcpy(dirty_rects, tg_dr, sizeof tg_dr); memcpy(drawn_rects, tg_dn_r, sizeof tg_dn_r);
+}
 void fb_damage(int32_t x, int32_t y, int32_t w, int32_t h)
 {
     if (w <= 0 || h <= 0) return;
@@ -351,9 +372,137 @@ static inline void fast_copy_span(volatile uint32_t *dst, const uint32_t *src, i
 static void fb_cguard_present(void);
 static void fb_cguard_drop(void);
 /* Presentación a VRAM con superposición de cursor */
+/* PARCHE 082: volcado de un rectangulo grande repartido por filas entre los nucleos (sobre todo la conversion a 16 bits de la Pi 5) */
+struct fb_rows_job { int32_t x0, y0, w, h; };
+static void fb_rows_part(int idx, int n, void *arg)
+{
+    struct fb_rows_job *j = (struct fb_rows_job *)arg;
+    int32_t a = (int32_t)((int64_t)j->h * idx / n), b = (int32_t)((int64_t)j->h * (idx + 1) / n);
+    for (int32_t r = a; r < b; ++r) {
+        uint32_t off = (uint32_t)((j->y0 + r) * fb_cur_w + j->x0);
+#ifdef __aarch64__
+        if (!FB_HW_NATIVE()) { fb_hw_put_span(j->x0, j->y0 + r, fb_backbuffer + off, j->w); continue; }
+#endif
+        fast_copy_span(fb_vram + off, fb_backbuffer + off, j->w);
+        FB_SYNC(fb_vram + off, (size_t)j->w * 4);
+    }
+}
+static uint64_t fb_par_rects;
+uint64_t fb_parallel_rects(void) { return fb_par_rects; }
+
+/* ================================================================== PARCHE 085: ventanas translucidas
+ * La ventana activa se repinta sola muchas veces (cada app dibuja directamente en el backbuffer). Para mezclarla con lo que tiene debajo
+ * sin "desteñir" lo ya mezclado se guardan dos capas del tamano de la pantalla: lo que habia debajo (tr_under, capturado justo antes de
+ * dibujar la ventana) y el ultimo resultado mezclado (tr_last). En cada fb_present, dentro de la ventana y de los rectangulos sucios, un
+ * pixel distinto de tr_last es nuevo (lo acaba de pintar la app): se mezcla con tr_under y se apunta en tr_last; uno igual ya estaba
+ * mezclado y se deja. Las zonas excluidas (menus emergentes) quedan opacas. */
+static uint32_t *tr_under, *tr_last; static uint32_t tr_cap;
+static int32_t tr_x, tr_y, tr_w, tr_h; static uint32_t tr_alpha = 255; static int tr_fresh;
+static int32_t tr_ex_x, tr_ex_y, tr_ex_w, tr_ex_h;
+static int tr_alloc(void)
+{
+    uint32_t need = fb_cur_w * fb_cur_h;
+    if (tr_under && tr_cap >= need) return 1;
+    if (tr_under) kfree(tr_under);
+    if (tr_last) kfree(tr_last);
+    { uint8_t ow = kheap_owner; kheap_owner = 2; tr_under = (uint32_t *)kmalloc((size_t)need * 4); tr_last = (uint32_t *)kmalloc((size_t)need * 4); kheap_owner = ow; }
+    if (!tr_under || !tr_last) { if (tr_under) kfree(tr_under); if (tr_last) kfree(tr_last); tr_under = tr_last = 0; tr_cap = 0; return 0; }
+    tr_cap = need;
+    return 1;
+}
+static int tr_clip(int32_t *x, int32_t *y, int32_t *w, int32_t *h)
+{
+    if (*x < 0) { *w += *x; *x = 0; }
+    if (*y < 0) { *h += *y; *y = 0; }
+    if (*x + *w > (int32_t)fb_cur_w) *w = (int32_t)fb_cur_w - *x;
+    if (*y + *h > (int32_t)fb_cur_h) *h = (int32_t)fb_cur_h - *y;
+    return *w > 0 && *h > 0;
+}
+static inline uint32_t tr_mix(uint32_t top, uint32_t under, uint32_t a)
+{
+    uint32_t ia = 255 - a;
+    uint32_t rb = ((top & 0x00FF00FFu) * a + (under & 0x00FF00FFu) * ia + 0x00800080u) >> 8;
+    uint32_t g = ((top & 0x0000FF00u) * a + (under & 0x0000FF00u) * ia + 0x00008000u) >> 8;
+    return (rb & 0x00FF00FFu) | (g & 0x0000FF00u);
+}
+void fb_tr_begin(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t alpha)
+{
+    tr_alpha = alpha > 255 ? 255 : alpha;
+    if (tr_alpha >= 255 || !fb_backbuffer || !tr_clip(&x, &y, &w, &h) || !tr_alloc()) { tr_alpha = 255; return; }
+    tr_x = x; tr_y = y; tr_w = w; tr_h = h; tr_fresh = 1;
+    for (int32_t r = 0; r < h; r++) { uint32_t o = (uint32_t)(y + r) * fb_cur_w + (uint32_t)x; for (int32_t c = 0; c < w; c++) tr_under[o + c] = fb_backbuffer[o + c]; }
+}
+void fb_tr_off(void) { tr_alpha = 255; }
+void fb_tr_release(void) { tr_alpha = 255; if (tr_under) kfree(tr_under); if (tr_last) kfree(tr_last); tr_under = tr_last = 0; tr_cap = 0; }   /* PARCHE 086 */
+void fb_tr_exclude(int32_t x, int32_t y, int32_t w, int32_t h) { tr_ex_x = x; tr_ex_y = y; tr_ex_w = w; tr_ex_h = h; }
+/* Mezcla inmediata de una ventana que no se volvera a pintar sola (las de detras): under = copia previa del rectangulo */
+uint32_t *fb_rect_save(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    if (!fb_backbuffer || !tr_clip(&x, &y, &w, &h)) return 0;
+    uint32_t *b = (uint32_t *)kmalloc((size_t)w * h * 4); if (!b) return 0;
+    for (int32_t r = 0; r < h; r++) for (int32_t c = 0; c < w; c++) b[r * w + c] = fb_backbuffer[(uint32_t)(y + r) * fb_cur_w + (uint32_t)(x + c)];
+    return b;
+}
+void fb_rect_blend_saved(uint32_t *saved, int32_t x, int32_t y, int32_t w, int32_t h, uint32_t alpha)
+{
+    if (!saved) return;
+    if (fb_backbuffer && alpha < 255 && tr_clip(&x, &y, &w, &h))
+        for (int32_t r = 0; r < h; r++) for (int32_t c = 0; c < w; c++) { uint32_t o = (uint32_t)(y + r) * fb_cur_w + (uint32_t)(x + c); fb_backbuffer[o] = tr_mix(fb_backbuffer[o], saved[r * w + c], alpha); }
+    kfree(saved);
+}
+static void tr_process_rect(int32_t x0, int32_t y0, int32_t x1, int32_t y1)
+{
+    if (x0 < tr_x) x0 = tr_x;
+    if (y0 < tr_y) y0 = tr_y;
+    if (x1 > tr_x + tr_w) x1 = tr_x + tr_w;
+    if (y1 > tr_y + tr_h) y1 = tr_y + tr_h;
+    if (x0 >= x1 || y0 >= y1) return;
+    uint32_t a = tr_alpha;
+    for (int32_t y = y0; y < y1; y++) {
+        int ey = tr_ex_w > 0 && y >= tr_ex_y && y < tr_ex_y + tr_ex_h;
+        uint32_t o = (uint32_t)y * fb_cur_w;
+        for (int32_t x = x0; x < x1; x++) {
+            uint32_t c = fb_backbuffer[o + (uint32_t)x];
+            if (!tr_fresh && c == tr_last[o + (uint32_t)x]) continue;
+            if (ey && x >= tr_ex_x && x < tr_ex_x + tr_ex_w) { tr_last[o + (uint32_t)x] = c; continue; }
+            uint32_t m = tr_mix(c, tr_under[o + (uint32_t)x], a);
+            fb_backbuffer[o + (uint32_t)x] = m; tr_last[o + (uint32_t)x] = m;
+        }
+    }
+}
+static void tr_present(void)
+{
+    if (tr_alpha >= 255 || !tr_under || !fb_backbuffer) return;
+    if (tr_fresh) { tr_process_rect(tr_x, tr_y, tr_x + tr_w, tr_y + tr_h); fb_damage(tr_x, tr_y, tr_w, tr_h); tr_fresh = 0; }
+    else for (int i = 0; i < dirty_count; i++) tr_process_rect(dirty_rects[i].x0, dirty_rects[i].y0, dirty_rects[i].x1, dirty_rects[i].y1);
+    tr_ex_w = 0;
+}
+
+/* PARCHE 089: datos para el Monitor del sistema */
+static uint64_t fb_presents;
+void fb_get_info(struct fb_info *o)
+{
+    memset(o, 0, sizeof *o);
+    o->w = fb_cur_w; o->h = fb_cur_h;
+#ifdef __aarch64__
+    o->bpp = fb_hw_bpp ? fb_hw_bpp : 32; o->pitch = fb_hw_pitch ? fb_hw_pitch : fb_cur_w * 4;
+#else
+    o->bpp = 32; o->pitch = fb_cur_w * 4;
+#endif
+    o->phys = (uint64_t)(uintptr_t)fb_vram; o->backbuffer_bytes = fb_bb_bytes; o->presents = fb_presents; o->active = fb_active;
+    o->tr_bytes = (uint64_t)tr_cap * 8u;
+#ifdef __aarch64__
+    o->driver = "VideoCore (buzon de la Pi)";
+#else
+    { uint16_t id = bga_read(BGA_REG_ID); o->driver = (id & 0xFFF0) == 0xB0C0 ? "Bochs VBE (BGA)" : "VGA"; o->hw_id = id; o->phys = fb_phys_base; }
+#endif
+}
+
 void fb_present(void)
 {
     if (!fb_mapped) return;
+    fb_presents++;
+    if (!fb_user_exclusive()) tr_present();          /* PARCHE 085: antes que las esquinas y los avisos (esos van opacos) */
     if (!fb_user_exclusive()) fb_cguard_present();   /* SOMA_PARCHE_028_UI: esquinas redondeadas de la ventana activa */
     if (!fb_user_exclusive()) clip_overlay_draw();   /* SOMA_PARCHE_PORTAPAPELES: avisos y panel del portapapeles */
 
@@ -370,6 +519,12 @@ void fb_present(void)
                 int32_t y0 = dirty_rects[i].y0;
                 int32_t w  = dirty_rects[i].x1 - x0;
                 int32_t h  = dirty_rects[i].y1 - y0;
+                if ((int64_t)w * h >= 32768 && smp_cpus() > 1) {
+                    struct fb_rows_job j = { x0, y0, w, h };
+                    smp_parallel(fb_rows_part, &j);
+                    fb_par_rects++;
+                    continue;
+                }
 
                 for (int32_t r = 0; r < h; ++r) {
                     uint32_t off = (uint32_t)((y0 + r) * fb_cur_w + x0);
@@ -427,10 +582,12 @@ void fb_cursor_set_image(const uint32_t *argb, int32_t w, int32_t h)
     cursor_overlay_h = h;
 }
 
+static int32_t cursor_hot_x, cursor_hot_y;           /* PARCHE 085: punto activo del puntero */
+void fb_cursor_set_hotspot(int32_t hx, int32_t hy) { cursor_hot_x = hx; cursor_hot_y = hy; }
 void fb_cursor_show(int32_t x, int32_t y)
 {
-    cursor_pos_x = x;
-    cursor_pos_y = y;
+    cursor_pos_x = x - cursor_hot_x;
+    cursor_pos_y = y - cursor_hot_y;
     cursor_visible = 1;
 }
 
@@ -477,7 +634,7 @@ int fb_set_mode(uint32_t width, uint32_t height)
         fb_backbuffer = 0;
     }
     if (!fb_backbuffer) {
-        fb_backbuffer = (uint32_t *)kmalloc(bytes);
+        { uint8_t ow = kheap_owner; kheap_owner = 2; fb_backbuffer = (uint32_t *)kmalloc(bytes); kheap_owner = ow; }   /* PARCHE 089: ACCT_SCREEN */
         fb_bb_bytes = fb_backbuffer ? bytes : 0;
     }
     if (fb_backbuffer) {

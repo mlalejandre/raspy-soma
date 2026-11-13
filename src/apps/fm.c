@@ -56,7 +56,7 @@ static const struct { const char *e; uint8_t c; } ext_tab[] = {
     {"xlsx", FC_DOC}, {"ods", FC_DOC}, {"ppt", FC_DOC}, {"pptx", FC_DOC}, {"csv", FC_DOC},
     {"txt", FC_TXT}, {"md", FC_TXT}, {"log", FC_TXT}, {"ini", FC_TXT}, {"cfg", FC_TXT}, {"conf", FC_TXT},
     {"json", FC_TXT}, {"xml", FC_TXT}, {"c", FC_TXT}, {"h", FC_TXT}, {"sh", FC_TXT}, {"py", FC_TXT},
-    {"cmd", FC_TXT}, {"yaml", FC_TXT}, {"yml", FC_TXT}, {"asm", FC_TXT},
+    {"cmd", FC_TXT}, {"tex", FC_DOC}, {"latex", FC_DOC}, {"yaml", FC_TXT}, {"yml", FC_TXT}, {"asm", FC_TXT},
     {"soma", FC_PRG}, {"elf", FC_PRG}, {"exe", FC_PRG}, {"app", FC_PRG},
     {"html", FC_WEB}, {"htm", FC_WEB}, {"css", FC_WEB}, {"js", FC_WEB},
     {"zip", FC_ZIP}, {"tar", FC_ZIP}, {"gz", FC_ZIP}, {"tgz", FC_ZIP}, {"7z", FC_ZIP}, {"rar", FC_ZIP},
@@ -275,7 +275,6 @@ static struct bigfs *fm_big(void) {
 }
 
 static char ram_buf[4096];
-static char sz_probe[16384];
 
 static const char *fm_ram_list_begin(void) {
     int len = vfs_format_list_ext(1, 0, ram_buf, sizeof(ram_buf) - 1);
@@ -300,7 +299,7 @@ static int fm_exists(int store, const char *path) {
         struct bigfs *fs = fm_big(); uint32_t ino;
         return fs && bigfs_lookup(fs, path, &ino) >= 0;
     }
-    char t; return vfs_read(path, &t, 1) >= 0;
+    return vfs_size(path) >= 0;                          /* PARCHE 087 */
 }
 
 static int64_t fm_read_head(int store, const char *path, char *buf, uint32_t n) {
@@ -309,17 +308,20 @@ static int64_t fm_read_head(int store, const char *path, char *buf, uint32_t n) 
         if (!fs || bigfs_lookup(fs, path, &ino) != (int)BIGFS_T_FILE) return -1;
         return bigfs_read(fs, ino, 0, buf, n);
     }
-    return vfs_read(path, buf, n);
+    uint32_t l = 0; char *a = vfs_read_alloc(path, &l);   /* PARCHE 087: vfs_read deja un byte para el '\0'; aqui se piden n exactos */
+    if (!a) return -1;
+    if (l > n) l = n;
+    memcpy(buf, a, l); kfree(a);
+    return (int64_t)l;
 }
 
 static int fm_move_ram(const char *from, const char *to) {
     if (str_len(to) >= FS_NAME_MAX) return -3;
     if (fm_exists(ST_RAM, to)) return -2;
-    char *tmp = (char *)kmalloc(FS_DATA_MAX + 1);
+    uint32_t r = 0; char *tmp = vfs_read_alloc(from, &r);   /* PARCHE 087: archivos de cualquier tamano */
     if (!tmp) return -4;
     int rc = -1;
-    int r = vfs_read(from, tmp, FS_DATA_MAX);
-    if (r >= 0 && vfs_write(to, tmp, (uint32_t)r) >= 0) { vfs_delete(from); rc = 0; }
+    if (vfs_write(to, tmp, r) >= 0) { vfs_delete(from); rc = 0; }
     kfree(tmp);
     return rc;
 }
@@ -423,7 +425,7 @@ static void lib_build(void) {
     char fn[80];
     while (p && lib_n < LIB_MAX && fm_ram_next(&p, fn, sizeof(fn))) {
         if (fn[0] != '/' || vfs_is_hidden(fn) || fm_is_sysdir(fn)) continue;
-        int sz = vfs_read(fn, sz_probe, sizeof(sz_probe));
+        int sz = vfs_size(fn);
         lib_add(fn, sz >= 0 ? (uint64_t)sz : 0, ST_RAM);
     }
     struct bigfs *fs = fm_big();
@@ -532,7 +534,7 @@ static void fm_reload_ram(void) {
             fm_item_clear(it);
             str_copy(it->name, rel, sizeof(it->name));
             str_copy(it->full_path, fname, sizeof(it->full_path));
-            int sz = vfs_read(fname, sz_probe, sizeof(sz_probe));
+            int sz = vfs_size(fname);
             it->size = sz >= 0 ? (uint64_t)sz : 0;
             it->cat = (uint8_t)fm_cat_of(rel);
         }
@@ -1634,10 +1636,10 @@ void fm_render_window(uint32_t win_x, uint32_t win_y, uint32_t win_w, uint32_t w
  * ==================================================================== */
 static int fm_stage(const struct fm_item *it, char *out, uint32_t max) {
     if (it->store == ST_RAM) { str_copy(out, it->full_path, max); return 0; }
-    if (it->size > 16000) { fm_say("Archivo demasiado grande para este visor (max 16 KiB)"); return -1; }
-    char *buf = (char *)kmalloc(16384);
+    if (it->size > 16u * 1024u * 1024u) { fm_say("Archivo demasiado grande para abrirlo (max 16 MiB)"); return -1; }   /* PARCHE 087 */
+    char *buf = (char *)kmalloc((size_t)it->size + 1);
     if (!buf) { fm_say("Memoria insuficiente"); return -1; }
-    int64_t r = fm_read_head(it->store, it->full_path, buf, 16000);
+    int64_t r = fm_read_head(it->store, it->full_path, buf, (uint32_t)it->size);
     if (r < 0) { kfree(buf); fm_say("No se pudo leer el archivo"); return -1; }
     char dst[48]; str_copy(dst, "/tmp/fm_vista", sizeof(dst));
     const char *dot = 0;
@@ -1698,6 +1700,8 @@ static int fm_open_item(struct fm_item *it, char *out_path, uint32_t max_out) {
         return 2;
     }
     if (it->cat == FC_WEB && (fm_has_ext(it->name, "html") || fm_has_ext(it->name, "htm"))) { gui_open_browser(p); return FM_ACT_EXT; }
+    if (fm_has_ext(it->name, "tex") || fm_has_ext(it->name, "latex")) { gui_open_layout_file(p); return FM_ACT_EXT; }   /* PARCHE 084 */
+    if (fm_has_ext(it->name, "pdf")) { gui_open_pdf(p); return FM_ACT_EXT; }                                          /* PARCHE 088 */
     gui_open_notepad(p);
     return FM_ACT_EXT;
 }
@@ -2201,10 +2205,10 @@ static void fmc_dest(char *out, uint32_t max, int store, const char *name) {
 static int fmc_copy(int s_store, const char *src, int d_store, const char *dst, const char **why) {
     *why = "No se pudo copiar";
     if (s_store == ST_RAM) {
-        char *buf = (char *)kmalloc(FS_DATA_MAX + 1);
+        if (vfs_size(src) < 0) { *why = "El archivo original ya no existe"; return -1; }
+        uint32_t rl = 0; char *buf = vfs_read_alloc(src, &rl);   /* PARCHE 087 */
         if (!buf) { *why = "Memoria insuficiente"; return -1; }
-        int r = vfs_read(src, buf, FS_DATA_MAX);
-        if (r < 0) { kfree(buf); *why = "El archivo original ya no existe"; return -1; }
+        int r = (int)rl;
         int rc = -1;
         if (d_store == ST_RAM) {
             if (str_len(dst) >= FS_NAME_MAX) *why = "Ruta demasiado larga para RamFS";
@@ -2224,15 +2228,21 @@ static int fmc_copy(int s_store, const char *src, int d_store, const char *dst, 
     if (!fs || bigfs_lookup(fs, src, &sino) != (int)BIGFS_T_FILE) { *why = "El archivo original ya no existe"; return -1; }
     struct bigfs_stat st;
     if (bigfs_stat(fs, sino, &st) < 0) return -1;
-    if (d_store == ST_RAM && st.size > FS_DATA_MAX) { *why = "Demasiado grande para RamFS (max 16 KiB)"; return -1; }
+    if (d_store == ST_RAM && st.size > FS_FILE_MAX) { *why = "Demasiado grande para RamFS (max 32 MiB)"; return -1; }
     char *buf = (char *)kmalloc(FMC_CHUNK);
     if (!buf) { *why = "Memoria insuficiente"; return -1; }
     int rc = -1;
     if (d_store == ST_RAM) {
         if (str_len(dst) >= FS_NAME_MAX) *why = "Ruta demasiado larga para RamFS";
         else {
-            int64_t r = bigfs_read(fs, sino, 0, buf, st.size > FMC_CHUNK ? FMC_CHUNK : st.size);
-            if (r >= 0 && vfs_write(dst, buf, (uint32_t)r) >= 0) rc = 0;
+            char *all = (char *)kmalloc((size_t)st.size + 1);  /* PARCHE 087: el archivo entero, no solo el primer trozo */
+            if (!all) *why = "Memoria insuficiente";
+            else {
+                int64_t r = bigfs_read(fs, sino, 0, all, st.size);
+                if (r == (int64_t)st.size && vfs_write(dst, all, (uint32_t)r) >= 0) rc = 0;
+                else *why = "No se pudo escribir en RamFS (sin memoria?)";
+                kfree(all);
+            }
         }
     } else {
         uint32_t dino;

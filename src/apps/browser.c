@@ -1,6 +1,9 @@
 /* SOMA_PARCHE_NAVEGADOR: navegador web profesional de SOMA.
  * Hilo GUI: dibuja y encola eventos. Hilo trabajador ("web_worker", pila propia de 1 MiB): red, HTML, CSS, JavaScript, maquetacion y temporizadores. */
 #include "browser.h"
+#include "savedlg.h"
+#include "acct.h"                                 /* PARCHE 085 */
+#include "../ui/clipboard.h"
 #include "web_page.h"
 #include "web_font.h"
 #include "fb.h"
@@ -75,9 +78,14 @@ static int s_cursor_cur = -1;
 /* ------------------------------------------------------------ servicios para web_page.c */
 int wp_fs_read(const char *path, char **out, uint32_t *len)
 {
-    const uint32_t MAXF = 1u << 20;
+    {   /* PARCHE 087: el archivo entero, mida lo que mida */
+        uint32_t l = 0; char *a = vfs_read_alloc(path, &l);
+        if (a && l > 0) { *out = a; *len = l; return 0; }
+        if (a) kfree(a);
+    }
+    const uint32_t MAXF = 1u << 18;
     char *tmp = (char *)kmalloc(MAXF + 1); if (!tmp) return -1;
-    int r = vfs_read(path, tmp, MAXF);
+    int r = -1;
     if (r <= 0) {
         uint8_t *bm = (uint8_t *)tmp; int n = 0;
         if (!wu_strieq(path, "/workspace/logo_soma.bmp") && !wu_strieq(path, "/workspace/chip_soma.bmp")) { kfree(tmp); return -1; }
@@ -193,7 +201,7 @@ static void start_worker(void)
 {
     if (s_worker_up || !s_inited) return;
     s_last_render = web_now_ms();
-    if (thread_create("web_worker", worker_entry, 0)) s_worker_up = 1;
+    { struct tcb *wt = thread_create("web_worker", worker_entry, 0); if (wt) { thread_set_owner(wt, ACCT_WEB); s_worker_up = 1; } }   /* PARCHE 089 */
 }
 /* Al arrancar la GUI solo se reserva el estado minimo: ni hilo, ni fuente, ni pagina hasta que se abre la ventana. */
 static void ensure_init(void)
@@ -394,6 +402,100 @@ static uint64_t page_key(struct wpage *p, int w, int h)
     return k;
 }
 
+/* ------------------------------------------------------------ PARCHE 085: menu del boton derecho */
+enum { CM_SAVE_IMG = 0, CM_COPY_IMG, CM_COPY_URL, CM_BACK, CM_FWD, CM_RELOAD, CM_COPY_LINK };
+static int s_cm_open, s_cm_x, s_cm_y, s_cm_n, s_cm_hl = -1; static int s_cm_items[8];
+static char s_cm_img[512], s_cm_link[512];
+static const char *cm_label(int id)
+{
+    switch (id) {
+    case CM_SAVE_IMG: return "Guardar imagen como...";
+    case CM_COPY_IMG: return "Copiar imagen";
+    case CM_COPY_URL: return "Copiar direccion de la imagen";
+    case CM_COPY_LINK: return "Copiar direccion del enlace";
+    case CM_BACK: return "Atras";
+    case CM_FWD: return "Adelante";
+    default: return "Recargar";
+    }
+}
+#define CM_W 250
+#define CM_IH 30
+static void cm_geom(int *x, int *y, int *h, int wx, int wy, int ww, int wh)
+{
+    *h = s_cm_n * CM_IH + 12; *x = s_cm_x; *y = s_cm_y;
+    if (*x + CM_W > wx + ww - 4) *x = wx + ww - 4 - CM_W;
+    if (*y + *h > wy + wh - 4) *y = wy + wh - 4 - *h;
+    if (*x < wx) *x = wx;
+    if (*y < wy) *y = wy;
+}
+static void cm_render(int wx, int wy, int ww, int wh)
+{
+    if (!s_cm_open) return;
+    int x, y, h; cm_geom(&x, &y, &h, wx, wy, ww, wh);
+    fb_draw_shadow(x, y, CM_W, h, 10, 18, 6, 0xA0000000u);
+    fb_fill_rrect_aa(x, y, CM_W, h, 10, 0xFF161D2Bu);
+    fb_stroke_rrect_aa(x, y, CM_W, h, 10, 0xFF2A3446u);
+    fb_tr_exclude(x - 2, y - 2, CM_W + 4, h + 4);
+    for (int i = 0; i < s_cm_n; i++) {
+        int iy = y + 6 + i * CM_IH, id = s_cm_items[i];
+        int dis = (id == CM_BACK && !wp_can_back(s_pg)) || (id == CM_FWD && !wp_can_fwd(s_pg));
+        if (i == s_cm_hl && !dis) fb_fill_rounded_rect(x + 6, iy, CM_W - 12, CM_IH, 7, 0x00243352);
+        if (i > 0 && (id == CM_BACK || id == CM_COPY_LINK) && s_cm_items[i - 1] < CM_BACK) fb_fill_rect((uint32_t)(x + 12), (uint32_t)(iy - 1), CM_W - 24, 1, 0x002A3446);
+        /* iconitos */
+        int ix = x + 22, icy = iy + CM_IH / 2; uint32_t ic = dis ? 0xFF475569u : 0xFFAEB8C8u;
+        if (id == CM_SAVE_IMG) { fb_stroke_rrect_aa(ix - 7, icy - 7, 14, 14, 2, ic); fb_fill_rect((uint32_t)(ix - 3), (uint32_t)(icy - 7), 6, 4, ic & 0xFFFFFF); }
+        else if (id == CM_COPY_IMG || id == CM_COPY_URL || id == CM_COPY_LINK) { fb_stroke_rrect_aa(ix - 6, icy - 4, 10, 11, 2, ic); fb_stroke_rrect_aa(ix - 3, icy - 7, 10, 11, 2, ic); }
+        else if (id == CM_BACK || id == CM_FWD) { int sg = id == CM_BACK ? -1 : 1; fb_line_aa((ix - sg * 5) * 16, icy * 16, (ix + sg * 5) * 16, icy * 16, 22, ic); fb_line_aa((ix + sg * 5) * 16, icy * 16, (ix + sg * 1) * 16, (icy - 4) * 16, 22, ic); fb_line_aa((ix + sg * 5) * 16, icy * 16, (ix + sg * 1) * 16, (icy + 4) * 16, 22, ic); }
+        else { fb_stroke_rrect_aa(ix - 6, icy - 6, 12, 12, 6, ic); }
+        tx(x + 40, iy + 7, cm_label(id), (int)wu_strlen(cm_label(id)), 13, dis ? 0x00475569 : C_TXT, 0);
+    }
+}
+struct rclick_args { struct wpage *p; int px, py; struct wnode *node, *link; };
+static void rclick_thunk(void *v) { struct rclick_args *a = (struct rclick_args *)v; a->link = 0; a->node = wl_hit(a->p->lay, a->px, a->py, &a->link, 0); }
+/* lo llama gui.c con cada pulsacion del boton derecho dentro de la ventana */
+int browser_right_click(int32_t mx, int32_t my, uint32_t win_x, uint32_t win_y, uint32_t win_w, uint32_t win_h)
+{
+    if (!s_inited || !s_pg) return 0;
+    if (savedlg_active()) return 0;
+    struct wpage *p = s_pg; struct geo g; geo_of(&g, (int)win_x, (int)win_y, (int)win_w, (int)win_h);
+    s_cm_n = 0; s_cm_img[0] = 0; s_cm_link[0] = 0; s_cm_hl = -1;
+    if (in_r(mx, my, g.vx, g.vy, g.vw - SB_W, g.vh) && p->lay && !p->lay_busy) {
+        struct rclick_args ra = { p, mx - g.vx + p->sx, my - g.vy + p->sy, 0, 0 }; on_gui_stack(rclick_thunk, &ra);
+        const char *src = ra.node ? wl_img_src(ra.node) : 0;
+        if (src && src[0]) {
+            const uint32_t *px; int w, h;
+            int ok = wp_img_get(p, src, &px, &w, &h, s_cm_img, sizeof s_cm_img);
+            if (ok) { s_cm_items[s_cm_n++] = CM_SAVE_IMG; s_cm_items[s_cm_n++] = CM_COPY_IMG; }
+            s_cm_items[s_cm_n++] = CM_COPY_URL;
+        }
+        const char *h = ra.link ? wd_attr(ra.link, "href") : 0;
+        if (h && h[0]) { wu_copy(s_cm_link, h, sizeof s_cm_link); s_cm_items[s_cm_n++] = CM_COPY_LINK; }
+    }
+    s_cm_items[s_cm_n++] = CM_BACK; s_cm_items[s_cm_n++] = CM_FWD; s_cm_items[s_cm_n++] = CM_RELOAD;
+    s_cm_open = 1; s_cm_x = mx + 2; s_cm_y = my + 2;
+    return 1;
+}
+static int cm_click(int32_t mx, int32_t my, int wx, int wy, int ww, int wh)
+{
+    if (!s_cm_open) return 0;
+    int x, y, h; cm_geom(&x, &y, &h, wx, wy, ww, wh);
+    s_cm_open = 0;
+    if (!in_r(mx, my, x, y, CM_W, h)) return 1;                           /* fuera: solo cierra */
+    int i = (my - y - 6) / CM_IH; if (i < 0 || i >= s_cm_n) return 1;
+    int id = s_cm_items[i];
+    const uint32_t *px; int w, hh;
+    switch (id) {
+    case CM_SAVE_IMG: if (wp_img_get(s_pg, s_cm_img, &px, &w, &hh, 0, 0)) savedlg_open(px, w, hh, s_cm_img); else clip_toast("La imagen ya no esta en memoria"); break;
+    case CM_COPY_IMG: if (wp_img_get(s_pg, s_cm_img, &px, &w, &hh, 0, 0) && clip_set_image(px, w, hh) >= 0) clip_toast("Imagen copiada"); break;
+    case CM_COPY_URL: clip_set_text(s_cm_img, 0); clip_toast("Direccion de la imagen copiada"); break;
+    case CM_COPY_LINK: clip_set_text(s_cm_link, 0); clip_toast("Direccion del enlace copiada"); break;
+    case CM_BACK: if (wp_can_back(s_pg)) q_push(J_BACK, 0, 0, 0, 0); break;
+    case CM_FWD: if (wp_can_fwd(s_pg)) q_push(J_FWD, 0, 0, 0, 0); break;
+    default: q_push(J_RELOAD, 0, 0, 0, 0); break;
+    }
+    return 1;
+}
+
 void browser_render_window(uint32_t win_x, uint32_t win_y, uint32_t win_w, uint32_t win_h, int show_cursor)
 {
     ensure_init(); if (!s_pg) return;
@@ -506,6 +608,8 @@ void browser_render_window(uint32_t win_x, uint32_t win_y, uint32_t win_w, uint3
         if (busy) { int k = (int)((web_now_ms() / 90) % 8); for (int i = 0; i < 3; i++) fb_fill_rrect_aa(wx + ww - 40 + i * 9, g.stat_y + STAT_H / 2 - 2, 5, 5, 2, (0xFF000000u | C_CYA) - (((k + i * 2) % 8) > 3 ? 0x90000000u : 0u)); }
         fb_reset_clip();
     }
+    cm_render(wx, wy, ww, wh);                                            /* PARCHE 085 */
+    savedlg_render(wx, wy, ww, wh);
     (void)show_cursor;
 }
 
@@ -552,6 +656,8 @@ void browser_handle_key(char c)
     ensure_init(); if (!s_pg) return;
     s_last_render = web_now_ms();
     int k = (uint8_t)c;
+    if (savedlg_key(c)) return;                                           /* PARCHE 085 */
+    if (s_cm_open && k == 27) { s_cm_open = 0; return; }
     if (s_pg->alert_pending) { if (k == 10 || k == 13 || k == 27 || k == ' ') s_pg->alert_pending = 0; return; }
     /* ensamblar UTF-8 */
     char u[5]; int un = 0;
@@ -601,6 +707,8 @@ int browser_handle_click(int32_t mx, int32_t my, uint32_t win_x, uint32_t win_y,
     ensure_init(); if (!s_pg) return 0;
     struct wpage *p = s_pg; s_last_render = web_now_ms();
     int wx = (int)win_x, wy = (int)win_y, ww = (int)win_w, wh = (int)win_h; struct geo g; geo_of(&g, wx, wy, ww, wh);
+    if (savedlg_click(mx, my, wx, wy, ww, wh)) return 0;                 /* PARCHE 085: dialogo y menu primero */
+    if (cm_click(mx, my, wx, wy, ww, wh)) return 0;
     if (p->alert_pending) {
         int aw = ww > 460 ? 420 : ww - 40, ax = wx + (ww - aw) / 2, ay = wy + wh / 2 - 50;
         if (in_r(mx, my, ax + aw - 92, ay + 62, 80, 28)) p->alert_pending = 0;
@@ -692,6 +800,13 @@ void browser_mouse(int32_t mx, int32_t my, uint32_t win_x, uint32_t win_y, uint3
         }
         s_hover_ui = held ? -1 : h;
     }
+    if (s_cm_open) {                                                      /* PARCHE 085: resalte en el menu */
+        int x, y, h; cm_geom(&x, &y, &h, (int)win_x, (int)win_y, (int)win_w, (int)win_h);
+        s_cm_hl = in_r(mx, my, x, y, CM_W, h) ? (my - y - 6) / CM_IH : -1;
+        set_cursor(CURSOR_ARROW);
+        return;
+    }
+    if (savedlg_active()) { set_cursor(CURSOR_ARROW); return; }
     int inview = in_r(mx, my, g.vx, g.vy, g.vw - SB_W, g.vh) && !p->alert_pending;
     if (s_sb_drag) { if (held) sb_to(&g, my); else s_sb_drag = 0; }
     if (wheel && in_r(mx, my, (int)win_x, g.vy, (int)win_w, g.vh) && !s_sb_drag) { wp_scroll_by(p, 0, -wheel * 48); s_last_render = web_now_ms(); }

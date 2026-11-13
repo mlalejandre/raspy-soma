@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "usermode.h"
+#include "uaccess.h"
 #include "vmm.h"
 #include "pmm.h"
 #include "idt.h"
@@ -158,17 +159,12 @@ static void usermode_init(void)
 
 /* El rango [p, p+len) debe estar en la ventana de usuario y mapeado con el bit U (y, si need_write, escribible)
  * en cada pagina. len hasta 1 MiB. */
+_Static_assert(UACC_PRESENT == VMM_FLAG_PRESENT && UACC_WRITABLE == VMM_FLAG_WRITABLE && UACC_USER == VMM_FLAG_USER, "uaccess.h desincronizado de vmm.h");
+static uint64_t user_pte_of(void *ctx, uint64_t va) { return vmm_as_get_pte(((struct uproc *)ctx)->as, va); }
 static int user_range(uint64_t p, uint64_t len, int need_write)
 {
-    if (len == 0 || len > USER_WINDOW) return 0;
-    if (p < USER_BASE || p + len > USER_BASE + USER_WINDOW || p + len < p) return 0;
     if (!usermode_cur) return 0;
-    for (uint64_t a = p & ~0xFFFULL; a < p + len; a += 4096) {
-        uint64_t pte = vmm_as_get_pte(usermode_cur->as, a);      /* SOMA_PARCHE_017_AS: tablas del proceso actual */
-        if (!(pte & VMM_FLAG_PRESENT) || !(pte & VMM_FLAG_USER)) return 0;
-        if (need_write && !(pte & VMM_FLAG_WRITABLE)) return 0;
-    }
-    return 1;
+    return uaccess_range_ok(p, len, need_write, USER_BASE, USER_WINDOW, user_pte_of, usermode_cur);   /* PARCHE 102 */
 }
 static int user_range_ok(uint64_t p, uint64_t len) { return user_range(p, len, 0); }
 
@@ -330,6 +326,7 @@ int64_t usermode_syscall(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2)
         usermode_cur->exit_code = (int64_t)a0;
         usermode_leave((int64_t)a0);
     case SYS_WRITE:
+        if (a1 == 0) return 0;                                   /* PARCHE 102: escribir 0 bytes no es un fallo */
         if (!user_range_ok(a0, a1)) return -1;
         {   /* se copia a un buffer del kernel con SMAP abierto el minimo tiempo, y se imprime ya cerrado */
             char buf[256];

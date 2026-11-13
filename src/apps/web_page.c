@@ -244,6 +244,18 @@ static int img_cb(void *ud, const char *src, struct wimginfo *o)
     if (e->state == 2) { o->w = e->w; o->h = e->h; o->px = e->px; o->has_alpha = e->has_alpha; o->pw = e->pw; o->ph = e->ph; return 1; }
     return 0;
 }
+/* PARCHE 085: pixeles ya decodificados de una imagen de la pagina (para "Guardar imagen como"). 1 = hay; url absoluta en abs. */
+int wp_img_get(struct wpage *p, const char *src, const uint32_t **px, int *w, int *h, char *abs, uint32_t absmax)
+{
+    char u[WN_URL_MAX];
+    if (!p || !src || !*src) return 0;
+    abs_url(p, src, u, sizeof u);
+    if (abs) { uint32_t i = 0; for (; u[i] && i + 1 < absmax; i++) abs[i] = u[i]; abs[i] = 0; }
+    struct wp_img *e = img_find(p, u, wu_hash(u, wu_strlen(u)));
+    if (!e || e->state != 2 || !e->px) return 0;
+    *px = e->px; *w = e->pw ? e->pw : e->w; *h = e->ph ? e->ph : e->h;
+    return 1;
+}
 static const char *img_kind(const uint8_t *d, uint32_t n)
 {
     if (n >= 12 && !memcmp(d, "RIFF", 4) && !memcmp(d + 8, "WEBP", 4)) return "WebP (no soportado)";
@@ -251,7 +263,7 @@ static const char *img_kind(const uint8_t *d, uint32_t n)
     if (n >= 5 && (!memcmp(d, "<svg", 4) || !memcmp(d, "<?xm", 4))) return "SVG (no soportado)";
     if (n >= 5 && (d[0] == '<' || !memcmp(d, "\xEF\xBB\xBF<", 4))) return "HTML (no es imagen)";
     if (n >= 4 && d[0] == 0x89 && d[1] == 'P') return "PNG no decodificable";
-    if (n >= 3 && d[0] == 0xFF && d[1] == 0xD8) return "JPEG no decodificable (CMYK, aritmetico o danado)";
+    if (n >= 3 && d[0] == 0xFF && d[1] == 0xD8) return "JPEG danado o no soportado (aritmetico o 12 bits)";
     if (n >= 3 && !memcmp(d, "GIF", 3)) return "GIF danado";
     return "formato desconocido";
 }
@@ -304,7 +316,19 @@ static uint32_t img_evict(struct wpage *p, uint32_t need, const struct wp_img *k
 static void img_decode_into(struct wpage *p, struct wp_img *e, const uint8_t *data, uint32_t len)
 {
     struct wimg im; memset(&im, 0, sizeof im);
-    if (len > 8 && wi_decode(data, len, &im) == 0 && im.px && im.w > 0 && im.h > 0) {
+    /* PARCHE 086: los JPEG se reducen ya al decodificar hasta el tamano al que se muestran (o 1024x768 si aun no se sabe); si falta
+     * memoria se liberan imagenes lejanas y se reintenta mas pequena, en vez de dar la imagen por danada */
+    int mw = e->dw > 0 ? e->dw : 1024, mh = e->dh > 0 ? e->dh : 768, dr = -1;
+    if (len > 8) {
+        dr = wi_decode_fit(data, len, &im, mw, mh);
+        for (int t = 0; dr == -2 && t < 3; t++) {
+            wi_free(&im); img_evict(p, 8u << 20, e); mw /= 2; mh /= 2;
+            dr = wi_decode_fit(data, len, &im, mw > 16 ? mw : 16, mh > 16 ? mh : 16);
+        }
+        if (dr == -2) { wi_free(&im); e->state = 3; img_note_fail(p, e->url, "sin memoria para decodificarla", 200, len); return; }
+    }
+    if (dr == 0 && im.px && im.w > 0 && im.h > 0) {
+        int nat_w = im.nw > 0 ? im.nw : im.w, nat_h = im.nh > 0 ? im.nh : im.h;
         /* SOMA_PARCHE_028_UI: se guarda al tamano al que se muestra (si se conoce), con un tope por imagen y dentro del
          * presupuesto de la pagina; si no cabe, se liberan antes las imagenes lejanas. La maquetacion sigue usando el tamano
          * natural (e->w, e->h), asi que la pagina se ve igual. */
@@ -319,7 +343,7 @@ static void img_decode_into(struct wpage *p, struct wp_img *e, const uint8_t *da
         if (f > 1) { px = img_shrink(im.px, im.w, im.h, f, &pw, &ph); kfree(im.px); im.px = 0; }
         uint32_t bytes = (uint32_t)pw * (uint32_t)ph * 4;
         if (px && bytes <= left) {
-            e->px = px; e->w = im.w; e->h = im.h; e->pw = pw; e->ph = ph; e->state = 2; p->img_bytes += bytes;
+            e->px = px; e->w = nat_w; e->h = nat_h; e->pw = pw; e->ph = ph; e->state = 2; p->img_bytes += bytes;
             int al = 0; for (uint32_t i = 0; i < (uint32_t)pw * (uint32_t)ph; i += 7) if ((px[i] >> 24) != 0xFF) { al = 1; break; }
             e->has_alpha = al; p->img_ok++;
             return;

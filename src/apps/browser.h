@@ -6,6 +6,7 @@
 void browser_init(void);
 void browser_load_url(const char *url);
 void browser_render_window(uint32_t win_x, uint32_t win_y, uint32_t win_w, uint32_t win_h, int show_cursor);
+int  browser_right_click(int32_t mx, int32_t my, uint32_t win_x, uint32_t win_y, uint32_t win_w, uint32_t win_h);   /* PARCHE 085 */
 int  browser_handle_click(int32_t mx, int32_t my, uint32_t win_x, uint32_t win_y, uint32_t win_w, uint32_t win_h);
 void browser_handle_key(char c);
 int  browser_is_loading(void);

@@ -320,7 +320,7 @@ def handle_mailbox(approve: bool) -> bool | None:
 # ---------------------------------------------------------------- SRCFS
 
 SRCFS_LBA = 8192
-SRCFS_INDEX_SECTORS = 32   # SOMA_PARCHE_011_SRCFS: debe coincidir con src/fs/srcfs.c y disk_layout.h
+SRCFS_INDEX_SECTORS = 64   # SOMA_PARCHE_011_SRCFS: debe coincidir con src/fs/srcfs.c y disk_layout.h
 SRCFS_ENTRY = 64
 SRCFS_LIMIT_LBA = 16384
 SRCFS_DATA_SECTORS = SRCFS_LIMIT_LBA - (SRCFS_LBA + SRCFS_INDEX_SECTORS)
@@ -554,7 +554,7 @@ def get_qemu_commands(arch: str) -> tuple[str, list[str], list[str]]:
     if arch == "x86_64":
         qemu_bin = "qemu-system-x86_64"
         canary = [
-            qemu_bin, "-machine", x86_machine(), "-m", "256M", "-no-reboot",
+            qemu_bin, "-machine", x86_machine(), "-m", os.environ.get("SOMA_MEM", "512M"), "-no-reboot",
             "-cdrom", "build/soma.iso", "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:8090-:80",
             "-device", "virtio-net-pci,netdev=net0",
             "-drive", "file=hdd.img,format=raw,if=virtio",
@@ -562,7 +562,7 @@ def get_qemu_commands(arch: str) -> tuple[str, list[str], list[str]]:
             "-serial", "stdio", "-display", "none",
         ] + sata_args() + nvme_args() + usb_args()
         main_cmd = [
-            qemu_bin, "-machine", x86_machine(), "-m", "256M", "-no-reboot", "-d", "guest_errors,cpu_reset", "-D", "build/qemu.log",
+            qemu_bin, "-machine", x86_machine(), "-m", os.environ.get("SOMA_MEM", "512M"), "-no-reboot", "-d", "guest_errors,cpu_reset", "-D", "build/qemu.log",
             "-cdrom", "build/soma.iso", "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:8090-:80", "-device", "virtio-net-pci,netdev=net0",
             "-drive", "file=hdd.img,format=raw,if=virtio",
             "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
@@ -572,7 +572,7 @@ def get_qemu_commands(arch: str) -> tuple[str, list[str], list[str]]:
     else:  # aarch64 – virtio-mmio (más simple y fiable en QEMU virt)
         qemu_bin = "qemu-system-aarch64"
         canary = [
-            qemu_bin, "-M", aarch64_machine(), "-cpu", "cortex-a72", "-m", "256M", "-no-reboot", "-semihosting",
+            qemu_bin, "-M", aarch64_machine(), "-cpu", "cortex-a72", "-m", "256M", "-smp", os.environ.get("SOMA_SMP", "4"), "-no-reboot", "-semihosting",
             "-kernel", "build/aarch64/soma.elf",
             "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:8090-:80",
             "-device", "virtio-net-device,netdev=net0",
@@ -581,7 +581,7 @@ def get_qemu_commands(arch: str) -> tuple[str, list[str], list[str]]:
             "-serial", "stdio", "-display", "none",
         ]
         main_cmd = [
-            qemu_bin, "-M", aarch64_machine(), "-cpu", "cortex-a72", "-m", "256M", "-no-reboot", "-semihosting",
+            qemu_bin, "-M", aarch64_machine(), "-cpu", "cortex-a72", "-m", "256M", "-smp", os.environ.get("SOMA_SMP", "4"), "-no-reboot", "-semihosting",
             "-kernel", "build/aarch64/soma.elf",
             "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:8090-:80",
             "-device", "virtio-net-device,netdev=net0",

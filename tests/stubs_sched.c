@@ -28,3 +28,5 @@ void net_lock(void) { }
 void net_unlock(void) { }
 int  net_poll(void) { return 0; }
 int  vfs_write(const char *n, const char *d, uint32_t len) { (void)n; (void)d; return (int)len; }
+/* PARCHE 089: lo define mem.c, que estas pruebas no enlazan */
+volatile unsigned char kheap_owner;

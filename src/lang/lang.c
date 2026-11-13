@@ -58,6 +58,7 @@ struct soma_compiler {
     int               depth;
 };
 
+int lang_diag_quiet;   /* PARCHE 100: el programador verifica candidatos sin llenar la terminal de errores */
 static struct soma_compiler    compiler_inst;
 /* PARCHE 029: la VM del REPL (~460 KB) se reserva al primer uso en lugar de ocupar .bss. */
 static struct soma_vm         *global_repl_vm_p = 0;
@@ -108,6 +109,7 @@ static void compiler_error(struct soma_compiler *c, const char *msg)
         }
     }
 
+    if (!lang_diag_quiet) {   /* PARCHE 100 */
     kprint("[COMPILER ERROR L");
     kprint_dec(c->cur.line);
     kprint("]: ");
@@ -115,6 +117,7 @@ static void compiler_error(struct soma_compiler *c, const char *msg)
     kprint(" (cerca de: '");
     kprint(c->cur.text);
     kprint("')\n");
+    }
 }
 
 static void emit_u8(struct soma_compiler *c, uint8_t b)
@@ -838,7 +841,7 @@ static void parse_primary(struct soma_compiler *c)
             else { emit_u8(c, OP_PUSH_INT); emit_i64(c, 0x0A0D14); }
             consume(c, TOK_RPAREN, ")");
             emit_u8(c, OP_SYS_WIN_CLEAR);
-        } else if (soma_sbuf_eq(m, "rect")) {
+        } else if (soma_sbuf_eq(m, "rect") || soma_sbuf_eq(m, "fill") || soma_sbuf_eq(m, "fill_rect")) {
             parse_expr(c); consume(c, TOK_COMMA, ",");
             parse_expr(c); consume(c, TOK_COMMA, ",");
             parse_expr(c); consume(c, TOK_COMMA, ",");
@@ -880,6 +883,9 @@ static void parse_primary(struct soma_compiler *c)
         } else if (soma_sbuf_eq(m, "mouse")) {
             consume(c, TOK_RPAREN, ")");
             emit_u8(c, OP_SYS_WIN_MOUSE);
+        } else if (soma_sbuf_eq(m, "key")) {
+            consume(c, TOK_RPAREN, ")");
+            emit_u8(c, OP_SYS_KEY);
         } else if (soma_sbuf_eq(m, "clicked")) {
             consume(c, TOK_RPAREN, ")");
             emit_u8(c, OP_SYS_WIN_MOUSE);
@@ -962,6 +968,28 @@ static void parse_primary(struct soma_compiler *c)
                 parse_expr(c);
                 consume(c, TOK_RPAREN, ")");
                 emit_u8(c, OP_ARRAY_POP);
+                return;
+            }
+        }
+
+        /* PARCHE 101: funciones basicas (si el programa no define una propia con ese nombre) */
+        if (check(c, TOK_LPAREN)) {
+            static const struct { const char *n; uint8_t op; uint8_t argc; } bi[] = {
+                { "abs", OP_ABS, 1 }, { "min", OP_MIN, 2 }, { "max", OP_MAX, 2 }, { "clamp", OP_CLAMP, 3 },
+                { "sqrt", OP_SQRT, 1 }, { "find", OP_STR_FIND, 2 }, { "chr", OP_CHR, 1 }, { "ord", OP_ORD, 2 },
+            };
+            int own = 0;
+            for (int q = 0; q < (int)c->fn_count; q++) if (soma_sbuf_eq(c->fns[q].name, name)) own = 1;
+            for (unsigned q = 0; !own && q < sizeof bi / sizeof bi[0]; q++) {
+                if (!soma_sbuf_eq(name, bi[q].n)) continue;
+                advance(c);
+                for (int a = 0; a < bi[q].argc; a++) {
+                    if (a == 1 && bi[q].op == OP_ORD && check(c, TOK_RPAREN)) { emit_u8(c, OP_PUSH_INT); emit_i64(c, 0); break; }
+                    if (a) consume(c, TOK_COMMA, ",");
+                    parse_expr(c);
+                }
+                consume(c, TOK_RPAREN, ")");
+                emit_u8(c, bi[q].op);
                 return;
             }
         }

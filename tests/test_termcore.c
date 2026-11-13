@@ -7,6 +7,14 @@
 #include "soma_test.h"
 #include "term_core.h"
 
+/* PARCHE 106: term_core.c declara el portapapeles del sistema como simbolos DEBILES (en Linux, sin definir, valen NULL). El enlazador de
+ * macOS no admite referencias debiles sin definir en un ejecutable, asi que alli se definen sin portapapeles compartido: mismo comportamiento. */
+#ifdef __APPLE__
+int clip_set_text(const char *t, uint32_t n) { (void)t; (void)n; return 0; }
+const char *clip_text(uint32_t *n) { if (n) *n = 0; return ""; }
+uint32_t clip_seq(void) { return 0; }
+#endif
+
 static struct term_core T;
 
 static void test_filas(void)

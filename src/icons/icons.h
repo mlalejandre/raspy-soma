@@ -29,7 +29,10 @@ enum soma_icon_id {
     ICON_PAINT = 9,
     ICON_CODER = 10,
     ICON_MEDIA = 11,
-    ICON_COUNT = 12
+    ICON_SETTINGS = 12,    /* PARCHE 085: engranaje (vectorial) */
+    ICON_PDF = 13,         /* PARCHE 088: documento PDF (vectorial) */
+    ICON_MONITOR = 14,     /* PARCHE 089: monitor del sistema (vectorial) */
+    ICON_COUNT = 15
 };
 
 static inline const uint8_t (*icon_get_data(int id))[16]

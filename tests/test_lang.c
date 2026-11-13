@@ -74,6 +74,15 @@ static void test_funciones_y_arrays(void)
                "4\n4\n9\n");
 }
 
+static void test_funciones_basicas(void)   /* PARCHE 101 */
+{
+    EXPECT_OUT("print(abs(0-7)); print(min(3,9)); print(max(3,9)); print(clamp(15,0,10)); print(clamp(0-5,0,10));", "7\n3\n9\n10\n0\n");
+    EXPECT_OUT("print(sqrt(144)); print(sqrt(50)); print(sqrt(0)); print(sqrt(0-4));", "12\n7\n0\n0\n");
+    EXPECT_OUT("print(find(\"hola mundo\",\"mundo\")); print(find(\"hola\",\"x\")); print(find(\"abc\",\"\"));", "5\n-1\n0\n");
+    EXPECT_OUT("print(chr(65)+chr(66)); print(ord(\"A\",0)); print(ord(\"hola\",2)); print(ord(\"hi\",9));", "AB\n65\n108\n0\n");
+    EXPECT_OUT("fn min(a,b){ return 42; } print(min(1,2));", "42\n");   /* una funcion propia manda sobre la del sistema */
+}
+
 static void test_errores_de_ejecucion_controlados(void)
 {
     CHECK_EQ_INT(run_prog("print(1/0);"), -1);
@@ -213,6 +222,7 @@ int main(void)
     test_cadenas_y_logica();
     test_control_de_flujo();
     test_funciones_y_arrays();
+    test_funciones_basicas();
     test_errores_de_ejecucion_controlados();
     test_errores_de_compilacion();
     test_buffer_de_salida_pequeno();

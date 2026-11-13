@@ -106,6 +106,18 @@ void fb_draw_glyph8_nodmg(int32_t x, int32_t y, const uint8_t *glyph, uint32_t f
 
 /* Cursor overlay: compuesto directamente en VRAM al presentar */
 void fb_cursor_set_image(const uint32_t *argb, int32_t w, int32_t h);
+/* PARCHE 085: punto activo del puntero y ventanas translucidas */
+void fb_cursor_set_hotspot(int32_t hx, int32_t hy);
+void fb_tr_begin(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t alpha);   /* captura lo de debajo; alpha 255 = opaca */
+void fb_tr_off(void);
+void fb_tr_release(void);
+void fb_target_begin(uint32_t *buf, uint32_t w, uint32_t h);   /* PARCHE 088: dibujar en un bufer propio */
+void fb_target_end(void);
+struct fb_info { uint32_t w, h, bpp, pitch, active, hw_id; uint64_t phys, backbuffer_bytes, tr_bytes, presents; const char *driver; };
+void fb_get_info(struct fb_info *o);   /* PARCHE 089 */   /* PARCHE 086: libera las capas (opacidad 100 %) */
+void fb_tr_exclude(int32_t x, int32_t y, int32_t w, int32_t h);                /* zona opaca solo en el proximo volcado */
+uint32_t *fb_rect_save(int32_t x, int32_t y, int32_t w, int32_t h);
+void fb_rect_blend_saved(uint32_t *saved, int32_t x, int32_t y, int32_t w, int32_t h, uint32_t alpha);
 void fb_cursor_show(int32_t x, int32_t y);
 void fb_cursor_hide(void);
 

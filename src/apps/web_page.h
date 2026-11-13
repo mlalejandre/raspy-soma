@@ -53,6 +53,7 @@ int  wp_post(struct wpage *p, const char *url, const char *body, uint32_t blen, 
 void wp_history_go(struct wpage *p, int delta);
 int  wp_can_back(const struct wpage *p);
 int  wp_can_fwd(const struct wpage *p);
+int  wp_img_get(struct wpage *p, const char *src, const uint32_t **px, int *w, int *h, char *abs, uint32_t absmax);   /* PARCHE 085 */
 void wp_stop(struct wpage *p);
 /* devuelve ms hasta que conviene volver a llamar */
 int  wp_tick(struct wpage *p, uint64_t now);

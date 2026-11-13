@@ -120,6 +120,10 @@ int memcmp(const void *a, const void *b, size_t n)
 #ifndef KHEAP_MAX_SIZE
 #define KHEAP_MAX_SIZE     (64 * 1024 * 1024ULL) /* Limite de expansion: 64 MiB */
 #endif
+/* PARCHE 086: en x86_64 el limite crece con la RAM (la mitad, hasta 256 MiB) si la RAM fisica queda por debajo de la ventana virtual del
+ * heap (0x20000000); asi una pagina web pesada no se queda sin memoria para sus imagenes. En aarch64 sigue el limite fijo del mapa. */
+static size_t kheap_limit = KHEAP_MAX_SIZE;
+size_t kheap_max_bytes(void) { return kheap_limit; }
 #define KHEAP_INIT_BYTES   (16 * 1024ULL)        /* 16 KiB iniciales (4 paginas) */
 
 #define KHEAP_MAGIC_ALLOC  0xA110CA7Eu
@@ -138,6 +142,10 @@ struct block_header {
 
 _Static_assert(sizeof(struct block_header) == 32, "block_header debe ser exactamente de 32 bytes");
 
+/* PARCHE 089: el byte alto de req guarda el "dueno" del bloque (aplicacion o subsistema) para el Monitor del sistema */
+#define REQ_MASK  0x00FFFFFFFFFFFFFFULL
+#define REQ(b)    ((b)->req & REQ_MASK)
+volatile uint8_t kheap_owner;   /* dueno actual: lo cambia el planificador al conmutar y la GUI al dar paso a cada aplicacion */
 static struct block_header *heap_head = 0;
 static uint64_t heap_current_brk = 0;
 static size_t   heap_mapped_bytes = 0;
@@ -183,14 +191,14 @@ static int block_valid(const struct block_header *b)
     if ((uintptr_t)(b + 1) + b->size > (uintptr_t)heap_current_brk) return 0;
     if (b->is_free == 1) return b->magic == KHEAP_MAGIC_FREE;
     if (b->is_free == 0) return b->magic == KHEAP_MAGIC_ALLOC &&
-                                b->req > 0 && b->req + KHEAP_TAIL_MIN <= b->size;
+                                REQ(b) > 0 && REQ(b) + KHEAP_TAIL_MIN <= b->size;
     return 0;
 }
 
 static int tail_intact(const struct block_header *b)
 {
     const uint8_t *p = (const uint8_t *)(b + 1);
-    for (size_t i = (size_t)b->req; i < b->size; ++i) {
+    for (size_t i = (size_t)REQ(b); i < b->size; ++i) {
         if (p[i] != KHEAP_TAIL_BYTE) return 0;
     }
     return 1;
@@ -278,8 +286,8 @@ static int kheap_expand(size_t min_bytes)
     size_t pages_needed = (min_bytes + VMM_PAGE_SIZE - 1) / VMM_PAGE_SIZE;
     if (pages_needed == 0) pages_needed = 1;
 
-    if (min_bytes > KHEAP_MAX_SIZE ||
-        heap_mapped_bytes + (pages_needed * VMM_PAGE_SIZE) > KHEAP_MAX_SIZE) {
+    if (min_bytes > kheap_limit ||
+        heap_mapped_bytes + (pages_needed * VMM_PAGE_SIZE) > kheap_limit) {
         return 0;
     }
 
@@ -342,6 +350,16 @@ void kheap_init(void)
 {
     if (heap_initialized) return;
 
+#if defined(__x86_64__) && !defined(SOMA_HOST_TEST)
+    {   /* PARCHE 086: limite segun la RAM */
+        size_t fr = 0, us = 0, tot = 0; pmm_get_stats(&fr, &us, &tot);
+        uint64_t ram = (uint64_t)tot * 4096u;
+        if (ram && ram <= 0x20000000ULL) {
+            uint64_t lim = ram / 2; if (lim > (256ULL << 20)) lim = 256ULL << 20;
+            if (lim > kheap_limit) kheap_limit = (size_t)lim;
+        }
+    }
+#endif
     heap_current_brk  = KHEAP_START;
     heap_mapped_bytes = 0;
     heap_head         = 0;
@@ -360,10 +378,12 @@ void kheap_init(void)
     kprint_hex32((uint32_t)KHEAP_START);
     kprint(" (NX activo, ");
     kprint_dec((uint32_t)(heap_mapped_bytes / 1024));
-    kprint(" KiB mapeados)\n");
+    kprint(" KiB mapeados, hasta ");
+    kprint_dec((uint32_t)(kheap_limit >> 20));
+    kprint(" MiB)\n");
 }
 
-void *kmalloc(size_t size)
+static void *kmalloc_impl(size_t size)
 {
     if (!heap_initialized) {
         kheap_init();
@@ -374,7 +394,7 @@ void *kmalloc(size_t size)
     heap_ctr.alloc_calls++;
 
     /* Antes de redondear: un tamano enorme envolvia a 0 y devolvia un bloque minimo. */
-    if (size > KHEAP_MAX_SIZE) {
+    if (size > kheap_limit) {
         heap_ctr.failed_allocs++;
         return 0;
     }
@@ -404,7 +424,7 @@ void *kmalloc(size_t size)
 
             curr->is_free = 0;
             curr->magic = KHEAP_MAGIC_ALLOC;
-            curr->req = req;
+            curr->req = req | ((uint64_t)kheap_owner << 56);
             memset((uint8_t *)(curr + 1) + req, (int)KHEAP_TAIL_BYTE, curr->size - req);
             heap_account_alloc(curr);
             return (void *)(curr + 1);
@@ -423,7 +443,7 @@ void *kmalloc(size_t size)
     return 0;
 }
 
-void kfree(void *ptr)
+static void kfree_impl(void *ptr)
 {
     if (!ptr || !heap_initialized) return;
 
@@ -505,6 +525,40 @@ void kfree(void *ptr)
     bin_insert(block);
 }
 
+/* PARCHE 103 (Fase 1): guarda de reentrada. El heap no tiene cerrojo porque el nucleo es cooperativo a proposito (ver ESTABILIDAD,
+ * parche 072): ninguna IRQ ni punto de desalojo debe caer dentro de kmalloc/kfree. Si algun dia ocurre (una IRQ que reserva memoria, un
+ * hilo desalojado a mitad), en vez de corromper las listas en silencio se rechaza la llamada reentrante y se cuenta en reentries. */
+static volatile int heap_busy;
+void *kmalloc(size_t size)
+{
+    if (heap_busy) { heap_ctr.reentries++; return 0; }
+    heap_busy = 1;
+    void *r = kmalloc_impl(size);
+    heap_busy = 0;
+    return r;
+}
+void kfree(void *ptr)
+{
+    if (heap_busy) { heap_ctr.reentries++; return; }
+    heap_busy = 1;
+    kfree_impl(ptr);
+    heap_busy = 0;
+}
+/* Solo para pruebas: simula que otra ruta ya esta dentro del asignador. Devuelve 1 si la reentrada se rechaza bien. */
+int kheap_test_reentry(void)
+{
+    uint64_t antes = heap_ctr.reentries;
+    void *ok = kmalloc(32);
+    if (!ok) return 0;
+    heap_busy = 1;
+    void *no = kmalloc(32);
+    kfree(ok);
+    heap_busy = 0;
+    int bien = (no == 0) && heap_ctr.reentries == antes + 2;
+    kfree(ok);                                   /* ahora si se libera; el bloque sigue vivo */
+    return bien;
+}
+
 void kheap_stats(size_t *used, size_t *free_bytes)
 {
     if (!heap_initialized) kheap_init();
@@ -526,12 +580,26 @@ void kheap_stats(size_t *used, size_t *free_bytes)
     if (free_bytes) *free_bytes = f;
 }
 
+/* PARCHE 089: bytes vivos (con cabecera) por dueno */
+void kheap_owner_usage(uint64_t out[256], uint32_t blocks[256])
+{
+    for (int i = 0; i < 256; i++) { out[i] = 0; if (blocks) blocks[i] = 0; }
+    if (!heap_initialized) return;
+    for (struct block_header *b = heap_head; b; b = b->next) {
+        if (!hdr_in_heap(b)) break;
+        if (b->is_free) continue;
+        uint8_t o = (uint8_t)(b->req >> 56);
+        out[o] += b->size + sizeof(struct block_header);
+        if (blocks) blocks[o]++;
+    }
+}
 void kheap_get_counters(struct kheap_counters *out)
 {
     if (!out) return;
     if (!heap_initialized) kheap_init();
     *out = heap_ctr;
     out->mapped_bytes = heap_mapped_bytes;
+    out->reentries = heap_ctr.reentries;
 }
 
 /*
@@ -606,6 +674,7 @@ void kheap_dump_stats(void)
     kprint(") | Liberaciones: "); kprint_dec((uint32_t)heap_ctr.free_calls);
     kprint(" (rechazadas: "); kprint_dec((uint32_t)heap_ctr.rejected_frees); kprint(")\n");
     kprint("Integridad:         ");
+    if (heap_ctr.reentries) { kprint("  llamadas reentrantes rechazadas: "); kprint_dec(heap_ctr.reentries); kprint("\n"); }
     if (heap_ctr.corruptions == 0 && kheap_check() == 0) kprint("OK\n\n");
     else kprint("CORRUPCION DETECTADA\n\n");
 }

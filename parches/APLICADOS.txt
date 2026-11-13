@@ -76,3 +76,32 @@
 20261111_192854 parche 076: Pantalla de 16 bits en la Pi 5 real: colores de la consola y escritorio (comando hdmi)
 20261111_195301 parche 077: Pi 5 real: pantalla de 16 bits bien detectada, segundo controlador USB del RP1 y ventilador
 20261111_201354 parche 078: Pi 5 real: resolucion y formato de pantalla calculados con pitch y tamano (video)
+20261112_111054 parche 079: Pi 5: Wi-Fi fase 1 - SDIO2, identificacion del chip CYW43455 y carga de su firmware; comando placa
+20261112_113558 parche 080: Wi-Fi: criptografia WPA2, saludo de 4 pasos, escaneo e interfaces de red (eth0, wlan0, virtio0)
+20261112_121741 parche 081: Wi-Fi: escaneo, conexion WPA2-PSK y wlan0 (escrito sin placa); cliente DHCP
+20261112_123813 parche 082: SMP: nucleos 1-3 por PSCI para calculo en paralelo (pantalla, PBKDF2); orden cpus
+20261112_165623 parche 083: Paint con la estetica del explorador: lienzo 320x240+, zoom, color HSV, deshacer, PNG comprimido
+20261112_185520 parche 084: Maquetador LaTeX: motor propio (documento + formulas TeX), vista Documento/Fuente, IA que escribe LaTeX
+20261112_193201 parche 085: Ajustes (transparencia y fuente), punteros vectoriales y Guardar imagen como en el navegador
+20261112_201048 parche 086: Navegador: imagenes sin memoria arregladas (heap mayor, JPEG reducidos al decodificar), JPEG CMYK, ventana grande
+20261112_204907 parche 087: Archivos sin limite de 16 KiB (hasta 32 MiB, 256 archivos; los grandes se guardan en BIGFS); descargar y suma
+20261112_213954 parche 088: Lector de PDF propio y visor de imagenes rehecho (PNG/JPEG/GIF/BMP de cualquier tamano)
+20261112_221638 parche 089: Monitor del sistema (CPU, memoria, procesos, graficos, discos, red, hardware) y CPU/memoria por aplicacion
+20261112_222944 parche 090: El Monitor del sistema se actualiza tambien en segundo plano
+20261113_102151 parche 091: El agente SOMA trabaja en segundo plano: el escritorio no se congela
+20261113_103602 parche 092: Guardar imagen como: nombre y carpeta editables con cursor
+20261113_110028 parche 093: SOMA Studio: editor de codigo profesional + IA sobre el mismo archivo
+20261113_110830 parche 094: SOMA Studio: nuevo aspecto visual
+20261113_112317 parche 095: La Pi 5 emulada usa 1920x1080 como la placa real
+20261113_124746 parche 096: Programador con IA: bucle agentico guiado por el compilador
+20261113_132259 parche 097: Programador: usado siempre, robusto ante el razonamiento del modelo y visible
+20261113_134343 parche 098: Las apps SOMA-LANG corren en su propio hilo; el escritorio sigue vivo
+20261113_151114 parche 099: SOMA Studio: campos de texto completos, clics fiables y pestanas nuevas
+20261113_153045 parche 100: Programador: corrige el kernel panic y los programas que no arrancan
+20261113_161024 parche 101: Editor: explorador fiable; SOMA-LANG: abs, min, max, clamp, sqrt, find, chr, ord
+20261113_173052 parche 102: Fase 1 seguridad: validacion de punteros de usuario (uaccess.h) con tests y fuzz
+20261113_194951 parche 103: Fase 1 seguridad: guarda de reentrada del heap (kmalloc/kfree) con test
+20261113_202821 parche 104: Fase 1 seguridad: vmm.c probado en host (fugas, fallos del PMM) y guarda al destruir el espacio activo
+20261113_212314 parche 105: Correccion: el test de vmm enlaza tambien en macOS (simbolos del enlazador propios en la prueba)
+20261113_213207 parche 106: Correccion: el test del terminal enlaza tambien en macOS (portapapeles debil)
+20261113_214151 parche 107: SRCFS: indice de 511 entradas; el agente vuelve a ver net/, lang/, ui/ y user/

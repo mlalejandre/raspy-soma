@@ -15,7 +15,8 @@ void jpeg_yield_hook(void){}
 static uint64_t S=88172645463325252ULL;
 static uint32_t rnd(void){ S^=S<<13; S^=S>>7; S^=S<<17; return (uint32_t)(S>>11); }
 static void run(const uint8_t *d, uint32_t n, int mode){
-  if(mode==0){ struct wimg o; if(wi_decode(d,n,&o)==0) wi_free(&o); }
+  if(mode==0){ struct wimg o; if(wi_decode(d,n,&o)==0) wi_free(&o);
+    int m=(int)(rnd()%4); static const int mm[4]={1,9,20,40}; if(wi_decode_fit(d,n,&o,mm[m],mm[m])==0) wi_free(&o); }   /* PARCHE 086: decodificacion reducida */
   else { struct wb out; memset(&out,0,sizeof out); wz_inflate(d,n,3,&out,8u<<20); wb_free(&out); }
 }
 int main(int argc,char**argv){

@@ -184,7 +184,7 @@ def run():
     build()
     sd = sd_image()
     ram = os.environ.get("SOMA_PI5_RAM", "2G")
-    cpus = os.environ.get("SOMA_PI5_CPUS", "1")
+    cpus = os.environ.get("SOMA_PI5_CPUS", "4")   # PARCHE 082: los 4 nucleos de la Pi 5
     extra = shlex.split(os.environ.get("SOMA_PI5_EXTRA", ""))
     gui = os.environ.get("SOMA_PI5_GUI", "1") != "0"
     port = os.environ.get("SOMA_PI5_VNC", "5900")
@@ -224,6 +224,37 @@ disable_overscan=1
 """
 
 
+# PARCHE 079: firmware del Wi-Fi (CYW43455) para la carpeta /wifi de la SD. Son binarios de Cypress/Infineon con licencia que permite
+# redistribuirlos pero no es libre: no se guardan en el repositorio, se descargan al generar la SD (los mismos que usa Raspberry Pi OS).
+WIFI_URL = "https://raw.githubusercontent.com/RPi-Distro/firmware-nonfree/bookworm/debian/config/brcm80211/"
+WIFI_FILES = [("cypress/cyfmac43455-sdio-standard.bin", "brcmfmac43455-sdio.bin"),
+              ("brcm/brcmfmac43455-sdio.txt", "brcmfmac43455-sdio.txt"),
+              ("cypress/cyfmac43455-sdio.clm_blob", "brcmfmac43455-sdio.clm_blob")]
+
+
+def wifi_firmware(fw):
+    """Descarga (una vez) los ficheros del Wi-Fi en tools/pi5/firmware/wifi/. Devuelve [(nombre, bytes)] o [] si no se pudo."""
+    import urllib.request
+    d = os.path.join(fw, "wifi")
+    os.makedirs(d, exist_ok=True)
+    out = []
+    for src, name in WIFI_FILES:
+        path = os.path.join(d, name)
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            try:
+                with urllib.request.urlopen(WIFI_URL + src, timeout=60) as r:
+                    data = r.read()
+                with open(path, "wb") as f:
+                    f.write(data)
+                print("Descargado %s (firmware Wi-Fi, %d KiB)." % (name, (len(data) + 1023) // 1024))
+            except Exception as e:
+                print("AVISO: no pude descargar %s (%s). Sin el, 'wifi prueba' llega hasta identificar el chip pero no carga el firmware.\n"
+                      "       Puedes copiarlo a mano de /lib/firmware/brcm/ de Raspberry Pi OS a %s." % (name, e, d))
+                return []
+        out.append((name, open(path, "rb").read()))
+    return out
+
+
 def sd_card():
     """PARCHE 074: genera soma_pi5_sd.img (MBR + FAT32) lista para grabar en una microSD y arrancar una Pi 5 real."""
     build()
@@ -247,6 +278,9 @@ def sd_card():
     d.add_file("kernel_2712.img", open(kernel, "rb").read())
     if os.path.exists(dtb):
         d.add_file("bcm2712-rpi-5-b.dtb", open(dtb, "rb").read())
+    if os.environ.get("SOMA_WIFI_FW", "1") != "0":
+        for name, data in wifi_firmware(fw):
+            d.add_file("wifi/" + name, data)
     out = os.path.join(ROOT, "soma_pi5_sd.img")
     with open(out, "wb") as f:
         f.write(d.build())

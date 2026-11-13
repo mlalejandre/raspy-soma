@@ -148,6 +148,13 @@ Comandos útiles en la placa:
 | `hdmi` / `hdmi swap` | Ver el modo de pantalla / intercambiar rojo y azul |
 | `usb`, `blk`, `fat ls sd0` | Dispositivos USB, discos y ficheros de la SD |
 | `fan on`, `fan off`, `fan inv` | Ventilador |
+| `placa` | Modelo, memoria y revisión de la Raspberry |
+| `wifi prueba` | Wi-Fi (fase 1, en pruebas): enciende el chip, lo identifica y carga su firmware desde `/wifi` de la SD |
+| `wifi scan`, `wifi conectar <red> <clave>` | Redes Wi-Fi cercanas y conexión WPA2 (escrito, pendiente de probar en placa) |
+| `dhcp` | Pide dirección IP al router |
+| `cpus`, `cpus prueba` | Núcleos del procesador y prueba de cálculo en paralelo |
+| `netif`, `netif usar wlan0` | Interfaces de red (Ethernet, Wi-Fi) y cambio entre ellas |
+| `wpa`, `wpa psk <ssid> <clave>` | Autoprueba de la criptografía WPA2 y clave de una red |
 | `eth`, `ping 10.0.2.2` | Ethernet (verificada en emulador) |
 | `gpio`, `gpio N out`, `gpio N 1` | Pines GPIO del RP1 |
 | `pci`, `threads` | Bus PCIe y planificador |

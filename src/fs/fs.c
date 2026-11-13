@@ -22,7 +22,7 @@
 #define FS_SECTORS_PER_FILE  33
 #define FS_DATA_SECTORS      32
 #define FS_CHECKPOINT_LBA    SOMA_LBA_CHECKPOINT
-#define FS_TOTAL_SECTORS     (1 + FS_MAX_FILES * FS_SECTORS_PER_FILE)
+#define FS_TOTAL_SECTORS     (1 + FS_DISK_SLOTS * FS_SECTORS_PER_FILE)
 
 struct fs_superblock {
     char     magic[8];       /* "SOMAFS02" */
@@ -37,13 +37,35 @@ struct fs_disk_header {
     char     name[FS_NAME_MAX]; /* 48 B */
     uint32_t size;              /* 4 B */
     uint8_t  used;              /* 1 B */
-    uint8_t  pad[11];           /* 11 B -> 64 B */
+    uint8_t  spilled;           /* PARCHE 087: 'B' = contenido en BIGFS (los nucleos viejos ven size >= 16 KiB y lo ignoran) */
+    uint8_t  pad[10];           /* 10 B -> 64 B */
     uint8_t  sec_pad[448];      /* Total 512 B (Sector 0 del inodo) */
 } __attribute__((aligned(64)));
 
 static struct vfs_file files[FS_MAX_FILES] __attribute__((aligned(8)));
 static struct kmutex vfs_mutex __attribute__((aligned(16)));
 static int fs_initialized = 0;
+static int fs_spill_warned;
+
+/* PARCHE 087: reserva exacta (con margen) para el contenido; conserva los datos si keep */
+static int ensure_cap(int i, uint32_t need, int keep)
+{
+    if (need > FS_FILE_MAX + 1) return -2;
+    if (files[i].data && files[i].cap >= need) return 0;
+    uint32_t c = need < 64 ? 64 : need + need / 8;
+    if (c > FS_FILE_MAX + 1) c = FS_FILE_MAX + 1;
+    uint8_t ow = kheap_owner; kheap_owner = 1;               /* PARCHE 089: memoria de RamFS (ACCT_RAMFS) */
+    char *nd = (char *)kmalloc(c);
+    kheap_owner = ow;
+    if (!nd) return -1;
+    if (keep && files[i].data && files[i].size) memcpy(nd, files[i].data, files[i].size);
+    if (files[i].data) kfree(files[i].data);
+    files[i].data = nd; files[i].cap = c;
+    return 0;
+}
+static void drop_data(int i) { if (files[i].data) kfree(files[i].data); files[i].data = 0; files[i].cap = 0; }
+/* el contenido va al almacen grande si no cabe en una ranura o si el archivo no tiene ranura */
+static int needs_spill(int i) { return i >= FS_DISK_SLOTS || files[i].size >= FS_DATA_MAX; }
 
 static int str_eq(const char *a, const char *b)
 {
@@ -269,9 +291,25 @@ static int sync_file_to_disk(int i)
     struct fs_disk_header hdr;
     memset(&hdr, 0, sizeof(hdr));
 
-    memcpy(hdr.name, files[i].name, FS_NAME_MAX);
-    hdr.size = files[i].size;
-    hdr.used = files[i].used;
+    /* PARCHE 087: archivos grandes y archivos sin ranura -> BIGFS */
+    int spill = files[i].used && needs_spill(i);
+    if (spill) {
+        if (!fs_spill_ready() || fs_spill_put(i, files[i].name, files[i].data, files[i].size) != 0) {
+            files[i].ram_only = 1; files[i].dirty = 0;
+            if (!fs_spill_warned) { fs_spill_warned = 1; kprint("VFS: archivo grande sin almacen BIGFS: queda solo en memoria (usa 'big format yes')\n"); }
+            if (i >= FS_DISK_SLOTS) return 0;
+            spill = 0;                                      /* la ranura queda libre en disco */
+        } else { files[i].spilled = 1; files[i].ram_only = 0; }
+    } else if (files[i].spilled) { fs_spill_del(i); files[i].spilled = 0; }
+    if (!files[i].used) { files[i].ram_only = 0; if (i >= FS_DISK_SLOTS) { files[i].dirty = 0; return 0; } }
+    if (i >= FS_DISK_SLOTS) { files[i].dirty = 0; return 0; }
+
+    if (files[i].used && (spill || !files[i].ram_only)) {
+        memcpy(hdr.name, files[i].name, FS_NAME_MAX);
+        hdr.size = files[i].size;
+        hdr.used = 1;
+        hdr.spilled = spill ? 'B' : 0;
+    }
 
     uint64_t start_lba = FS_DATA_LBA + (uint64_t)i * FS_SECTORS_PER_FILE;
 
@@ -280,7 +318,7 @@ static int sync_file_to_disk(int i)
     if (virtio_blk_write(start_lba, sec_buf) != 0) return -1;
 
     /* 2. Escribir los 32 sectores de datos (16 KiB) */
-    if (files[i].used && files[i].data) {
+    if (hdr.used && !hdr.spilled && files[i].data) {
         const uint8_t *raw = (const uint8_t *)files[i].data;
         for (int s = 0; s < FS_DATA_SECTORS; ++s) {
             memset(sec_buf, 0, sizeof(sec_buf));
@@ -310,7 +348,9 @@ static int load_file_from_disk(int i)
     if (virtio_blk_read(start_lba, sec_buf) != 0) return -1;
     memcpy(&hdr, sec_buf, sizeof(hdr));
 
-    if (hdr.used > 1 || hdr.size >= FS_DATA_MAX) return -1;
+    if (hdr.used > 1) return -1;
+    if (hdr.used && hdr.spilled != 'B' && hdr.size >= FS_DATA_MAX) return -1;
+    if (hdr.used && hdr.spilled == 'B' && hdr.size > FS_FILE_MAX) return -1;
     if (hdr.used) {
         int name_term = 0;
         for (uint32_t n = 0; n < FS_NAME_MAX; ++n) {
@@ -319,17 +359,26 @@ static int load_file_from_disk(int i)
         if (!name_term || hdr.name[0] == '\0') return -1;
     }
 
+    if (hdr.used && hdr.spilled == 'B') {                 /* PARCHE 087: contenido en BIGFS */
+        uint32_t sl = 0; char nm[FS_NAME_MAX];
+        if (!fs_spill_ready() || fs_spill_stat(i, nm, &sl) != 0 || sl != hdr.size) return -1;
+        files[i].size = 0;
+        if (ensure_cap(i, hdr.size + 1, 0) != 0) return -1;
+        if (fs_spill_get(i, files[i].data, hdr.size) != 0) { drop_data(i); return -1; }
+        files[i].data[hdr.size] = '\0';
+        memcpy(files[i].name, hdr.name, FS_NAME_MAX);
+        files[i].size = hdr.size; files[i].used = 1; files[i].dirty = 0; files[i].spilled = 1; files[i].ram_only = 0;
+        return 0;
+    }
     memcpy(files[i].name, hdr.name, FS_NAME_MAX);
     files[i].size = hdr.size;
     files[i].used = hdr.used;
     files[i].dirty = 0;
+    files[i].spilled = 0; files[i].ram_only = 0;
 
     if (hdr.used) {
-        if (!files[i].data) {
-            files[i].data = (char *)kmalloc(FS_DATA_MAX);
-            if (!files[i].data) return -1;
-        }
-        memset(files[i].data, 0, FS_DATA_MAX);
+        if (ensure_cap(i, hdr.size + 1, 0) != 0) return -1;
+        memset(files[i].data, 0, hdr.size + 1);
 
         uint8_t *raw = (uint8_t *)files[i].data;
         for (int s = 0; s < FS_DATA_SECTORS; ++s) {
@@ -343,31 +392,44 @@ static int load_file_from_disk(int i)
         }
         files[i].data[hdr.size] = '\0';
     } else {
-        if (files[i].data) {
-            kfree(files[i].data);
-            files[i].data = 0;
-        }
+        drop_data(i);
     }
 
+    return 0;
+}
+/* PARCHE 087: archivos por encima de las 64 ranuras guardados en BIGFS */
+static int load_spill_slot(int i)
+{
+    char nm[FS_NAME_MAX]; uint32_t sl = 0;
+    if (fs_spill_stat(i, nm, &sl) != 0 || sl > FS_FILE_MAX || !nm[0]) return -1;
+    nm[FS_NAME_MAX - 1] = 0;
+    if (ensure_cap(i, sl + 1, 0) != 0) return -1;
+    if (fs_spill_get(i, files[i].data, sl) != 0) { drop_data(i); return -1; }
+    files[i].data[sl] = '\0';
+    memcpy(files[i].name, nm, FS_NAME_MAX);
+    files[i].size = sl; files[i].used = 1; files[i].dirty = 0; files[i].spilled = 1; files[i].ram_only = 0;
     return 0;
 }
 
 static int vfs_sync_unlocked(void)
 {
+    /* PARCHE 083: sin disco virtio (Pi 5 real o emulada) RamFS vive solo en memoria: guardar no es un error (antes cada escritura
+     * en una ruta normal devolvia fallo aunque el archivo quedaba bien en RAM; Paint decia "Error al guardar"). */
+    if (virtio_blk_capacity() == 0) {
+        for (int i = 0; i < FS_MAX_FILES; ++i) files[i].dirty = 0;
+        return 0;
+    }
     struct fs_superblock sb;
     memset(&sb, 0, sizeof(sb));
     memcpy(sb.magic, "SOMAFS02", 8);
     sb.version = 2;
-    sb.max_files = FS_MAX_FILES;
+    sb.max_files = FS_DISK_SLOTS;
     sb.max_file_size = FS_DATA_MAX;
 
     uint32_t used_count = 0;
     int any_dirty = 0;
     for (int i = 0; i < FS_MAX_FILES; ++i) {
-        if (files[i].used) {
-            if (files[i].size >= FS_DATA_MAX) return -1;
-            used_count++;
-        }
+        if (files[i].used && i < FS_DISK_SLOTS && !files[i].ram_only) used_count++;
         if (files[i].dirty) {
             any_dirty = 1;
             if (sync_file_to_disk(i) != 0) return -1;
@@ -386,14 +448,11 @@ static int vfs_create_internal(const char *name, const char *initial_data, uint3
     /* SOMA_PARCHE_002_NAMELEN: un nombre que no cabe se aceptaba "con exito"
      * al truncarse, y luego el archivo no se podia leer ni borrar. */
     if (str_len(name) >= FS_NAME_MAX) return -1;
-    if (len > FS_DATA_MAX - 1) return -2;
+    if (len > FS_FILE_MAX) return -2;
 
     for (int i = 0; i < FS_MAX_FILES; ++i) {
         if (files[i].used && str_eq(files[i].name, name)) {
-            if (!files[i].data) {
-                files[i].data = (char *)kmalloc(FS_DATA_MAX);
-                if (!files[i].data) return -1;
-            }
+            { int e = ensure_cap(i, len + 1, 0); if (e) return e; }
             if (initial_data && len > 0) memcpy(files[i].data, initial_data, len);
             files[i].data[len] = '\0';
             files[i].size = len;
@@ -403,11 +462,8 @@ static int vfs_create_internal(const char *name, const char *initial_data, uint3
     }
     for (int i = 0; i < FS_MAX_FILES; ++i) {
         if (!files[i].used) {
-            if (!files[i].data) {
-                files[i].data = (char *)kmalloc(FS_DATA_MAX);
-                if (!files[i].data) return -1;
-            }
-            files[i].used = 1;
+            { int e = ensure_cap(i, len + 1, 0); if (e) return e; }
+            files[i].used = 1; files[i].spilled = 0; files[i].ram_only = 0;
             files[i].dirty = !is_ephemeral_path(name);
             str_copy(files[i].name, name, FS_NAME_MAX);
             files[i].size = 0;
@@ -433,33 +489,32 @@ static void vfs_format_unlocked(void)
     static uint8_t zero_buf[512] __attribute__((aligned(16)));
     memset(zero_buf, 0, sizeof(zero_buf));
 
-    uint32_t fs_total_sectors = 1 + FS_MAX_FILES * FS_SECTORS_PER_FILE;
+    uint32_t fs_total_sectors = 1 + FS_DISK_SLOTS * FS_SECTORS_PER_FILE;
     for (uint32_t s = 0; s < fs_total_sectors; ++s) {
         virtio_blk_write(FS_SUPER_LBA + s, zero_buf);
     }
     virtio_blk_write(FS_CHECKPOINT_LBA - 1, zero_buf);
 
     for (int i = 0; i < FS_MAX_FILES; ++i) {
+        if (files[i].spilled) fs_spill_del(i);
         files[i].used = 0;
         files[i].size = 0;
         files[i].dirty = 0;
+        files[i].spilled = 0; files[i].ram_only = 0;
         files[i].name[0] = '\0';
-        if (files[i].data) {
-            kfree(files[i].data);
-            files[i].data = 0;
-        }
+        drop_data(i);
     }
 
     /* 1. Archivos Base de Sistema */
     VFS_CREATE_LIT("/etc/hostname", "soma-node1\n");
-    VFS_CREATE_LIT("/etc/os-release", "NAME=SOMA\nVERSION=0.2-release\nARCH=" MYOS_ARCH_NAME "\nSTORAGE=virtio-blk-v2 (64 inodos / 16 KiB)\nDESCRIPTION=Sistema Operativo Multi-Agente\n");
+    VFS_CREATE_LIT("/etc/os-release", "NAME=SOMA\nVERSION=0.2-release\nARCH=" MYOS_ARCH_NAME "\nSTORAGE=virtio-blk-v2 (256 archivos, grandes en BIGFS)\nDESCRIPTION=Sistema Operativo Multi-Agente\n");
     VFS_CREATE_LIT("/sys/status.txt", "KERNEL: SOMA " MYOS_ARCH_NAME " | VIRTIO: OK | NETWORK: 10.0.2.15 | STORAGE: PERSISTENT V2\n");
 
     const char *init_code = "#!/bin/soma\n# SOMA Init Script\nexport MOTD=\"SOMA Bare-Metal Core Activo\"\necho \"$MOTD ($HOST en $ARCH)\"\n";
     vfs_create_internal("/etc/init.sh", init_code, str_len(init_code));
     VFS_CREATE_LIT("/etc/soma_manifest.txt", "Identity: SOMA AI Kernel (Nail-35b)\nRole: Multi-Agent System Core Intelligence\nStatus: Fully Operational (VFS V2 Active)\n");
     VFS_CREATE_LIT("/etc/mem_user.txt", "Usuario: Marcos | Rol: Administrador y Arquitecto Principal del Sistema SOMA | Preferencias: Respuestas tecnicas concisas, directas y veraces.\n");
-    VFS_CREATE_LIT("/etc/mem_hw.txt", "CPU: 64-bit Ring 0 | RAM: 512 MiB | IP: 10.0.2.15 | Almacenamiento: virtio-blk (SOMAFS02: 64 inodos / 16 KiB)\n");
+    VFS_CREATE_LIT("/etc/mem_hw.txt", "CPU: 64-bit Ring 0 | RAM: 512 MiB | IP: 10.0.2.15 | Almacenamiento: virtio-blk (SOMAFS02: 256 archivos, sin limite de 16 KiB)\n");
 
     /* 2. Directorio de Usuario */
     VFS_CREATE_LIT("/mis_archivos/bienvenida.txt", "Carpeta personal del usuario Marcos.\nEspacio destinado a documentos, proyectos y notas personales.\n");
@@ -562,7 +617,7 @@ void vfs_init(void)
         files[i].size = 0;
         files[i].dirty = 0;
         files[i].name[0] = '\0';
-        files[i].data = 0;
+        files[i].data = 0; files[i].cap = 0; files[i].spilled = 0; files[i].ram_only = 0;
     }
 
     fs_initialized = 1;
@@ -572,14 +627,16 @@ void vfs_init(void)
     if (virtio_blk_read(FS_SUPER_LBA, &sb) == 0 &&
         memcmp(sb.magic, "SOMAFS02", 8) == 0 &&
         sb.version == 2 &&
-        sb.max_files == FS_MAX_FILES &&
-        sb.num_files <= FS_MAX_FILES) {
-        kprint("VFS: Sistema de archivos persistente detectado (SOMAFS02 - 64 inodos / 16 KiB)\n");
+        sb.max_files == FS_DISK_SLOTS &&
+        sb.num_files <= FS_DISK_SLOTS) {
+        kprint("VFS: Sistema de archivos persistente detectado (SOMAFS02: 256 archivos, sin limite de 16 KiB; los grandes en BIGFS)\n");
         int loaded = 0;
-        for (int i = 0; i < FS_MAX_FILES; ++i) {
+        for (int i = 0; i < FS_DISK_SLOTS; ++i) {
             int r = load_file_from_disk(i);
             if (r == 0 && files[i].used) loaded++;
         }
+        if (fs_spill_ready())                               /* PARCHE 087: archivos mas alla de las 64 ranuras */
+            for (int i = FS_DISK_SLOTS; i < FS_MAX_FILES; ++i) if (load_spill_slot(i) == 0) loaded++;
         kprint("VFS: "); kprint_dec((uint32_t)loaded); kprint(" archivos cargados desde virtio-blk (KHeap dinamico).\n");
         kprint("VFS: Directorios '/workspace/' y '/mis_archivos/' activos.\n");
 
@@ -592,7 +649,7 @@ void vfs_init(void)
         return;
     }
 
-    kprint("VFS: Formateando sistema de archivos de alta capacidad SOMAFS02 (64 inodos / 16 KiB)...\n");
+    kprint("VFS: Formateando SOMAFS02 (256 archivos; los grandes van a BIGFS)...\n");
     vfs_format();
     vfs_ensure_demo_files();
 }
@@ -630,11 +687,8 @@ static int vfs_write_core(const char *name, const char *data, uint32_t len)
     kmutex_lock(&vfs_mutex);
     for (int i = 0; i < FS_MAX_FILES; ++i) {
         if (files[i].used && vfs_names_equal(files[i].name, name)) {
-            if (len > FS_DATA_MAX - 1) { kmutex_unlock(&vfs_mutex); return -2; }
-            if (!files[i].data) {
-                files[i].data = (char *)kmalloc(FS_DATA_MAX);
-                if (!files[i].data) { kmutex_unlock(&vfs_mutex); return -1; }
-            }
+            if (len > FS_FILE_MAX) { kmutex_unlock(&vfs_mutex); return -2; }
+            { int e = ensure_cap(i, len + 1, 0); if (e) { kmutex_unlock(&vfs_mutex); return e; } }
             if (data && len > 0) memcpy(files[i].data, data, len);
             files[i].data[len] = '\0';
             files[i].size = len;
@@ -696,10 +750,7 @@ int vfs_delete(const char *name)
             files[i].size = 0;
             files[i].name[0] = '\0';
             files[i].dirty = 1;
-            if (files[i].data) {
-                kfree(files[i].data);
-                files[i].data = 0;
-            }
+            drop_data(i);
             int r = vfs_sync_unlocked();
             kmutex_unlock(&vfs_mutex);
             return r != 0 ? -1 : 0;
@@ -756,7 +807,7 @@ void vfs_list_ext(int show_all, const char *filter_dir)
         kprint("  /dev/null, /dev/zero, /dev/urandom, /dev/rtc\n");
     }
     kprint("--------------------------------------------------\n");
-    kprint("Total: "); kprint_dec((uint32_t)count); kprint(" archivos visibles (Capacidad: 64 inodos / 16 KiB por archivo).\n\n");
+    kprint("Total: "); kprint_dec((uint32_t)count); kprint(" archivos visibles (Capacidad: 256 archivos, sin limite de 16 KiB).\n\n");
     kmutex_unlock(&vfs_mutex);
 }
 
@@ -1170,7 +1221,7 @@ void vfs_tree_ext(int show_all, char *out_buf, uint32_t max)
     kmutex_lock(&vfs_mutex);
     uint32_t pos = 0;
     const char *hdr = show_all
-        ? "/ (SOMAFS02 - 64 Inodos / 16 KiB - Arbol Completo)\n+-- dev/\n|   +-- null\n|   +-- zero\n|   +-- urandom\n|   +-- rtc\n+-- proc/\n|   +-- version\n|   +-- uptime\n|   +-- meminfo\n|   +-- cpuinfo\n|   +-- threads\n|   +-- net/\n|       +-- dev\n|       +-- arp\n"
+        ? "/ (SOMAFS02 - 256 archivos - Arbol Completo)\n+-- dev/\n|   +-- null\n|   +-- zero\n|   +-- urandom\n|   +-- rtc\n+-- proc/\n|   +-- version\n|   +-- uptime\n|   +-- meminfo\n|   +-- cpuinfo\n|   +-- threads\n|   +-- net/\n|       +-- dev\n|       +-- arp\n"
         : "/ (SOMAFS02 - Archivos Visibles)\n";
 
     kprint(hdr);
@@ -1261,10 +1312,52 @@ int vfs_checkpoint_restore(void)
         }
     }
 
-    for (int i = 0; i < FS_MAX_FILES; ++i) {
+    for (int i = 0; i < FS_DISK_SLOTS; ++i) {
         load_file_from_disk(i);
     }
 
     kmutex_unlock(&vfs_mutex);
     return 0;
+}
+
+/* ================================================================== PARCHE 087: archivos de cualquier tamano */
+int vfs_size(const char *name)
+{
+    if (!fs_initialized) vfs_init();
+    if (!name) return -1;
+    if (is_proc_path(name) || is_dev_path(name)) { static char t[FS_DATA_MAX]; int r = vfs_read(name, t, sizeof t); return r; }
+    kmutex_lock(&vfs_mutex);
+    int r = -1;
+    for (int i = 0; i < FS_MAX_FILES; ++i) if (files[i].used && vfs_names_equal(files[i].name, name)) { r = (int)files[i].size; break; }
+    kmutex_unlock(&vfs_mutex);
+    return r;
+}
+char *vfs_read_alloc(const char *name, uint32_t *len_out)
+{
+    if (len_out) *len_out = 0;
+    if (!fs_initialized) vfs_init();
+    if (!name) return 0;
+    if (is_proc_path(name) || is_dev_path(name)) {
+        char *b = (char *)kmalloc(FS_DATA_MAX + 1); if (!b) return 0;
+        int r = vfs_read(name, b, FS_DATA_MAX + 1); if (r < 0) { kfree(b); return 0; }
+        if (len_out) *len_out = (uint32_t)r;
+        return b;
+    }
+    kmutex_lock(&vfs_mutex);
+    char *b = 0;
+    for (int i = 0; i < FS_MAX_FILES; ++i) {
+        if (files[i].used && vfs_names_equal(files[i].name, name)) {
+            if (!files[i].data && files[i].size) break;
+            b = (char *)kmalloc((size_t)files[i].size + 1);
+            if (b) { if (files[i].size) memcpy(b, files[i].data, files[i].size); b[files[i].size] = 0; if (len_out) *len_out = files[i].size; }
+            break;
+        }
+    }
+    kmutex_unlock(&vfs_mutex);
+    return b;
+}
+int vfs_big_persist(void)
+{
+    if (virtio_blk_capacity() == 0) return -1;
+    return fs_spill_ready() ? 1 : 0;
 }

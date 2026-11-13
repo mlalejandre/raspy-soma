@@ -15,7 +15,7 @@
 extern void gui_open_browser(const char *path) __attribute__((weak));
 uint64_t timer_get_uptime_ms(void);
 
-#define NP_MAX_SIZE 16384
+#define NP_MAX_SIZE 131072                 /* PARCHE 087: 128 KiB (antes 16 KiB, el tope de RamFS) */
 static char np_text[NP_MAX_SIZE];
 static uint32_t np_len = 0;
 static uint32_t np_cursor = 0;
@@ -494,7 +494,7 @@ static void np_geo_of(struct np_geo *g, uint32_t win_x, uint32_t win_y, uint32_t
     np_cols_last = g->cols;
 }
 
-static uint16_t np_rows[NP_MAX_SIZE + 2];   /* inicio (indice en np_text) de cada fila visual */
+static uint32_t np_rows[NP_MAX_SIZE + 2];   /* inicio (indice en np_text) de cada fila visual */
 static uint32_t np_nrows = 1;
 
 static inline uint32_t np_step(uint32_t i)
@@ -514,11 +514,11 @@ static void np_layout(uint32_t cols)
     np_rows[n++] = 0;
     while (i < np_len) {
         uint8_t c = (uint8_t)np_text[i];
-        if (c == '\n') { i++; np_rows[n++] = (uint16_t)i; col = 0; brk = 0; continue; }
+        if (c == '\n') { i++; np_rows[n++] = (uint32_t)i; col = 0; brk = 0; continue; }
         uint32_t a = np_adv(c, col);
         if (col + a > cols && col > 0) {
             uint32_t start = (brk > np_rows[n - 1]) ? brk : i;
-            np_rows[n++] = (uint16_t)start;
+            np_rows[n++] = (uint32_t)start;
             col = 0;
             for (uint32_t k = start; k < i; k += np_step(k)) col += np_adv((uint8_t)np_text[k], col);
             brk = 0;

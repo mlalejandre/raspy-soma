@@ -32,6 +32,10 @@ struct tcb {
     /* SOMA_PARCHE_015_PROC: proceso de usuario asociado (0 = hilo de kernel puro) */
     void           *uproc;
     uint64_t        kstack_top;     /* cima de la pila de kernel del hilo */
+    /* PARCHE 089: Monitor del sistema */
+    uint64_t        cyc_total;      /* ciclos en CPU */
+    uint64_t        cyc_start;      /* inicio de la rodaja actual */
+    uint8_t         owner;          /* dueno (acct.h) */
 } __attribute__((aligned(16)));
 
 /* Ganchos de arquitectura (los implementa usermode.c; en AArch64 son vacios):
