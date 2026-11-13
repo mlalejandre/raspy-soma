@@ -13,10 +13,13 @@
 #include "console.h"
 #include "fs.h"
 #include "coder_app.h"
+#include "coder_demo.h"
 #include "web_net.h"   /* PARCHE 087 */
 #include "mem.h"
 #include "thread.h"
 #include "panic.h"
+#include "agent_policy.h"                              /* PARCHE 110 */
+#include "conc_test.h"                                  /* PARCHE 111 */
 #include "mutex.h"
 #include "mutex.h"
 #include "pmm.h"
@@ -253,6 +256,18 @@ static int *agent_mode_ptr(void)
 #define agent_dispatch_mode (*agent_mode_ptr())
 
 int dispatch_command(const char *cmd_line, char *out_buf, uint32_t max_out);
+
+/* PARCHE 110: politica de escritura de los agentes (ver agent_policy.h). Devuelve 1 (y avisa) si el agente intenta modificar una ruta protegida. */
+static void fb_puts(char *out, uint32_t max, uint32_t *pos, const char *s);
+volatile uint32_t agent_denied_writes;
+static int agent_write_denied(const char *path, const char *cmd, char *out_buf, uint32_t max_out)
+{
+    if (!agent_dispatch_mode || !agent_path_protected(path)) return 0;
+    agent_denied_writes++;
+    kprint("[SEGURIDAD AGENTE] "); kprint(cmd); kprint(": denegado, los agentes no pueden modificar /etc, /sys, /bin ni /boot.\n");
+    if (out_buf && max_out) { uint32_t pp = 0; fb_puts(out_buf, max_out, &pp, "Error: Operacion denegada por politica de seguridad."); }
+    return 1;
+}
 
 int dispatch_agent_command(const char *cmd_line, char *out_buf, uint32_t max_out)
 {
@@ -1472,6 +1487,7 @@ static int cmd_fat(const char *args, char *out_buf, uint32_t max_out)
                 char *fbuf = 0;
                 int r = dst ? fat_stat(&v, pa, &st) : FAT_E_ARG;
                 if (!dst) fb_puts(b, sizeof b, &p, "fat get: falta el destino\n");
+                else if (agent_write_denied(dst, "fat get", 0, 0)) fb_puts(b, sizeof b, &p, "fat get: destino protegido (los agentes no pueden modificar /etc, /sys, /bin ni /boot)\n");
                 else if (r != 0) { fb_puts(b, sizeof b, &p, "fat get: "); fb_puts(b, sizeof b, &p, fat_err_str(r)); fb_putc(b, sizeof b, &p, '\n'); }
                 else if (st.is_dir) fb_puts(b, sizeof b, &p, "fat get: es un directorio\n");
                 else if (st.size > FS_FILE_MAX) { fb_puts(b, sizeof b, &p, "fat get: "); fb_put_dec(b, sizeof b, &p, st.size); fb_puts(b, sizeof b, &p, " bytes no caben en el VFS (maximo 32 MiB)\n"); }
@@ -1822,6 +1838,43 @@ static struct kmutex dl_a, dl_b;
 static int dl_launched = 0;
 static void dl_thread1(void *arg) { (void)arg; kmutex_lock(&dl_a); thread_sleep(100); kmutex_lock(&dl_b); kmutex_unlock(&dl_b); kmutex_unlock(&dl_a); }
 static void dl_thread2(void *arg) { (void)arg; kmutex_lock(&dl_b); thread_sleep(100); kmutex_lock(&dl_a); kmutex_unlock(&dl_a); kmutex_unlock(&dl_b); }
+
+/* PARCHE 111: prueba de estres de concurrencia (mutex + heap + VFS) con seis hilos */
+static int cmd_conctest(const char *args, char *out_buf, uint32_t max_out)
+{
+    (void)args;
+    uint32_t pos = 0;
+    int ok = conc_selftest();
+    fb_puts(out_buf, max_out, &pos, ok ? "conctest: TODO OK (detalle en la consola)" : "conctest: HAY FALLOS (detalle en la consola)");
+    return 1;
+}
+
+static int cmd_fscrash(const char *args, char *out_buf, uint32_t max_out)
+{
+    (void)args;
+    uint32_t pos = 0;
+    int ok = vfs_crash_selftest();
+    fb_puts(out_buf, max_out, &pos, ok ? "fscrash: TODO OK (detalle en la consola)" : "fscrash: HAY FALLOS (detalle en la consola)");
+    return 1;
+}
+
+static int cmd_fscheck(const char *args, char *out_buf, uint32_t max_out)
+{
+    (void)args;
+    uint32_t pos = 0;
+    int bad = vfs_fscheck();
+    fb_puts(out_buf, max_out, &pos, bad == 0 ? "fscheck: disco correcto (detalle en la consola)" : "fscheck: HAY PROBLEMAS (detalle en la consola)");
+    return 1;
+}
+
+static int cmd_demo_ai(const char *args, char *out_buf, uint32_t max_out)
+{
+    uint32_t pos = 0;
+    int vivo = args && args[0] == 'v';
+    int ok = coder_demo_run(vivo);
+    fb_puts(out_buf, max_out, &pos, ok ? "demo_ai: TODO OK (detalle en la consola)" : "demo_ai: HAY FALLOS (detalle en la consola)");
+    return 1;
+}
 
 static int cmd_deadlock(const char *args, char *out_buf, uint32_t max_out)
 {
@@ -2236,6 +2289,7 @@ static int cmd_write(const char *args, char *out_buf, uint32_t max_out)
     fn[fi] = '\0';
     while (*args == ' ') args++;
 
+    if (agent_write_denied(fn, "write", out_buf, max_out)) return 1;       /* PARCHE 110: toda la zona protegida, no solo dos archivos */
     if (agent_dispatch_mode && (str_eq(fn, "/etc/init.sh") || str_eq(fn, "/etc/soma_manifest.txt"))) {
         kprint("write: operacion denegada por seguridad (Agente no puede modificar scripts de arranque).\n");
         uint32_t pos = 0; fb_puts(out_buf, max_out, &pos, "Error: Operacion denegada por politica de seguridad.");
@@ -2312,6 +2366,7 @@ static int cmd_rm(const char *args, char *out_buf, uint32_t max_out)
         fb_puts(out_buf, max_out, &pos, "Error: falta el nombre del archivo.");
         return 1;
     }
+    if (agent_write_denied(args, "rm", out_buf, max_out)) return 1;
     int r = vfs_delete(args);
     if (r == 0) {
         kprint("Eliminado '"); kprint(args); kprint("'\n");
@@ -2333,6 +2388,7 @@ static int cmd_cp(const char *args, char *out_buf, uint32_t max_out)
     while (*args == ' ') args++;
     while (*args && *args != ' ' && di < sizeof(dst) - 1) dst[di++] = *args++;
     dst[di] = '\0';
+    if (agent_write_denied(dst, "cp", out_buf, max_out)) return 1;
     uint32_t rl = 0; char *cp_buf = vfs_read_alloc(src, &rl);   /* PARCHE 087: antes copiaba solo los primeros 4 KiB */
     uint32_t pos = 0;
     if (!cp_buf) { kprint("cp: origen no encontrado\n"); fb_puts(out_buf, max_out, &pos, "cp: error (no existe o sin memoria)"); }
@@ -2351,6 +2407,7 @@ static int cmd_mv(const char *args, char *out_buf, uint32_t max_out)
     while (*args == ' ') args++;
     while (*args && *args != ' ' && di < sizeof(dst) - 1) dst[di++] = *args++;
     dst[di] = '\0';
+    if (agent_write_denied(src, "mv", out_buf, max_out) || agent_write_denied(dst, "mv", out_buf, max_out)) return 1;
     uint32_t rl = 0; char *mv_buf = vfs_read_alloc(src, &rl);   /* PARCHE 087 */
     uint32_t pos = 0;
     if (!mv_buf) { kprint("mv: origen no encontrado\n"); fb_puts(out_buf, max_out, &pos, "mv: error (no existe o sin memoria)"); }
@@ -2364,6 +2421,7 @@ static int cmd_touch(const char *args, char *out_buf, uint32_t max_out)
 {
     while (*args == ' ') args++;
     char tmp[8]; uint32_t pos = 0;
+    if (agent_write_denied(args, "touch", out_buf, max_out)) return 1;
     if (vfs_read(args, tmp, sizeof(tmp)) < 0) { vfs_write(args, "", 0); kprint("touch: creado\n"); fb_puts(out_buf, max_out, &pos, "touch: OK"); }
     else { kprint("touch: ya existe\n"); fb_puts(out_buf, max_out, &pos, "touch: existe"); }
     return 1;
@@ -3445,6 +3503,7 @@ static int cmd_descargar(const char *args, char *out_buf, uint32_t max_out)
         for (n = 0; nm[n] && l < sizeof dst - 1; n++) dst[l++] = nm[n];
         dst[l] = 0;
     }
+    if (agent_write_denied(dst, "descargar", out_buf, max_out)) return 1;
     struct wn_req rq; struct wn_resp rs; memset(&rq, 0, sizeof rq); memset(&rs, 0, sizeof rs);
     rq.url = url; rq.timeout_ms = 30000; rq.max_body = 24u << 20; rq.want_binary = 1;
     if (wn_fetch(&rq, &rs) != 0 || !rs.body) { fb_puts(rep, sizeof rep, &p, "descargar: error de red "); fb_puts(rep, sizeof rep, &p, rs.err); wn_free(&rs); { fb_puts(rep, sizeof rep, &p, "\n"); shell_emit(rep, out_buf, max_out); } return 1; }
@@ -4627,6 +4686,10 @@ static const struct command_entry cmd_table[] = {
     { "df",           cmd_df,           CMD_F_SAFE,   "Capacidad de almacenamiento y estado de RamFS" },
     { "stats",        cmd_stats,        CMD_F_SAFE,   "Estadisticas de paquetes y bytes VirtIO-NET" },
     { "heap",         cmd_heap,         CMD_F_SAFE,   "Telemetria y auto-test del KHeap dinamico" },
+    { "demo_ai",      cmd_demo_ai,      CMD_F_NORMAL, "DEMO: la IA escribe un programa, las pruebas detectan sus fallos y los corrige (demo_ai vivo = con el LLM real)" },
+    { "fscrash",      cmd_fscrash,      CMD_F_NORMAL, "DEPURACION: simula cortes de energia al guardar y comprueba que ningun archivo queda a medias" },
+    { "fscheck",      cmd_fscheck,      CMD_F_NORMAL, "Comprueba el disco del VFS: cabeceras y CRC de cada archivo" },
+    { "conctest",     cmd_conctest,     CMD_F_NORMAL, "DEPURACION: prueba de estres de concurrencia (6 hilos: mutex, heap y VFS)" },
     { "deadlock",     cmd_deadlock,     CMD_F_NORMAL, "DEPURACION: provoca un interbloqueo de dos hilos para probar su deteccion" },
     { "mutex",        cmd_mutex,        CMD_F_SAFE,   "Estado de los mutex del kernel: propietario, esperando, interbloqueos" },
     { "audio",        cmd_audio,        CMD_F_NORMAL, "Audio: audio info|tone [hz] [ms]|test|play <ruta.wav>|stop|vol N|stat" },
@@ -5378,6 +5441,7 @@ static int dispatch_command_inner(const char *cmd_line, char *out_buf, uint32_t 
                 while (*p && *p != ' ' && dp < 63) dst_file[dp++] = *p++;
                 dst_file[dp] = '\0';
 
+                if (sp > 0 && dp > 0 && agent_write_denied(dst_file, "redireccion", out_buf, max_out)) { kfree(sub_cmd); ret_val = 1; goto cleanup; }
                 if (sp > 0 && dp > 0) {
                     redir_active = 1; console_muted = 1; redir_buf[0] = '\0';
                     int res = dispatch_command(sub_cmd, redir_buf, 16384);

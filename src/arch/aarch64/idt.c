@@ -21,6 +21,15 @@ void arm64_exception_handler(uint64_t type, uint64_t *regs)
     __asm__ volatile ("mrs %0, elr_el1" : "=r"(elr));
     __asm__ volatile ("mrs %0, spsr_el1" : "=r"(spsr));
 
+    {   /* PARCHE 109: excepcion DURANTE el informe de panico: no reentrar; detener de forma observable */
+        console_capture_abort();   /* PARCHE 116: un panico nunca queda dentro de una captura de pruebas */
+        int nivel = panic_enter();
+        if (nivel >= 1) {
+            if (nivel == 1) kprint("\n[PANICO ANIDADO] otra excepcion durante el informe: sistema detenido\n");
+            qemu_exit(0x23);
+            for (;;) arch_halt();
+        }
+    }
     kprint("\n\n========================================================================\n");
     kprint("!!! KERNEL PANIC: EXCEPCION CPU AARCH64 DETECTADA !!!\n");
     kprint("========================================================================\n");

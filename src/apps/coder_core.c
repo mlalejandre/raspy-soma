@@ -339,12 +339,14 @@ int cc_normalize(char *src, uint32_t *len, uint32_t cap)
 
 /* ------------------------------------------------------------------ verificacion */
 struct verdict {
-    int      compiles, hard, warns, issues, truncated, unchanged;
+    int      compiles, hard, warns, issues, truncated, unchanged, tfail, tpass;
     uint32_t line, bc;
-    char     msg[160], token[48], issue[200], ltext[120];
+    char     msg[160], token[48], issue[300], ltext[120];
     int      score;
 };
 static uint8_t g_bc[65536];
+static const struct cc_env *g_te;      /* PARCHE 116: entorno con pruebas durante cc_run */
+static char g_tout[4096];
 static struct soma_lint_report g_rep;
 
 static int balance(const char *s, uint32_t n, int *str_open)
@@ -361,6 +363,52 @@ static int balance(const char *s, uint32_t n, int *str_open)
     *str_open = q != 0;
     return b;
 }
+/* PARCHE 116: compara ignorando espacios y saltos de linea finales */
+static int out_equal(const char *a, const char *b)
+{
+    uint32_t la = cl(a), lb = cl(b);
+    while (la && (a[la - 1] == '\n' || a[la - 1] == ' ' || a[la - 1] == '\r')) la--;
+    while (lb && (b[lb - 1] == '\n' || b[lb - 1] == ' ' || b[lb - 1] == '\r')) lb--;
+    if (la != lb) return 0;
+    for (uint32_t i = 0; i < la; i++) if (a[i] != b[i]) return 0;
+    return 1;
+}
+static void oneline(char *d, uint32_t cap, const char *s, uint32_t maxc)
+{
+    uint32_t n = 0; d[0] = 0;
+    for (uint32_t i = 0; s[i] && n + 4 < cap && i < maxc; i++) { char c = s[i]; if (c == '\n') { d[n++] = '\\'; d[n++] = 'n'; } else if (c == '\r') continue; else d[n++] = c; }
+    if (s[0] && cl(s) > maxc && n + 4 < cap) { d[n++] = '.'; d[n++] = '.'; d[n++] = '.'; }
+    d[n] = 0;
+}
+/* Ejecuta el bytecode g_bc[0..bl) contra los casos de prueba; rellena tpass/tfail y describe el PRIMER fallo en v->issue. */
+static uint32_t g_tm_hash; static int g_tm_valid, g_tm_pass, g_tm_fail; static char g_tm_issue[300];
+static void run_tests(uint32_t bl, struct verdict *v)
+{
+    const struct cc_env *e = g_te;
+    v->tpass = v->tfail = 0;
+    if (!e || !e->run || !e->tests || e->ntests <= 0) return;
+    uint32_t h = chash((const char *)g_bc, bl);                      /* mismo bytecode: mismo resultado (verify se llama varias veces por candidato) */
+    if (g_tm_valid && g_tm_hash == h) { v->tpass = g_tm_pass; v->tfail = g_tm_fail; ccat(v->issue, sizeof v->issue, g_tm_issue); if (v->tfail) v->issues++; return; }
+    for (int i = 0; i < e->ntests; i++) {
+        const struct cc_test *t = &e->tests[i];
+        g_tout[0] = 0;
+        int rc = e->run(g_bc, bl, t->input ? t->input : "", g_tout, sizeof g_tout);
+        if (rc == 0 && out_equal(g_tout, t->expect)) { v->tpass++; continue; }
+        v->tfail++;
+        if (v->tfail == 1) {
+            char a[96], b[96], c[96];
+            oneline(a, sizeof a, t->input ? t->input : "", 60); oneline(b, sizeof b, t->expect, 80); oneline(c, sizeof c, g_tout, 80);
+            ccat(v->issue, sizeof v->issue, "La prueba '"); ccat(v->issue, sizeof v->issue, t->name ? t->name : "?"); ccat(v->issue, sizeof v->issue, "' FALLA");
+            if (rc != 0) ccat(v->issue, sizeof v->issue, " (el programa no termina bien: error de ejecucion o bucle infinito)");
+            ccat(v->issue, sizeof v->issue, ". Entrada: \""); ccat(v->issue, sizeof v->issue, a);
+            ccat(v->issue, sizeof v->issue, "\". Salida esperada: \""); ccat(v->issue, sizeof v->issue, b);
+            ccat(v->issue, sizeof v->issue, "\". Salida obtenida: \""); ccat(v->issue, sizeof v->issue, c); ccat(v->issue, sizeof v->issue, "\". ");
+        }
+    }
+    if (v->tfail) { v->issues++; if (v->tfail > 1) { ccat(v->issue, sizeof v->issue, "Fallan "); cnum(v->issue, sizeof v->issue, (uint32_t)v->tfail); ccat(v->issue, sizeof v->issue, " pruebas en total. "); } }
+    g_tm_valid = 1; g_tm_hash = h; g_tm_pass = v->tpass; g_tm_fail = v->tfail; g_tm_issue[0] = 0; ccat(g_tm_issue, sizeof g_tm_issue, v->issue);
+}
+
 static void verify(const char *src, uint32_t n, int gui, const char *orig, uint32_t orig_n, struct verdict *v)
 {
     uint32_t bl = 0; int so = 0;
@@ -398,13 +446,15 @@ static void verify(const char *src, uint32_t n, int gui, const char *orig, uint3
     if (cfind(src, "win.create") && !cfind(src, "win.present")) { ccat(v->issue, sizeof v->issue, "Falta win.present() en el bucle de dibujo. "); v->issues++; }
     if (cfind(src, "win.create") && !cfind(src, "win.active")) { ccat(v->issue, sizeof v->issue, "Falta el bucle while (win.active()) { ... }. "); v->issues++; }
     if (orig && orig_n && orig_n == n) { uint32_t i = 0; while (i < n && orig[i] == src[i]) i++; if (i == n) { v->unchanged = 1; ccat(v->issue, sizeof v->issue, "El codigo es IDENTICO al original: no se aplico el cambio pedido. "); v->issues++; } }
-    v->score = (v->compiles ? 0 : 1000) + v->hard * 100 + v->issues * 60 + v->warns * 3;
+    if (v->compiles && !gui && v->hard == 0 && !v->truncated) run_tests(v->bc, v);
+    v->score = (v->compiles ? 0 : 1000) + v->hard * 100 + v->issues * 60 + v->warns * 3 + v->tfail * 300;
 }
 static int verdict_ok(const struct verdict *v) { return v->compiles && v->hard == 0 && v->issues == 0; }
 
 static const char *hint_for(const struct verdict *v)
 {
     const char *m = v->msg;
+    if (v->tfail) return "El programa COMPILA pero no produce la salida esperada en las pruebas: compara la salida obtenida con la esperada, localiza el error de logica (limites de bucle, condiciones, orden, formato) y corrigelo sin cambiar lo demas.";
     for (const char *t = v->ltext; t[0] && t[1] && t[2]; t++)
         if (t[0] >= '0' && t[0] <= '9' && t[1] == '.' && t[2] >= '0' && t[2] <= '9') return "SOMA-LANG solo tiene ENTEROS: no escribas decimales (1.5). Usa enteros escalados (15 decimas) o divisiones enteras.";
     if (cfind(v->ltext, "def ") || cfind(v->ltext, "):")) return "Eso es Python: las funciones son fn nombre(a) { ... } y los bloques van entre llaves.";
@@ -449,6 +499,17 @@ static void add_numbered(const char *src, uint32_t n, uint32_t center, int radiu
         line++;
     }
 }
+static void add_tests(void)       /* PARCHE 116: los casos de prueba forman parte del encargo */
+{
+    const struct cc_env *e = g_te;
+    if (!e || !e->run || !e->tests || e->ntests <= 0) return;
+    ccat(g_prompt, sizeof g_prompt, "\nPRUEBAS (el programa se ejecuta contra ellas; debe producir EXACTAMENTE esa salida):\n");
+    for (int i = 0; i < e->ntests; i++) {
+        char a[96], b[96]; oneline(a, sizeof a, e->tests[i].input ? e->tests[i].input : "", 60); oneline(b, sizeof b, e->tests[i].expect, 80);
+        ccat(g_prompt, sizeof g_prompt, "- "); ccat(g_prompt, sizeof g_prompt, e->tests[i].name ? e->tests[i].name : "caso");
+        ccat(g_prompt, sizeof g_prompt, ": entrada \""); ccat(g_prompt, sizeof g_prompt, a); ccat(g_prompt, sizeof g_prompt, "\" -> salida \""); ccat(g_prompt, sizeof g_prompt, b); ccat(g_prompt, sizeof g_prompt, "\"\n");
+    }
+}
 static void build_gen(const char *mission, const char *plan, int gui, int edit, const char *retry_note)
 {
     g_prompt[0] = 0;
@@ -464,6 +525,7 @@ static void build_gen(const char *mission, const char *plan, int gui, int edit, 
         ccat(g_prompt, sizeof g_prompt, "\n```\n");
     }
     ccat(g_prompt, sizeof g_prompt, "\nTAREA: "); ccat(g_prompt, sizeof g_prompt, mission);
+    add_tests();
     if (plan && plan[0]) { ccat(g_prompt, sizeof g_prompt, "\nPLAN: "); ccat(g_prompt, sizeof g_prompt, plan); }
     if (retry_note && retry_note[0]) { ccat(g_prompt, sizeof g_prompt, "\nNOTA: "); ccat(g_prompt, sizeof g_prompt, retry_note); }
     ccat(g_prompt, sizeof g_prompt, "\n\nResponde SOLO con el programa COMPLETO dentro de un bloque ```soma ... ```. Sin explicaciones, sin '...', sin omitir partes.");
@@ -475,6 +537,7 @@ static void build_repair(const char *mission, const char *cand, uint32_t n, cons
     ccat(g_prompt, sizeof g_prompt, REF);
     add_lessons();
     ccat(g_prompt, sizeof g_prompt, "\nTAREA: "); ccat(g_prompt, sizeof g_prompt, mission);
+    add_tests();
     ccat(g_prompt, sizeof g_prompt, "\n\nPROBLEMAS DETECTADOS:\n");
     if (!v->compiles) {
         ccat(g_prompt, sizeof g_prompt, "- Error del compilador en la linea "); cnum(g_prompt, sizeof g_prompt, v->line);
@@ -577,8 +640,9 @@ static uint32_t take(const struct cc_env *e, struct cc_result *r, int gui, int e
     /* deja g_rep coherente con el candidato elegido (la reparacion lista sus errores) */
     verify(g_cand, best_n, gui, edit ? g_orig : 0, edit ? cl(g_orig) : 0, &tv);
     if (!v->compiles) { char m[220]; m[0] = 0; ccat(m, sizeof m, "Candidato: linea "); cnum(m, sizeof m, v->line); ccat(m, sizeof m, ": "); ccat(m, sizeof m, v->msg); if (v->ltext[0]) { ccat(m, sizeof m, "  |  "); ccatn(m, sizeof m, v->ltext, 70); } say(e, m); }
-    else if (v->issue[0]) { char m[220]; m[0] = 0; ccat(m, sizeof m, "Candidato compila; aviso: "); ccatn(m, sizeof m, v->issue, 180); say(e, m); }
+    else if (v->issue[0]) { char m[320]; m[0] = 0; ccat(m, sizeof m, "Candidato compila; aviso: "); ccatn(m, sizeof m, v->issue, 280); say(e, m); }
     else say(e, "Candidato correcto (compila y pasa las comprobaciones).");
+    if (v->compiles && e->run && e->tests && e->ntests > 0) { char m[96]; m[0] = 0; ccat(m, sizeof m, "Pruebas de comportamiento: "); cnum(m, sizeof m, (uint32_t)v->tpass); ccat(m, sizeof m, "/"); cnum(m, sizeof m, (uint32_t)e->ntests); ccat(m, sizeof m, " superadas."); say(e, m); }
     return best_n;
 }
 
@@ -589,7 +653,9 @@ int cc_run(const struct cc_env *e, const char *target, const char *mission, stru
 {
     if (g_busy) { for (uint32_t i = 0; i < sizeof *r; i++) ((char *)r)[i] = 0; ccpy(r->summary, sizeof r->summary, "El programador ya esta trabajando en otra tarea; espera a que termine."); return 0; }
     g_busy = 1;
+    g_te = e; g_tm_valid = 0;
     int ok = cc_run_inner(e, target, mission, r);
+    g_te = 0;
     g_busy = 0;
     return ok;
 }
@@ -645,6 +711,7 @@ static int cc_run_inner(const struct cc_env *e, const char *target, const char *
         return 0;
     }
     n = take(e, r, gui, edit, &v);
+    if (e->run && e->tests && e->ntests > 0) { r->tests_total = e->ntests; r->tests_first_fail = v.compiles ? v.tfail : e->ntests; }
     seen[nseen++] = chash(g_cand, n);
     if (v.score < bv.score) { bv = v; bn = n; cmove(g_best, g_cand, n + 1); }
 
@@ -704,7 +771,8 @@ static int cc_run_inner(const struct cc_env *e, const char *target, const char *
 
     /* 6. entrega: se escribe una sola vez y solo si es correcto */
     r->score = bv.score;
-    if (verdict_ok(&bv) || (bv.compiles && bv.hard == 0 && !bv.truncated && !bv.unchanged && bv.issues <= 1 && bv.score < 200)) {
+    if (r->tests_total) r->tests_pass = bv.compiles ? bv.tpass : 0;
+    if (bv.tfail == 0 && (verdict_ok(&bv) || (bv.compiles && bv.hard == 0 && !bv.truncated && !bv.unchanged && bv.issues <= 1 && bv.score < 200))) {
         if (e->write && e->write(target, g_best, bn) >= 0) {
             r->ok = 1; r->wrote = 1; r->bc_len = bv.bc;
             ccpy(r->summary, sizeof r->summary, verdict_ok(&bv) ? "Programa verificado y guardado." : "Programa guardado (compila; con un aviso).");

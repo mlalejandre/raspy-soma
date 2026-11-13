@@ -191,8 +191,22 @@ void console_clear(void)
 #endif
 }
 
+/* PARCHE 116: captura por hilo */
+static char *volatile cap_buf; static uint32_t cap_cap, cap_len; static struct tcb *volatile cap_owner; static const char *cap_in;
+void console_capture_begin(char *buf, uint32_t cap, const char *input)
+{
+    if (!buf || cap == 0) return;
+    buf[0] = 0; cap_cap = cap; cap_len = 0; cap_in = input ? input : ""; cap_owner = thread_current(); cap_buf = buf;
+}
+uint32_t console_capture_end(void) { uint32_t n = cap_len; cap_buf = 0; cap_owner = 0; cap_in = 0; return n; }
+void console_capture_abort(void) { cap_buf = 0; cap_owner = 0; cap_in = 0; }
+
 void kputc(char c)
 {
+    if (cap_buf && thread_current() == cap_owner) {
+        if (cap_len + 1 < cap_cap) { cap_buf[cap_len++] = c; cap_buf[cap_len] = 0; }
+        return;
+    }
     if (console_muted) return;
 #ifdef __x86_64__
     while ((inb(COM1 + 5) & 0x20) == 0) {}
@@ -691,6 +705,12 @@ static void redraw_prompt_line(const char *line, uint32_t len, uint32_t cursor, 
 int kgetline(char *buf, uint32_t max)
 {
     if (!buf || max == 0) return 0;
+    if (cap_buf && thread_current() == cap_owner) {          /* PARCHE 116: entrada simulada; sin mas lineas, linea vacia (nunca bloquea) */
+        uint32_t n = 0;
+        while (cap_in && *cap_in && *cap_in != '\n' && n + 1 < max) buf[n++] = *cap_in++;
+        if (cap_in && *cap_in == '\n') cap_in++;
+        buf[n] = 0; return (int)n;
+    }
 
     char line[CMD_LINE_MAX];
     char temp_line[CMD_LINE_MAX];

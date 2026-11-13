@@ -137,6 +137,7 @@ void kernel_main(void)
 
     /* SOMA_PARCHE_021_FPU: /autoexec.cmd del almacen grande (si existe), antes de la GUI */
     if (bigfs_sys_autoexec(run_autoexec_line)) kprint("[AUTOEXEC] terminado\n");
+    vfs_killtest_boot();                                /* PARCHE 114: solo actua si el disco lleva la marca de tools/killtest.py */
 
 #ifdef __aarch64__
     sd_autostart();                                     /* PARCHE 061: tarjeta SD (Pi 5) */

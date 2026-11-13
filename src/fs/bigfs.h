@@ -12,7 +12,7 @@
  *   data_start..        clusteres de 4 KiB (8 sectores)
  * Cada inodo cabe en UN sector y lleva su CRC32: cada operacion de metadatos se confirma con UNA escritura
  * atomica de sector, asi que un corte de energia en cualquier punto deja el disco consistente
- * (sin diario). Los datos se escriben ANTES que el inodo que los referencia; el bitmap de clusteres no se
+ * (sin diario). Los datos se escriben ANTES que el inodo que los referencia (con `flush` opcional como barrera entre ambos); el bitmap de clusteres no se
  * guarda: se reconstruye al montar a partir de los extents de los inodos (no hay fugas por cortes).
  * Archivos = hasta BIGFS_MAX_EXTENTS extents contiguos. Directorios reales (puntero al padre en el inodo).
  * El nucleo es neutro de arquitectura: el dispositivo y la memoria los aporta quien lo use (struct bigfs_dev). */
@@ -57,6 +57,7 @@ struct bigfs_dev {
     uint64_t (*now)(void *ctx);            /* opcional */
     void (*lock)(void *ctx);               /* opcionales */
     void (*unlock)(void *ctx);
+    int (*flush)(void *ctx);               /* opcional (PARCHE 115): barrera de escritura; vuelve cuando todo lo escrito antes es DURABLE */
 };
 
 struct bigfs_stat {

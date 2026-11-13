@@ -46,4 +46,11 @@ void     watchdog_tick(uint64_t now_ms, uint64_t pc, uint64_t fp, uint64_t sp); 
 uint32_t watchdog_trips(void);
 uint64_t watchdog_last_beat_ms(void);
 
+
+/* PARCHE 109: guarda de panico anidado. El manejador de excepciones llama a panic_enter() al empezar el informe: devuelve 0 la primera vez
+ * y el nivel de anidamiento (1, 2, ...) si una excepcion ocurre MIENTRAS se imprime el informe (p. ej. una pila corrupta o una consola rota).
+ * Sin esta guarda el manejador se reentraba a si mismo hasta desbordar la pila: triple fallo y reinicio en bucle, sin ningun diagnostico. */
+int  panic_enter(void);
+void panic_reset(void);   /* solo para pruebas */
+
 #endif

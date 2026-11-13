@@ -69,6 +69,7 @@ int virtio_blk_read(uint64_t sector, void *buf)
     return 0;
 }
 uint64_t virtio_blk_capacity(void) { return DISK_SECTORS; }   /* PARCHE 083 */
+int virtio_blk_flush(void) { return 0; }   /* PARCHE 115 */
 int virtio_blk_write(uint64_t sector, const void *buf)
 {
     if (sector >= DISK_SECTORS) return -1;

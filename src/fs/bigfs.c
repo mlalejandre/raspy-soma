@@ -376,6 +376,8 @@ static int commit_inode(struct bigfs *fs, uint32_t id)
     in->mtime = now(fs);
     in->crc = inode_crc(in);
     uint32_t sec = id / 2;
+    /* PARCHE 115: barrera: todo lo escrito antes (datos, inodos previos) debe ser durable ANTES de confirmar este inodo. */
+    if (fs->dev.flush && fs->dev.flush(fs->dev.ctx) != 0) return BIGFS_E_IO;
     return dev_write(fs, fs->sb.inode_start + sec, &fs->ino[sec * 2], 1);   /* UN sector: atomico */
 }
 

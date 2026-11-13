@@ -3,6 +3,7 @@
 #include "io.h"
 #include "panic.h"
 #include "usermode.h"
+#include "pic_irq.h"
 
 struct idt_entry {
     uint16_t offset_low;
@@ -159,8 +160,17 @@ uint64_t timer_get_uptime_ms(void)
     return timer_ticks;
 }
 
+volatile uint32_t timer_sleep_noirq_count;   /* PARCHE 109: esperas pedidas con las interrupciones desactivadas */
+
 void timer_sleep_ms(uint32_t ms)
 {
+    uint64_t fl; __asm__ volatile ("pushfq; popq %0" : "=r"(fl));
+    if (!(fl & 0x200)) {
+        /* PARCHE 109: con IF=0 el reloj no avanza y 'hlt' dormiria para siempre (cuelgue total). Espera acotada por iteraciones. */
+        timer_sleep_noirq_count++;
+        for (uint64_t i = 0, n = (uint64_t)ms * 20000u; i < n; ++i) __asm__ volatile ("pause");
+        return;
+    }
     uint64_t target = timer_ticks + (uint64_t)ms;
     while (timer_ticks < target) {
         __asm__ volatile ("hlt");
@@ -212,6 +222,15 @@ void timer_init(uint32_t freq_hz)
     outb(0x40, (uint8_t)((divisor >> 8) & 0xFF));
 }
 
+volatile uint64_t irq_spurious_count;   /* PARCHE 108: IRQ espurias del PIC absorbidas (7 y 15) */
+volatile uint64_t irq_unhandled_count;  /* PARCHE 108: IRQ reales sin manejador (confirmadas para no bloquear la linea) */
+
+static uint8_t pic_read_isr(uint16_t cmd_port)
+{
+    outb(cmd_port, 0x0B);               /* OCW3: la proxima lectura devuelve ISR */
+    return inb(cmd_port);
+}
+
 static void irq_dispatch(struct trap_frame *tf)
 {
     if (tf->vector == 32) {
@@ -230,10 +249,14 @@ static void irq_dispatch(struct trap_frame *tf)
         return;
     }
 
-    if (tf->vector >= 40) {
-        outb(0xA0, 0x20);
+    /* PARCHE 108: el resto de IRQ del PIC (2..15) no tiene manejador. Se distingue la espuria de la real con el registro ISR. */
+    uint8_t im = tf->vector == 39 ? pic_read_isr(0x20) : 0, is = tf->vector == 47 ? pic_read_isr(0xA0) : 0;
+    switch (pic_irq_action((unsigned)tf->vector, im, is)) {
+    case PIC_IRQ_SPURIOUS_NO_EOI:         irq_spurious_count++; break;
+    case PIC_IRQ_SPURIOUS_ACK_MASTER:     irq_spurious_count++; outb(0x20, 0x20); break;
+    case PIC_IRQ_ACK_BOTH:                irq_unhandled_count++; outb(0xA0, 0x20); outb(0x20, 0x20); break;
+    default:                              irq_unhandled_count++; outb(0x20, 0x20); break;
     }
-    outb(0x20, 0x20);
 }
 
 void isr_exception_handler(struct trap_frame *tf)
@@ -247,7 +270,16 @@ void isr_exception_handler(struct trap_frame *tf)
     /* SOMA_PARCHE_014_RING3: una excepcion en ring 3 mata el proceso de usuario, no el kernel */
     if ((tf->cs & 3) == 3 && usermode_active())
         usermode_on_fault(tf->vector, tf->rip, read_cr2());
+    {   /* PARCHE 109: excepcion DURANTE el informe de panico: no reentrar (desbordaria la pila); detener de forma observable */
+        int nivel = panic_enter();
+        if (nivel >= 1) {
+            if (nivel == 1) kprint("\n[PANICO ANIDADO] otra excepcion durante el informe: sistema detenido\n");
+            qemu_exit(0x23);
+            for (;;) __asm__ volatile ("cli; hlt");
+        }
+    }
     console_muted = 0; /* un panic dentro de una redireccion '>' debe ser visible */
+    console_capture_abort(); /* PARCHE 116: ni dentro de una captura de pruebas */
     uint64_t cr2 = read_cr2();
     uint64_t cr0 = read_cr0();
     uint64_t cr3 = read_cr3();
@@ -309,7 +341,7 @@ void idt_init(void)
 {
     tss_init();
 
-    for (int i = 0; i < 34; ++i) {
+    for (int i = 0; i < 48; ++i) {                                /* PARCHE 108: 0..47 (antes 0..33: IRQ 2..15 sin puerta) */
         idt_set_gate((uint8_t)i, (uint64_t)isr_stub_table[i], 0x08, 0x8E);
     }
 
@@ -324,5 +356,12 @@ void idt_init(void)
     idtr_desc.base  = (uint64_t)&idt;
 
     __asm__ volatile ("lidt %0" : : "m"(idtr_desc));
-    kprint("IDT: 32 excepciones registradas (IST1 activo en #DF/#PF)\n");
+    kprint("IDT: 32 excepciones + 16 IRQ del PIC registradas (IST1 activo en #DF/#PF)\n");
+    /* PARCHE 108: autoprueba. Un 'int' de software a los vectores 39 y 47 recorre la misma ruta que una IRQ espuria del 8259 (ISR sin
+     * bit activo): debe absorberse sin panico y quedar contada. Antes de este parche habria acabado en #NP (puerta ausente). */
+    uint64_t antes = irq_spurious_count;
+    __asm__ volatile ("int $39" : : : "memory");
+    __asm__ volatile ("int $47" : : : "memory");
+    kprint(irq_spurious_count == antes + 2 ? "IDT: IRQ espuria 7/15 absorbida sin panico: OK\n"
+                                           : "IDT: IRQ espuria 7/15: FALLO (no se contabilizo)\n");
 }

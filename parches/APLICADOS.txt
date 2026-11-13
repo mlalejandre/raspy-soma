@@ -105,3 +105,12 @@
 20261113_212314 parche 105: Correccion: el test de vmm enlaza tambien en macOS (simbolos del enlazador propios en la prueba)
 20261113_213207 parche 106: Correccion: el test del terminal enlaza tambien en macOS (portapapeles debil)
 20261113_214151 parche 107: SRCFS: indice de 511 entradas; el agente vuelve a ver net/, lang/, ui/ y user/
+20261113_215357 parche 108: Fase 1 seguridad: IRQ espurias del PIC (puertas 34..47) sin panico del kernel, con test y autoprueba
+20261113_220359 parche 109: Fase 1 seguridad: guarda de panico anidado (x86_64 y aarch64) y timer_sleep_ms sin cuelgue con IF=0
+20261113_221904 parche 110: Fase 1 permisos: politica de escritura de los agentes (/etc, /sys, /bin, /boot) con test y rutas normalizadas
+20261113_222942 parche 111: Fase 1 concurrencia: prueba de estres con hilos competidores (conctest)
+20261113_224432 parche 112: Fase 2 persistencia: guardado atomico con diario, CRC por archivo y comandos fscrash/fscheck
+20261113_225451 parche 113: Fase 2 persistencia: actualizacion atomica de archivos grandes (BIGFS) con recuperacion en el arranque
+20261113_230445 parche 114: Fase 2 persistencia: prueba de cortes reales con kill -9 (tools/killtest.py)
+20261113_232123 parche 115: Fase 2 persistencia: barreras de escritura para el diario y BIGFS, probadas con cache volatil
+20261113_234620 parche 116: Fase 3 IA: pruebas de comportamiento en el programador y demo reproducible demo_ai

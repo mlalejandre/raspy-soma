@@ -319,6 +319,11 @@ static int virtio_blk_opn(uint64_t sector, void *buf, uint32_t nsec, int write)
     return 0;
 }
 
+int virtio_blk_flush(void)
+{
+    return (blk_ready && !blk_broken) ? 0 : -1;     /* write-through por no negociar F_FLUSH (ver virtio_blk.h) */
+}
+
 static int virtio_blk_op(uint64_t sector, void *buf, int write)
 {
     return virtio_blk_opn(sector, buf, 1, write);

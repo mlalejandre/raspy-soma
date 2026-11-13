@@ -10,6 +10,7 @@
 #include "idt.h"
 #include "rtc.h"
 #include "fs.h"
+#include "spillio.h"
 
 static struct bigfs *g_fs;
 static struct kmutex g_lock;
@@ -25,6 +26,7 @@ static uint64_t region_sectors(void)
 
 static int d_read(void *c, uint64_t lba, void *b, uint32_t n) { (void)c; return virtio_blk_read_n(SOMA_LBA_BIGFS_START + lba, b, n); }
 static int d_write(void *c, uint64_t lba, const void *b, uint32_t n) { (void)c; return virtio_blk_write_n(SOMA_LBA_BIGFS_START + lba, b, n); }
+static int d_flush(void *c) { (void)c; return virtio_blk_flush(); }
 static void *d_alloc(size_t n) { return kmalloc(n); }
 static void d_free(void *p) { kfree(p); }
 static void d_lock(void *c) { (void)c; if (!g_lock_ready) { kmutex_init(&g_lock, "bigfs_lock"); g_lock_ready = 1; } kmutex_lock(&g_lock); }
@@ -41,7 +43,7 @@ static int make_dev(struct bigfs_dev *d)
     uint64_t n = region_sectors();
     if (!n) return 0;
     d->ctx = 0; d->read = d_read; d->write = d_write; d->total_sectors = n;
-    d->alloc = d_alloc; d->free = d_free; d->now = d_now; d->lock = d_lock; d->unlock = d_unlock;
+    d->alloc = d_alloc; d->free = d_free; d->now = d_now; d->lock = d_lock; d->unlock = d_unlock; d->flush = d_flush;
     return 1;
 }
 
@@ -88,6 +90,11 @@ static void spill_path(int slot, char *p)
     const char *d = RFS_DIR "/"; int k = 0; while (*d) p[k++] = *d++;
     p[k++] = (char)('0' + (slot / 100) % 10); p[k++] = (char)('0' + (slot / 10) % 10); p[k++] = (char)('0' + slot % 10); p[k] = 0;
 }
+static void spill_tmp_path(int slot, char *p)      /* "/.ramfs/tNNN": mismo directorio, nunca choca con un numero de ranura */
+{
+    const char *d = RFS_DIR "/t"; int k = 0; while (*d) p[k++] = *d++;
+    p[k++] = (char)('0' + (slot / 100) % 10); p[k++] = (char)('0' + (slot / 10) % 10); p[k++] = (char)('0' + slot % 10); p[k] = 0;
+}
 int fs_spill_ready(void)
 {
     if (g_spill_state) return g_spill_state > 0;
@@ -102,21 +109,23 @@ int fs_spill_ready(void)
     if (!fs) { g_spill_state = -1; return 0; }
     uint32_t ino; if (bigfs_lookup(fs, RFS_DIR, &ino) < 0 && bigfs_mkdir(fs, RFS_DIR) != 0) { g_spill_state = -1; return 0; }
     g_spill_state = 1;
+    {   /* PARCHE 113: terminar o descartar actualizaciones interrumpidas por un corte */
+        int prom = 0, desc = 0;
+        for (int sl = 0; sl < FS_MAX_FILES; sl++) {
+            char p[32], t[32]; spill_path(sl, p); spill_tmp_path(sl, t);
+            int r = spill_recover(fs, p, t);
+            if (r == 1) prom++; else if (r == 2) desc++;
+        }
+        if (prom || desc) { kprint("BIGFS: actualizaciones interrumpidas: "); kprint_dec((uint32_t)prom); kprint(" completadas, "); kprint_dec((uint32_t)desc); kprint(" descartadas\n"); }
+    }
     return 1;
 }
+/* PARCHE 113: actualizacion atomica (ver spillio.h): el contenido anterior no se destruye hasta tener el nuevo completo. */
 int fs_spill_put(int slot, const char *name, const char *data, uint32_t len)
 {
     struct bigfs *fs = g_spill_state > 0 ? g_fs : 0; if (!fs) return -1;
-    char p[32]; spill_path(slot, p);
-    uint32_t ino;
-    if (bigfs_lookup(fs, p, &ino) < 0) { if (bigfs_create(fs, p, &ino) != 0) return -1; }
-    uint8_t h[64]; memset(h, 0, sizeof h); memcpy(h, "RFS1", 4);
-    for (int i = 0; i < FS_NAME_MAX - 1 && name[i]; i++) h[4 + i] = (uint8_t)name[i];
-    h[52] = (uint8_t)len; h[53] = (uint8_t)(len >> 8); h[54] = (uint8_t)(len >> 16); h[55] = (uint8_t)(len >> 24);
-    if (bigfs_truncate(fs, ino, 0) != 0) return -1;
-    if (bigfs_write(fs, ino, 0, h, 64) != 64) return -1;
-    if (len && bigfs_write(fs, ino, 64, data, len) != (int64_t)len) return -1;
-    return 0;
+    char p[32], t[32]; spill_path(slot, p); spill_tmp_path(slot, t);
+    return spill_put_atomic(fs, p, t, name, FS_NAME_MAX, data, len);
 }
 int fs_spill_stat(int slot, char *name_out, uint32_t *len_out)
 {
@@ -139,7 +148,7 @@ int fs_spill_get(int slot, char *buf, uint32_t len)
 void fs_spill_del(int slot)
 {
     struct bigfs *fs = g_spill_state > 0 ? g_fs : 0; if (!fs) return;
-    char p[32]; spill_path(slot, p); (void)bigfs_unlink(fs, p);
+    char p[32], t[32]; spill_path(slot, p); spill_tmp_path(slot, t); (void)bigfs_unlink(fs, p); (void)bigfs_unlink(fs, t);
 }
 
 int bigfs_sys_autoexec(void (*run)(const char *line))

@@ -13,11 +13,14 @@
 #define SOMA_LBA_RESULT_SECTORS 4
 #define SOMA_LBA_BOOT_GATE      24     /* LBA 24: Flag de prueba canaria */
 #define SOMA_LBA_RESUME_FLAG    25     /* LBA 25: Flag de reanudación atómica */
+#define SOMA_LBA_KILLTEST       30     /* LBA 30: marca "SOMA_KILLTEST" -> el arranque ejecuta la prueba de cortes reales (tools/killtest.py) */
 
 /* Zona 2: Sistema de Archivos Persistente V2 (RamFS SOMAFS02) */
 #define SOMA_LBA_FS_SUPER       1024   /* LBA 1024: Superbloque del VFS */
 #define SOMA_LBA_FS_DATA        1025   /* LBA 1025..3137: 64 inodos x 33 sectores (16 KiB/archivo) */
 #define SOMA_LBA_FS_LIMIT       3138
+#define SOMA_LBA_FS_JOURNAL     3200   /* LBA 3200..3234: diario del VFS (1 sector de compromiso + cabecera + 32 de datos) */
+#define SOMA_LBA_FS_JOURNAL_END 3234
 
 /* Zona 3: Scratch del Sistema y Zona de Usuario */
 #define SOMA_LBA_SCRATCH_MIN    3500   /* LBA 3500..3508: Scratch para canary tests */

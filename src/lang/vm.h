@@ -99,6 +99,7 @@ enum soma_opcode {
 #define VM_ARRAYS_POOL_CAP   48
 #define VM_ARRAY_ITEMS_CAP   48
 #define VM_MAX_STEPS         200000000ULL
+extern uint64_t vm_step_limit;   /* PARCHE 116: limite efectivo (por defecto VM_MAX_STEPS); las pruebas del programador lo bajan para detectar bucles infinitos rapido */
 
 #define VM_STR_SLOTS         24
 #define VM_STR_SLOT_CAP      16384

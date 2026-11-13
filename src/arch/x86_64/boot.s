@@ -198,6 +198,21 @@ ISR_ERR   30
 ISR_NOERR 31
 ISR_NOERR 32
 ISR_NOERR 33
+/* PARCHE 108: IRQ 2..15 del PIC (vectores 34..47). Antes no tenian puerta: una IRQ espuria (7/15) acababa en #NP y panico del kernel */
+ISR_NOERR 34
+ISR_NOERR 35
+ISR_NOERR 36
+ISR_NOERR 37
+ISR_NOERR 38
+ISR_NOERR 39
+ISR_NOERR 40
+ISR_NOERR 41
+ISR_NOERR 42
+ISR_NOERR 43
+ISR_NOERR 44
+ISR_NOERR 45
+ISR_NOERR 46
+ISR_NOERR 47
 ISR_NOERR 64      /* PARCHE 038: interrupcion del temporizador del LAPIC (autotest de apic) */
 ISR_NOERR 255     /* PARCHE 038: vector espurio del LAPIC (SVR = 0x1FF) */
 
@@ -255,7 +270,10 @@ isr_stub_table:
     .quad isr_stub_20, isr_stub_21, isr_stub_22, isr_stub_23
     .quad isr_stub_24, isr_stub_25, isr_stub_26, isr_stub_27
     .quad isr_stub_28, isr_stub_29, isr_stub_30, isr_stub_31
-    .quad isr_stub_32, isr_stub_33
+    .quad isr_stub_32, isr_stub_33, isr_stub_34, isr_stub_35
+    .quad isr_stub_36, isr_stub_37, isr_stub_38, isr_stub_39
+    .quad isr_stub_40, isr_stub_41, isr_stub_42, isr_stub_43
+    .quad isr_stub_44, isr_stub_45, isr_stub_46, isr_stub_47
 
 .section .text
 

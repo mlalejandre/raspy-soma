@@ -20,6 +20,12 @@
 #define CC_SRC_MAX    32768
 #define CC_LESSONS    "/agent/coder_lessons.txt"
 
+struct cc_test {                      /* PARCHE 116 */
+    const char *name;
+    const char *input;                /* lineas para input(), separadas por \n (puede ser "") */
+    const char *expect;               /* salida exacta esperada (se ignoran espacios y saltos finales) */
+};
+
 struct cc_env {
     int      (*llm)(const char *prompt, char *out, uint32_t max, uint32_t timeout_ms);   /* 1 = respuesta */
     int      (*read)(const char *path, char *buf, uint32_t max);                         /* bytes o <0 */
@@ -30,6 +36,9 @@ struct cc_env {
     int      max_llm_calls;                                                              /* 0 = 7 */
     void     (*trace)(const char *kind, const char *prompt, const char *reply);              /* PARCHE 097: opcional */
     int      force_new;      /* PARCHE 098: crear desde cero aunque el archivo exista (no es una modificacion) */
+    int      (*run)(const uint8_t *bc, uint32_t len, const char *input, char *out, uint32_t max);   /* PARCHE 116: ejecuta bytecode capturando su salida; 0 = termino bien, <0 = error o no termina */
+    const struct cc_test *tests; /* PARCHE 116: casos de prueba del encargo (con `run`) */
+    int      ntests;
 };
 
 struct cc_result {
@@ -43,6 +52,9 @@ struct cc_result {
     int      cancelled;
     int      stuck;            /* el modelo repetia la misma respuesta */
     int      score;            /* 0 = perfecto */
+    int      tests_total;      /* PARCHE 116: casos de prueba del encargo */
+    int      tests_pass;       /* ... que pasa el programa entregado (o el mejor candidato si no se entrego) */
+    int      tests_first_fail; /* ... que fallaban en la PRIMERA version generada: bugs detectados por las pruebas */
     uint32_t bc_len;
     char     summary[192];
     char     last_error[192];

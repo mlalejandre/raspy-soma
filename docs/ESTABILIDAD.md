@@ -995,3 +995,126 @@ nucleos a la vez, asi que se ha elegido un modelo asimetrico que no puede romper
   `ejecutar.py` reempaqueta en cada arranque, asi que el disco se actualiza solo.
 - `tests/test_srcfs_pack.py`: capacidad 511 y una comprobacion nueva que falla si alguna carpeta de `src/` queda fuera de la imagen.
 - Limite honesto: con 511 entradas quedan ~190 de margen. Si `src/` los supera, el empaquetado avisa (`[SRCFS] AVISO`).
+
+## Parche 108 — Fase 1 (seguridad), paso 5: IRQ espurias del PIC ya no provocan panico del kernel (fallo real)
+- Hallazgo (primer fallo explotable de la Fase 1): la IDT solo tenia puertas para los vectores 0..33. Una IRQ **espuria** del 8259 (IRQ7 = vector 39,
+  IRQ15 = vector 47; el PIC las genera aunque la linea este enmascarada) o cualquier IRQ 2..15 llegaba a una puerta ausente y el kernel hacia
+  `KERNEL PANIC` (#GP). Reproducido en QEMU con `int $39`; ahora se absorbe.
+- `boot.s`: stubs 34..47 y la tabla ampliada. `idt.c`: puertas 0..47 y `irq_dispatch` distingue espuria de real leyendo el registro ISR (OCW3).
+  Espuria del maestro: sin EOI; del esclavo: EOI solo al maestro; reales sin manejador: EOI (para no bloquear la linea) y contador.
+  Contadores `irq_spurious_count` / `irq_unhandled_count`.
+- `src/arch/x86_64/pic_irq.h`: la decision como funcion pura; `tests/test_pic_irq.c` la prueba exhaustivamente (3,4 M de combinaciones vector x ISR).
+- Autoprueba al arrancar (`idt_init`): `int $39` + `int $47` deben absorberse y contarse; se imprime `IDT: IRQ espuria 7/15 absorbida sin panico: OK`.
+  Verificado que sin el cambio el mismo arranque cae en panico (#GP).
+
+## Parche 109 — Fase 1 (seguridad), paso 6: panico anidado y esperas con interrupciones apagadas
+- **Panico anidado.** Si una excepcion ocurria DURANTE el informe de panico (pila corrupta, consola rota), el manejador se reentraba a si mismo
+  hasta desbordar la pila: el sistema moria sin ningun diagnostico. Nuevo `panic_enter()` en `panic.c` (nivel 0 = primer panico; 1, 2... = anidado):
+  en x86_64 y aarch64 el manejador imprime `[PANICO ANIDADO] ...` una sola vez y detiene el sistema con el codigo observable por el host (0x23).
+  `tests/test_panic.c`: niveles y reinicio (57 comprobaciones). Reproducido en QEMU forzando una excepcion dentro del informe: con la guarda
+  imprime el aviso y se detiene; sin ella el sistema moria en silencio.
+- **`timer_sleep_ms` (x86_64)** con IF=0: el reloj no avanza y `hlt` dormia para siempre. Ahora detecta IF=0, hace una espera acotada con `pause`
+  y lo cuenta en `timer_sleep_noirq_count`. (Hoy solo la usan los drivers aarch64; era una trampa latente.)
+- Revision: el recorrido de la pila del informe ya estaba bien blindado (alineacion, limites, lectura via VMM, 57 pruebas hostiles).
+
+## Parche 110 — Fase 1 (permisos): politica de escritura de los agentes sobre /etc, /sys, /bin y /boot
+- Punto de partida: el informe del paso 1 marcaba CONTROL_PERMISOS = 0 (heuristico: la lista blanca `CMD_F_SAFE` y el filtro de `fs.c`
+  `agent_path_denied` usan otros nombres). Revision manual: SI hay control, pero estrecho. La lista blanca de comandos del agente existe y se aplica en
+  `dispatch_command`; y el VFS rechaza las escrituras y borrados de un agente en `/etc/init.sh`, `/etc/soma_manifest.txt`, `/etc/history.txt` y `/agent/`.
+- Hueco: todo el resto de `/etc` (`ui.conf`, `nousb`, `mem_user.txt`, `mem_hw.txt`, `os-release`), `/sys`, `/bin` y `/boot` quedaba abierto a un agente
+  confundido o manipulado (p. ej. `touch /etc/nousb` desactiva el USB en el siguiente arranque; `descargar <url> /sys/status.txt` o `echo ... > /etc/ui.conf`
+  escriben contenido de la red o del modelo en configuracion del sistema).
+- `src/agent/agent_policy.h` (funcion pura): normaliza la ruta (`//`, `/./`, `/../`) y protege `/etc`, `/sys`, `/bin`, `/boot` y todo lo que cuelgue de ellos;
+  una ruta demasiado larga para el VFS cuenta como protegida. Se aplica, SOLO en modo agente, en `write`, `rm`, `cp` (destino), `mv` (origen y destino),
+  `touch`, la redireccion `>`, `descargar` y `fat get`. El usuario humano no se ve afectado. Contador `agent_denied_writes`.
+- No se toca el VFS: otros subsistemas que corren en hilos de agente (memoria, historial) escriben en `/etc` por su propio camino y siguen funcionando.
+- `tests/test_agent_policy.c`: casos de evasion, rutas largas y 200 000 casos aleatorios contra una referencia independiente.
+- Comprobado en QEMU: un agente no puede escribir, borrar, copiar, mover, tocar ni redirigir a `/etc` (8 intentos, ninguno efectivo), sigue pudiendo escribir en
+  `/workspace` y el usuario humano sigue pudiendo escribir en `/etc`.
+
+## Parche 111 — Fase 1 (concurrencia), paso 7: prueba de estres con hilos competidores
+- Nuevo `src/core/conc_test.c` y comando `conctest` en la consola SOMA: lanza 6 hilos que compiten a la vez por el mutex, el heap y el VFS, cediendo la CPU
+  a mitad de cada operacion (el planificador es cooperativo, asi que `thread_yield()` es donde se producen los cambios de contexto).
+- Comprueba: exclusion mutua (contador compartido exacto), bloques del heap con contenido intacto, archivos del VFS leidos tal como se escribieron,
+  `kheap_check` consistente, sin bloques perdidos, sin llamadas reentrantes al heap (`reentries`), sin archivos huerfanos, sin usos incorrectos ni
+  interbloqueos de mutex, y recuperacion de un mutex cuyo propietario muere (`kmutex_lock_timeout` debe tener exito tras la recuperacion forzosa).
+- Resultado en QEMU x86_64: todas las comprobaciones OK (contador = 480 = 6 x 80), unos 30 ms. No ha revelado fallos nuevos: confirma los parches 103 y mutex previos.
+- La prueba no se ejecuta al arrancar; solo bajo demanda con `conctest` (devuelve 1 si todo esta bien).
+
+## Parche 112 — Fase 2 (persistencia), paso 1: guardado atomico con diario y CRC por archivo
+- Hueco: guardar un archivo escribia cabecera y 32 sectores de datos en su sitio. Un corte de luz o un cuelgue a mitad dejaba una cabecera nueva con datos
+  viejos (o al reves), sin forma de notarlo. Ademas, `vfs_checkpoint_save` escribia el marcador de punto de control valido ANTES de copiar los datos: un corte a
+  mitad dejaba un checkpoint "valido" mezclado.
+- `src/fs/slotio.h` (codigo puro, sin dependencias del nucleo): diario de un hueco en LBA 3200..3234 (zona libre). Orden: imagen del inodo en el diario ->
+  sector de compromiso (con CRC32 de la carga) -> escritura en su sitio (datos primero, cabecera la ultima) -> diario invalidado. En el arranque
+  (`slotio_recover`, antes de leer ningun archivo) se rehace lo comprometido y se descarta lo que no llego a comprometerse. Tras cualquier corte el archivo
+  es COMPLETAMENTE el contenido anterior o COMPLETAMENTE el nuevo.
+- CRC32 de los datos en la cabecera del inodo (`pad[0..3]`, marca `C` en `pad[4]`; los nucleos anteriores ignoran `pad`, y los archivos antiguos sin
+  marca siguen cargando). Al cargar, un CRC distinto genera un aviso y suma a `fs_crc_bad`.
+- Punto de control: se invalida el marcador, se copia todo y el marcador se escribe el ULTIMO.
+- `tests/test_slotio.c` (host, ASan/UBSan): corte simulado tras CADA escritura posible, en 7 pares de tamanos (incluidos 0, 1, 16383 y 16384 bytes);
+  recuperacion interrumpida a su vez; diario con bits volteados; indice de ranura fuera de rango; vecinos intactos; CRC32 de referencia (13 575 comprobaciones).
+  Mutacion comprobada: sin diario (comportamiento anterior) el test falla (779 fallos).
+- Comandos nuevos: `fscrash` (simula cortes dentro del kernel con inyeccion de fallos en la E/S del VFS) y `fscheck` (recorre el disco: cabeceras coherentes, CRC).
+- QEMU con disco virtio: 277 cortes simulados, 0 archivos a medias; `fscheck` sin problemas. Prueba de arranque real: escritura comprometida y
+  no aplicada -> en el siguiente arranque "se completo una escritura interrumpida" y el archivo tiene el contenido nuevo.
+- Limite conocido: los archivos grandes (BIGFS, >= 16 KiB) y la tabla de ranuras aun no usan el diario (siguiente paso de la Fase 2).
+
+## Parche 113 — Fase 2 (persistencia), paso 2: actualizacion atomica de archivos grandes (BIGFS)
+- Hueco: `fs_spill_put` actualizaba un archivo grande con `truncate(0)` y reescritura en el sitio. Un corte despues del truncate (o entre la cabecera y los
+  datos) destruia el contenido anterior sin tener el nuevo, y al arrancar el archivo desaparecia. Ademas, al pasar un archivo de grande a pequeno se
+  borraba el contenido en BIGFS ANTES de confirmar la ranura en linea: un corte intermedio dejaba la cabecera apuntando a un archivo inexistente.
+  Y si el corte caia entre BIGFS (ya nuevo) y la cabecera de la ranura (aun vieja), el tamano no coincidia y la carga descartaba el archivo.
+- `src/fs/spillio.h` (puro, sobre la API de BIGFS): el contenido nuevo se escribe completo en un temporal (`/.ramfs/tNNN`); despues se borra el antiguo y se
+  renombra el temporal (cada paso es UNA escritura atomica de sector en BIGFS). `spill_valid` exige marca + tamano real = cabecera + longitud declarada, asi
+  que un temporal a medias nunca se confunde con uno completo. En el montaje `spill_recover` promociona un temporal completo si falta el definitivo, o lo borra.
+- `fs.c`: el borrado del contenido en BIGFS al pasar a ranura en linea ocurre DESPUES de confirmar la ranura; y la carga acepta un BIGFS mas reciente que su
+  cabecera (usa el tamano y nombre de BIGFS y lo avisa; contador `fs_spill_fixed`, visible en `fscheck`).
+- `tests/test_spillio.c` (host, ASan/UBSan): corte tras CADA escritura posible, en actualizaciones y en primera escritura, 7 pares de tamanos (incluido 0 y
+  16384); tras cada corte, montaje + recuperacion: el archivo es entero viejo o entero nuevo (o ausente solo si no existia), sin temporal, `bigfs_fsck` limpio
+  y se puede seguir guardando; segunda recuperacion sin efecto; disco casi lleno (el viejo queda intacto). Mutacion comprobada: con el metodo anterior
+  falla (590 fallos). 4 210 comprobaciones.
+- QEMU con disco: crecer (20 -> 30 KB), encoger (25 KB -> 100 B) y cruzar el limite (100 B -> 40 KB) y reiniciar: contenidos intactos.
+- Coste: durante la actualizacion de un archivo grande hacen falta clusteres para el viejo y el nuevo a la vez; si no caben, la escritura falla y el viejo queda intacto.
+
+## Parche 114 — Fase 2 (persistencia), paso 3: prueba de cortes REALES con `kill -9` (`tools/killtest.py`)
+- Los parches 112 y 113 se probaron con cortes simulados (inyeccion de fallos en el host y en el kernel). Este paso lo comprueba de extremo a extremo con el kernel
+  real: QEMU muere de verdad (`kill -9`) en mitad de escrituras continuas, y en el arranque siguiente se verifica el disco.
+- `tools/killtest.py`: copia el disco a un temporal (el tuyo NO se toca), pone la marca `SOMA_KILLTEST` en LBA 30, y repite N rondas (por defecto 20): arrancar,
+  escribir entre 2,5 y 6 s, matar. Informa por ronda si el diario rehizo una escritura o BIGFS recupero un temporal. Codigo de salida 0 = todo correcto.
+- Kernel: `vfs_killtest_boot()` (se ejecuta tras el autoexec SOLO si el disco lleva la marca): verifica tres archivos de prueba (`/workspace/k0..k2.bin`, de
+  8 B a 39 KB; cada uno lleva su semilla y longitud y se autoverifica), ejecuta `fscheck` y despues escribe sin parar hasta que lo vuelvan a matar.
+- Resultado con el codigo de los parches 112-113: 25 cortes reales, 0 archivos danados; el diario rehizo escrituras interrumpidas 13 veces y BIGFS descarto un
+  temporal. Mutacion comprobada: con el diario desactivado (escritura directa, comportamiento anterior) la misma prueba encuentra archivos danados en 6 de 12 cortes.
+- Uso: `python3 ejecutar.py` (compila) y despues `python3 tools/killtest.py --rondas 30`.
+
+## Parche 115 — Fase 2 (persistencia), paso 4: barreras de escritura (el orden de llegada a disco ya no se da por supuesto)
+- Hallazgo: los parches 112-114 dependen del ORDEN en que las escrituras llegan a disco (la carga del diario antes de su compromiso; los datos de BIGFS antes del inodo que
+  los referencia). Hoy se cumple porque el controlador virtio-blk NO negocia `VIRTIO_BLK_F_FLUSH`, y por la especificacion el dispositivo se comporta entonces como
+  write-through. Pero era una dependencia implicita: cualquier disco con cache volatil (AHCI, NVMe, SD, o virtio con F_FLUSH) puede reordenar o perder escrituras
+  no vaciadas, y el diario dejaria de proteger.
+- Nueva API de barrera: `virtio_blk_flush()` (hoy sin trabajo que hacer, documentado en `virtio_blk.h`; es el sitio donde un controlador con cache emitira su FLUSH CACHE),
+  `slotdev.flush` y `bigfs_dev.flush` (opcionales). Barreras en `slotio`: carga del diario -> BARRERA -> compromiso -> BARRERA -> inodo en su sitio -> BARRERA -> invalidar diario
+  (tambien en la recuperacion). En BIGFS, `commit_inode` hace una barrera antes de confirmar cada inodo (datos e inodos previos son durables antes que el nuevo).
+- Pruebas con un modelo de disco con CACHE VOLATIL (lo no vaciado puede perderse o llegar en cualquier orden; en cada corte se prueba "nada pendiente", "todo" y 12 subconjuntos
+  aleatorios): diario con barreras 0 fallos de 3 332 cortes, SIN barreras 1 818 fallos; BIGFS/spill con barreras 0 de 5 140, SIN barreras 62. Es decir, las barreras son necesarias
+  y suficientes en el modelo, y el test falla si se quitan.
+- Sin cambio de comportamiento en el hardware actual: QEMU `fscrash` (277 cortes, 0 a medias) y `tools/killtest.py` siguen en verde.
+
+## Parche 116 — Fase 3 (IA nativa), paso 1: el programador de SOMA PRUEBA lo que escribe y la demo reproducible `demo_ai`
+- Punto de partida: `coder_core` ya tenia el bucle generar -> normalizar -> compilar -> reparar, pero "correcto" solo significaba "compila y pasa el lint". Un programa con un
+  error de LOGICA (un bucle que se queda corto, una condicion al reves) se entregaba tan feliz.
+- Pruebas de comportamiento: el encargo puede llevar casos de prueba (`struct cc_test`: entrada para `input()` -> salida exacta) y el entorno una funcion `run`. Cada
+  candidato que compila se EJECUTA contra ellas en la VM. Un fallo (salida distinta, error de ejecucion, bucle infinito) entra en la reparacion con la entrada, la salida
+  esperada y la obtenida, y en el contexto de generacion aparecen las pruebas. Un programa que no pasa TODAS las pruebas no se entrega: el archivo queda como estaba (antes
+  se aceptaba "compila con un aviso"; ahora los fallos de pruebas pesan 300 puntos y bloquean la entrega). Resultado del trabajo: `tests_total`, `tests_pass` y
+  `tests_first_fail` (bugs que cazaron las pruebas en la primera version). Sin pruebas, el comportamiento anterior no cambia (49 comprobaciones del simulador, 16 escenarios previos intactos).
+- Infraestructura: `console_capture_begin/end/abort` (captura la salida DE UN HILO y le da lineas de entrada simuladas; `kgetline` nunca se bloquea en una captura; el manejador de
+  panico la corta en x86_64 y aarch64); `vm_step_limit` (el limite de instrucciones de la VM pasa a variable: las pruebas lo bajan para detectar un bucle infinito en milisegundos;
+  por defecto sigue siendo 200 millones). El resultado de las pruebas se memoriza por bytecode (cada candidato se verifica varias veces).
+- `tests/test_coder_sim.c` (host, ASan/UBSan): 5 escenarios nuevos con un modelo falso que SOLO corrige si el mensaje de reparacion trae el detalle de las pruebas: correcto a la
+  primera; bug de logica detectado y reparado; bucle infinito detectado y reparado; modelo que nunca arregla (no se entrega y el disco no se toca); modelo que ignora las pruebas.
+- Comando `demo_ai` (`src/apps/coder_demo.c`): tres escenarios con un modelo guionizado y determinista (sin red): 1) compila pero imprime un termino de menos (Fibonacci),
+  2) compila pero no termina, 3) un modelo que no se corrige y al que SOLO le queda la negativa a entregar. Las lecciones viven en memoria durante la demo para que cada
+  ejecucion sea identica; imprime la huella (hash) del registro: dos ejecuciones dan la misma (0xD93160A9). `demo_ai vivo` usa el LLM real con las mismas pruebas.
+- QEMU: los 3 escenarios 3/3; la huella coincide en ejecuciones repetidas, tambien con el disco ya usado; el sistema sigue arrancando hasta `[SOMA ready]`.

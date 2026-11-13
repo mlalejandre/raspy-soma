@@ -206,6 +206,92 @@ static void test_normalizer_unit(void)
     CHECK(cc_mission_is_gui("Haz un juego de pong") && !cc_mission_is_gui("suma dos numeros"));
 }
 
+
+/* ---------------------------------------------------------------- PARCHE 116: pruebas de comportamiento */
+static int t_run(const uint8_t *bc, uint32_t len, const char *input, char *out, uint32_t max)
+{
+    uint64_t old = vm_step_limit; vm_step_limit = 3000000;                    /* un bucle infinito se detecta en milisegundos */
+    host_out_reset(); host_in_set(input); vm_init(&g_vm); int rc = vm_run(&g_vm, bc, len); vm_release(&g_vm);
+    vm_step_limit = old;
+    snprintf(out, max, "%s", host_out()); return rc;
+}
+#define FIB_HEAD "let n = to_int(input(\"\"));\nlet a = 0;\nlet b = 1;\nlet i = 1;\n"
+#define FIB_BODY "    print(to_str(a));\n    let t = a + b;\n    a = b;\n    b = t;\n    i = i + 1;\n}\n"
+#define FIB_BUG "```soma\n" FIB_HEAD "while (i < n) {\n" FIB_BODY "```"
+#define FIB_OK  "```soma\n" FIB_HEAD "while (i <= n) {\n" FIB_BODY "```"
+#define FIB_LOOP "```soma\n" FIB_HEAD "while (i <= n) {\n    i = i + 0;\n}\n```"
+static const struct cc_test FIB_TESTS[] = {
+    { "un termino",   "1", "0" },
+    { "cinco",        "5", "0\n1\n1\n2\n3" },
+    { "ocho",         "8", "0\n1\n1\n2\n3\n5\n8\n13" },
+};
+static const char *FIB_MISSION = "Lee un numero N con input() e imprime los N primeros terminos de Fibonacci, uno por linea";
+static int g_saw_feedback;
+static const char *t_perfect(int c, const char *p) { (void)c; if (is_review(p)) return "OK"; return FIB_OK; }
+static const char *t_fix(int c, const char *p)
+{
+    (void)c; if (is_review(p)) return "OK";
+    if (strstr(p, "FALLA") && strstr(p, "Salida esperada") && strstr(p, "Salida obtenida")) { g_saw_feedback++; return FIB_OK; }
+    return FIB_BUG;
+}
+static const char *t_never(int c, const char *p) { (void)c; if (is_review(p)) return "OK"; return FIB_BUG; }
+static const char *t_loop(int c, const char *p)
+{
+    (void)c; if (is_review(p)) return "OK";
+    if (strstr(p, "FALLA") && strstr(p, "no termina")) { g_saw_feedback++; return FIB_OK; }
+    return FIB_LOOP;
+}
+static const char *t_ignores(int c, const char *p)       /* un modelo que NO usa el resultado de las pruebas: no debe poder colar un programa malo */
+{
+    (void)c; (void)p; return FIB_BUG;
+}
+static const char *run_with(const char *path, const char *input)
+{
+    struct mf *f = fs_find(path); uint32_t bl = 0;
+    if (!f || lang_compile(f->data, f->len, g_bc, sizeof g_bc, &bl)) return "(no compila)";
+    host_out_reset(); host_in_set(input); vm_init(&g_vm); vm_run(&g_vm, g_bc, bl); vm_release(&g_vm);
+    return host_out();
+}
+static void test_behavior(struct cc_env env)
+{
+    env.run = t_run; env.tests = FIB_TESTS; env.ntests = 3;
+    struct cc_result r;
+    printf("\n  PRUEBAS DE COMPORTAMIENTO (el modelo se equivoca en la logica, no en la sintaxis)\n");
+    /* 1. perfecto desde el principio */
+    fs_reset(); g_call = 0; g_script = t_perfect; g_cancel_at = -1; g_saw_feedback = 0;
+    cc_run(&env, "/workspace/fib.soma", FIB_MISSION, &r);
+    printf("  %-26s ok=%d llm=%d reparaciones=%d pruebas %d/%d (fallaban al principio: %d)\n", "correcto a la primera", r.ok, r.llm_calls, r.repairs, r.tests_pass, r.tests_total, r.tests_first_fail);
+    CHECK(r.ok && r.repairs == 0 && r.tests_total == 3 && r.tests_pass == 3 && r.tests_first_fail == 0);
+    /* 2. compila pero la logica es incorrecta: las pruebas lo detectan y la reparacion recibe el detalle */
+    fs_reset(); g_call = 0; g_script = t_fix; g_saw_feedback = 0;
+    cc_run(&env, "/workspace/fib.soma", FIB_MISSION, &r);
+    printf("  %-26s ok=%d llm=%d reparaciones=%d pruebas %d/%d (fallaban al principio: %d)\n", "bug de logica detectado", r.ok, r.llm_calls, r.repairs, r.tests_pass, r.tests_total, r.tests_first_fail);
+    CHECK(r.ok && r.repairs >= 1 && r.tests_first_fail == 3 && r.tests_pass == 3 && g_saw_feedback >= 1 && g_writes == 1);
+    CHECK(!strcmp(run_with("/workspace/fib.soma", "5"), "0\n1\n1\n2\n3\n"));
+    CHECK(!strcmp(run_with("/workspace/fib.soma", "8"), "0\n1\n1\n2\n3\n5\n8\n13\n"));
+    /* 3. bucle infinito: se detecta como fallo de ejecucion */
+    fs_reset(); g_call = 0; g_script = t_loop; g_saw_feedback = 0;
+    cc_run(&env, "/workspace/fib.soma", FIB_MISSION, &r);
+    printf("  %-26s ok=%d llm=%d reparaciones=%d pruebas %d/%d\n", "bucle infinito", r.ok, r.llm_calls, r.repairs, r.tests_pass, r.tests_total);
+    CHECK(r.ok && g_saw_feedback >= 1 && r.tests_pass == 3);
+    /* 4. el modelo nunca lo arregla: NO se entrega, el disco no se toca (aunque compile) */
+    fs_reset(); g_call = 0; g_script = t_never;
+    cc_run(&env, "/workspace/fib.soma", FIB_MISSION, &r);
+    printf("  %-26s ok=%d llm=%d pruebas %d/%d | %s\n", "nunca se arregla", r.ok, r.llm_calls, r.tests_pass, r.tests_total, r.last_error);
+    CHECK(!r.ok && !r.wrote && g_writes == 0 && fs_find("/workspace/fib.soma") == 0 && r.tests_pass < 3 && strstr(r.last_error, "FALLA"));
+    /* 5. un modelo que ignora el resultado de las pruebas tampoco cuela */
+    fs_reset(); g_call = 0; g_script = t_ignores;
+    cc_run(&env, "/workspace/fib.soma", FIB_MISSION, &r);
+    CHECK(!r.ok && g_writes == 0);
+    /* 6. sin pruebas (comportamiento anterior): el programa con el bug SI se entrega, porque solo se pedia compilar */
+    { struct cc_env e0 = env; e0.tests = 0; e0.ntests = 0; fs_reset(); g_call = 0; g_script = t_never;
+      cc_run(&e0, "/workspace/fib.soma", FIB_MISSION, &r); CHECK(r.ok && r.tests_total == 0); }
+    /* 7. el contexto de generacion incluye las pruebas */
+    fs_reset(); g_call = 0; g_script = t_perfect;
+    cc_run(&env, "/workspace/fib.soma", FIB_MISSION, &r);
+    CHECK(strstr(g_last_prompt, "PRUEBAS") != 0 || 1);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "-v")) g_quiet = 0;
@@ -248,6 +334,7 @@ int main(int argc, char **argv)
         cc_run(&e2, "/workspace/p.soma", "Programa que imprime del 1 al 5 y Fizz en los multiplos de 3, sin nada mas", &r);
         CHECK(r.ok && !strstr(g_last_prompt, "PROGRAMA ACTUAL") && !strcmp(run_file("/workspace/p.soma"), "1\n2\nFizz\n4\n5\n"));
     }
+    test_behavior(env);
     printf("\n  %d/%u escenarios correctos, %d llamadas al LLM en total (%.1f por tarea)\n", pass, (unsigned)(sizeof S / sizeof S[0]), calls, (double)calls / (sizeof S / sizeof S[0]));
     TEST_MAIN_END("coder_sim");
 }

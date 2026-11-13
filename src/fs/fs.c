@@ -5,6 +5,7 @@
 #include "fs.h"
 #include "mem.h"
 #include "virtio_blk.h"
+#include "slotio.h"
 #include "sysinfo.h"
 #include "pmm.h"
 #include "vmm.h"
@@ -22,6 +23,7 @@
 #define FS_SECTORS_PER_FILE  33
 #define FS_DATA_SECTORS      32
 #define FS_CHECKPOINT_LBA    SOMA_LBA_CHECKPOINT
+#define FS_JOURNAL_LBA       SOMA_LBA_FS_JOURNAL
 #define FS_TOTAL_SECTORS     (1 + FS_DISK_SLOTS * FS_SECTORS_PER_FILE)
 
 struct fs_superblock {
@@ -285,6 +287,21 @@ static int read_dev_file(const char *name, char *buf_out, uint32_t max_len)
     return -1;
 }
 
+/* PARCHE 112: E/S del VFS con inyeccion de cortes (solo para pruebas: fs_fault_budget < 0 = desactivado). */
+static long fs_fault_budget = -1;
+static uint32_t fs_spill_fixed;
+static uint32_t fs_jseq, fs_commits, fs_crc_bad, fs_jreplayed, fs_jdiscarded;
+static int fs_blk_write(void *ctx, uint64_t lba, const void *buf)
+{
+    (void)ctx;
+    if (fs_fault_budget == 0) return -1;
+    if (fs_fault_budget > 0) fs_fault_budget--;
+    return virtio_blk_write(lba, buf);
+}
+static int fs_blk_read(void *ctx, uint64_t lba, void *buf) { (void)ctx; return virtio_blk_read(lba, buf); }
+static int fs_blk_flush(void *ctx) { (void)ctx; return virtio_blk_flush(); }
+static const struct slotdev fs_dev = { fs_blk_read, fs_blk_write, 0, fs_blk_flush };
+
 static int sync_file_to_disk(int i)
 {
     uint8_t sec_buf[512] __attribute__((aligned(16)));
@@ -293,6 +310,7 @@ static int sync_file_to_disk(int i)
 
     /* PARCHE 087: archivos grandes y archivos sin ranura -> BIGFS */
     int spill = files[i].used && needs_spill(i);
+    int del_spill_after = 0;
     if (spill) {
         if (!fs_spill_ready() || fs_spill_put(i, files[i].name, files[i].data, files[i].size) != 0) {
             files[i].ram_only = 1; files[i].dirty = 0;
@@ -300,7 +318,11 @@ static int sync_file_to_disk(int i)
             if (i >= FS_DISK_SLOTS) return 0;
             spill = 0;                                      /* la ranura queda libre en disco */
         } else { files[i].spilled = 1; files[i].ram_only = 0; }
-    } else if (files[i].spilled) { fs_spill_del(i); files[i].spilled = 0; }
+    } else if (files[i].spilled) {
+        /* PARCHE 113: si pasa de BIGFS a ranura en linea, el contenido en BIGFS se borra DESPUES de confirmar el nuevo (antes: primero,
+         * y un corte intermedio dejaba la cabecera apuntando a un archivo inexistente). Si se borra el archivo, el orden no importa. */
+        if (!files[i].used) { fs_spill_del(i); files[i].spilled = 0; } else del_spill_after = 1;
+    }
     if (!files[i].used) { files[i].ram_only = 0; if (i >= FS_DISK_SLOTS) { files[i].dirty = 0; return 0; } }
     if (i >= FS_DISK_SLOTS) { files[i].dirty = 0; return 0; }
 
@@ -313,25 +335,25 @@ static int sync_file_to_disk(int i)
 
     uint64_t start_lba = FS_DATA_LBA + (uint64_t)i * FS_SECTORS_PER_FILE;
 
-    /* 1. Escribir sector 0 del inodo (Cabecera) */
+    /* PARCHE 112: CRC de los datos en la cabecera (pad[0..3], marca 'C' en pad[4]; los nucleos viejos ignoran pad). */
+    if (hdr.used && !hdr.spilled) {
+        uint32_t crc = slotio_crc32(0, files[i].data ? (const void *)files[i].data : (const void *)"", files[i].data ? files[i].size : 0);
+        memcpy(hdr.pad, &crc, 4); hdr.pad[4] = 'C';
+    }
     memcpy(sec_buf, &hdr, sizeof(hdr));
-    if (virtio_blk_write(start_lba, sec_buf) != 0) return -1;
 
-    /* 2. Escribir los 32 sectores de datos (16 KiB) */
-    if (hdr.used && !hdr.spilled && files[i].data) {
-        const uint8_t *raw = (const uint8_t *)files[i].data;
-        for (int s = 0; s < FS_DATA_SECTORS; ++s) {
-            memset(sec_buf, 0, sizeof(sec_buf));
-            uint32_t off = (uint32_t)s * 512;
-            if (off < files[i].size) {
-                uint32_t take = files[i].size - off;
-                if (take > 512) take = 512;
-                memcpy(sec_buf, raw + off, take);
-            }
-            if (virtio_blk_write(start_lba + 1 + s, sec_buf) != 0) return -1;
-        }
+    if (hdr.used && !hdr.spilled) {
+        /* Guardado ATOMICO con diario: tras un corte, el archivo queda entero viejo o entero nuevo (ver slotio.h). */
+        static uint8_t hbuf[512] __attribute__((aligned(16)));
+        memset(hbuf, 0, sizeof hbuf); memcpy(hbuf, &hdr, sizeof hdr);
+        if (slotio_commit(&fs_dev, FS_JOURNAL_LBA, start_lba, (uint32_t)i, hbuf, (const uint8_t *)files[i].data, files[i].size, ++fs_jseq) != 0) return -1;
+        fs_commits++;
+    } else {
+        /* Borrado o contenido en BIGFS: un solo sector de cabecera (la escritura de un sector ya es atomica). */
+        if (fs_blk_write(NULL, start_lba, sec_buf) != 0) return -1;
     }
 
+    if (del_spill_after) { fs_spill_del(i); files[i].spilled = 0; }
     files[i].dirty = 0;
     return 0;
 }
@@ -361,7 +383,13 @@ static int load_file_from_disk(int i)
 
     if (hdr.used && hdr.spilled == 'B') {                 /* PARCHE 087: contenido en BIGFS */
         uint32_t sl = 0; char nm[FS_NAME_MAX];
-        if (!fs_spill_ready() || fs_spill_stat(i, nm, &sl) != 0 || sl != hdr.size) return -1;
+        if (!fs_spill_ready() || fs_spill_stat(i, nm, &sl) != 0) return -1;
+        if (sl != hdr.size) {                                /* PARCHE 113: el contenido en BIGFS se confirma ANTES que la cabecera; si un corte
+                                                              * llego entre ambos, el archivo valido es el de BIGFS (nuevo y completo) */
+            if (sl > FS_FILE_MAX || !nm[0]) return -1;
+            hdr.size = sl; memcpy(hdr.name, nm, FS_NAME_MAX); hdr.name[FS_NAME_MAX - 1] = 0; fs_spill_fixed++;
+            kprint("VFS: archivo grande '"); kprint(hdr.name); kprint("' recuperado tras un corte (BIGFS estaba mas reciente que la cabecera)\n");
+        }
         files[i].size = 0;
         if (ensure_cap(i, hdr.size + 1, 0) != 0) return -1;
         if (fs_spill_get(i, files[i].data, hdr.size) != 0) { drop_data(i); return -1; }
@@ -391,6 +419,13 @@ static int load_file_from_disk(int i)
             }
         }
         files[i].data[hdr.size] = '\0';
+        if (hdr.pad[4] == 'C') {                              /* PARCHE 112: verificar integridad */
+            uint32_t want; memcpy(&want, hdr.pad, 4);
+            if (slotio_crc32(0, files[i].data, hdr.size) != want) {
+                fs_crc_bad++;
+                kprint("VFS: AVISO: el archivo '"); kprint(hdr.name); kprint("' no coincide con su CRC (dato danado en disco)\n");
+            }
+        }
     } else {
         drop_data(i);
     }
@@ -494,6 +529,7 @@ static void vfs_format_unlocked(void)
         virtio_blk_write(FS_SUPER_LBA + s, zero_buf);
     }
     virtio_blk_write(FS_CHECKPOINT_LBA - 1, zero_buf);
+    virtio_blk_write(FS_JOURNAL_LBA, zero_buf);                /* PARCHE 112: sin diario pendiente */
 
     for (int i = 0; i < FS_MAX_FILES; ++i) {
         if (files[i].spilled) fs_spill_del(i);
@@ -630,6 +666,11 @@ void vfs_init(void)
         sb.max_files == FS_DISK_SLOTS &&
         sb.num_files <= FS_DISK_SLOTS) {
         kprint("VFS: Sistema de archivos persistente detectado (SOMAFS02: 256 archivos, sin limite de 16 KiB; los grandes en BIGFS)\n");
+        {   /* PARCHE 112: rehacer o descartar una escritura interrumpida por un corte, ANTES de leer ningun archivo */
+            int jr = slotio_recover(&fs_dev, FS_JOURNAL_LBA, FS_DATA_LBA, FS_SECTORS_PER_FILE, FS_DISK_SLOTS);
+            if (jr == 1) { fs_jreplayed++; kprint("VFS: diario: se completo una escritura interrumpida (archivo recuperado)\n"); }
+            else if (jr == 2) { fs_jdiscarded++; kprint("VFS: diario: se descarto una escritura sin terminar (el archivo conserva su contenido anterior)\n"); }
+        }
         int loaded = 0;
         for (int i = 0; i < FS_DISK_SLOTS; ++i) {
             int r = load_file_from_disk(i);
@@ -1273,8 +1314,9 @@ int vfs_checkpoint_save(void)
     vfs_sync_unlocked();
 
     static uint8_t c_buf[512] __attribute__((aligned(16)));
+    /* PARCHE 112: un corte a mitad de copia dejaba un punto de control valido a medias (marcador escrito primero). Ahora se
+     * INVALIDA el marcador, se copia todo y el marcador se escribe el ULTIMO: un checkpoint a medias nunca parece valido. */
     memset(c_buf, 0, sizeof(c_buf));
-    memcpy(c_buf, "MYOS_CHECKPOINT_V2", 18);
     if (virtio_blk_write(FS_CHECKPOINT_LBA - 1, c_buf) != 0) {
         kmutex_unlock(&vfs_mutex);
         return -1;
@@ -1288,8 +1330,11 @@ int vfs_checkpoint_save(void)
         }
     }
 
+    memset(c_buf, 0, sizeof(c_buf));
+    memcpy(c_buf, "MYOS_CHECKPOINT_V2", 18);
+    int rc = virtio_blk_write(FS_CHECKPOINT_LBA - 1, c_buf);
     kmutex_unlock(&vfs_mutex);
-    return 0;
+    return rc;
 }
 
 int vfs_checkpoint_restore(void)
@@ -1360,4 +1405,126 @@ int vfs_big_persist(void)
 {
     if (virtio_blk_capacity() == 0) return -1;
     return fs_spill_ready() ? 1 : 0;
+}
+
+/* ================================================================== PARCHE 112: autotest de cortes y comprobacion de disco */
+static void ct_fill(char *b, uint32_t n, uint32_t seed) { for (uint32_t k = 0; k < n; ++k) b[k] = (char)('a' + (k * 7 + seed * 13 + (k >> 6)) % 26); }
+
+/* Simula cortes de energia en cada escritura posible de un guardado y comprueba que el archivo queda ENTERO viejo o ENTERO nuevo. */
+int vfs_crash_selftest(void)
+{
+    if (!fs_initialized) vfs_init();
+    if (virtio_blk_capacity() == 0) { kprint("[FSCRASH] sin disco virtio: nada que probar\n"); return 1; }
+    static const uint32_t cases[][2] = { {700, 3000}, {3000, 700}, {15000, 4000}, {1, 15000}, {512, 512}, {0, 900} };
+    static char oldb[16384], newb[16384];
+    const char *path = "/workspace/_fscrash.tmp";
+    int fails = 0, runs = 0, kept_old = 0, got_new = 0;
+    kprint("[FSCRASH] cortando la energia (simulado) tras cada escritura posible de un guardado...\n");
+    for (unsigned c = 0; c < sizeof cases / sizeof cases[0]; ++c) {
+        uint32_t os = cases[c][0], ns = cases[c][1];
+        ct_fill(oldb, os, 1); ct_fill(newb, ns, 2);
+        for (long cut = 0; cut <= (long)slotio_nd(ns) + 37; ++cut) {
+            vfs_delete(path);
+            if (vfs_write(path, oldb, os) != (int)os) { kprint("[FSCRASH] no se pudo preparar el archivo\n"); fails++; break; }
+            kmutex_lock(&vfs_mutex);
+            int idx = -1;
+            for (int i = 0; i < FS_DISK_SLOTS; ++i) if (files[i].used && vfs_names_equal(files[i].name, path)) { idx = i; break; }
+            if (idx < 0) { kmutex_unlock(&vfs_mutex); fails++; break; }
+            kmutex_unlock(&vfs_mutex);
+            fs_fault_budget = cut;
+            int wr = vfs_write(path, newb, ns);
+            fs_fault_budget = -1;
+            kmutex_lock(&vfs_mutex);
+            slotio_recover(&fs_dev, FS_JOURNAL_LBA, FS_DATA_LBA, FS_SECTORS_PER_FILE, FS_DISK_SLOTS);     /* "reinicio" */
+            int lr = load_file_from_disk(idx);
+            int is_old = (lr == 0 && files[idx].used && files[idx].size == os && (os == 0 || memcmp(files[idx].data, oldb, os) == 0));
+            int is_new = (lr == 0 && files[idx].used && files[idx].size == ns && (ns == 0 || memcmp(files[idx].data, newb, ns) == 0));
+            kmutex_unlock(&vfs_mutex);
+            runs++;
+            if (is_new) got_new++; else if (is_old) kept_old++;
+            if (!is_old && !is_new) { fails++; kprint("[FSCRASH] FALLO: archivo a medias (caso "); kprint_dec(c); kprint(", corte "); kprint_dec((uint32_t)cut); kprint(")\n"); }
+            if (wr >= 0 && !is_new) { fails++; kprint("[FSCRASH] FALLO: escritura dada por buena pero no esta (caso "); kprint_dec(c); kprint(")\n"); }
+        }
+    }
+    vfs_delete(path);
+    kprint("[FSCRASH] "); kprint_dec((uint32_t)runs); kprint(" cortes simulados: "); kprint_dec((uint32_t)kept_old); kprint(" conservaron el contenido anterior, ");
+    kprint_dec((uint32_t)got_new); kprint(" completaron el nuevo, ");
+    kprint_dec((uint32_t)fails); kprint(" archivos a medias\n");
+    kprint(fails ? "[FSCRASH] HAY FALLOS\n" : "[FSCRASH] TODO OK: ningun corte dejo un archivo a medias\n");
+    return fails == 0;
+}
+
+/* Recorre los inodos en disco: cabeceras coherentes y CRC de los datos. Devuelve el numero de problemas. */
+int vfs_fscheck(void)
+{
+    if (!fs_initialized) vfs_init();
+    if (virtio_blk_capacity() == 0) { kprint("[FSCHECK] sin disco virtio\n"); return 0; }
+    static uint8_t sec[512] __attribute__((aligned(16)));
+    static uint8_t buf[FS_DATA_SECTORS * 512];
+    int used = 0, crc_ok = 0, sin_crc = 0, bad = 0;
+    kmutex_lock(&vfs_mutex);
+    for (int i = 0; i < FS_DISK_SLOTS; ++i) {
+        struct fs_disk_header h; uint64_t b = FS_DATA_LBA + (uint64_t)i * FS_SECTORS_PER_FILE;
+        if (virtio_blk_read(b, sec) != 0) { bad++; continue; }
+        memcpy(&h, sec, sizeof h);
+        if (h.used == 0) continue;
+        if (h.used > 1 || h.name[0] == 0 || (h.spilled != 'B' && h.size >= FS_DATA_MAX)) { bad++; kprint("[FSCHECK] inodo "); kprint_dec((uint32_t)i); kprint(": cabecera incoherente\n"); continue; }
+        used++;
+        if (h.spilled == 'B') continue;
+        uint32_t nd = slotio_nd(h.size); int io = 0;
+        for (uint32_t s = 0; s < nd; ++s) if (virtio_blk_read(b + 1 + s, buf + s * 512) != 0) io = 1;
+        if (io) { bad++; continue; }
+        if (h.pad[4] != 'C') { sin_crc++; continue; }
+        uint32_t want; memcpy(&want, h.pad, 4);
+        if (slotio_crc32(0, buf, h.size) == want) crc_ok++; else { bad++; kprint("[FSCHECK] '"); kprint(h.name); kprint("': CRC no coincide\n"); }
+    }
+    kmutex_unlock(&vfs_mutex);
+    kprint("[FSCHECK] archivos en disco: "); kprint_dec((uint32_t)used); kprint(" | CRC correcto: "); kprint_dec((uint32_t)crc_ok);
+    kprint(" | sin CRC (escritos por un nucleo anterior): "); kprint_dec((uint32_t)sin_crc); kprint(" | problemas: "); kprint_dec((uint32_t)bad); kprint("\n");
+    kprint("[FSCHECK] diario: "); kprint_dec(fs_commits); kprint(" guardados atomicos, "); kprint_dec(fs_jreplayed); kprint(" rehechos y ");
+    kprint_dec(fs_jdiscarded); kprint(" descartados en el arranque, "); kprint_dec(fs_crc_bad); kprint(" avisos de CRC al cargar, "); kprint_dec(fs_spill_fixed); kprint(" archivos grandes recuperados\n");
+    return bad;
+}
+
+/* ================================================================== PARCHE 114: prueba de cortes REALES (tools/killtest.py)
+ * El script marca el disco (LBA 30), arranca QEMU y lo mata con kill -9 en mitad de escrituras; en cada arranque este codigo verifica que
+ * ningun archivo de prueba quedo a medias y que `fscheck` no ve problemas, y vuelve a escribir sin parar hasta que lo vuelvan a matar. */
+static void kt_fill(char *b, uint32_t n, uint32_t seed)
+{
+    for (uint32_t k = 0; k < n; ++k) b[k] = (char)('a' + (k * 7 + seed * 13 + (k >> 6)) % 26);
+    if (n >= 8) { memcpy(b, &seed, 4); memcpy(b + 4, &n, 4); }              /* semilla y longitud dentro del propio archivo: se autoverifica */
+}
+static int kt_check(const char *path)           /* -1 no existe, 0 danado, 1 correcto */
+{
+    static char b[41000], e[41000];
+    int n = vfs_read(path, b, sizeof b);
+    if (n < 0) return -1;
+    if (n < 8) return 0;
+    uint32_t seed, len; memcpy(&seed, b, 4); memcpy(&len, b + 4, 4);
+    if (len != (uint32_t)n) return 0;
+    kt_fill(e, (uint32_t)n, seed);
+    return memcmp(b, e, (size_t)n) == 0 ? 1 : 0;
+}
+void vfs_killtest_boot(void)
+{
+    static uint8_t sec[512] __attribute__((aligned(16)));
+    if (virtio_blk_capacity() <= SOMA_LBA_KILLTEST + 1 || virtio_blk_read(SOMA_LBA_KILLTEST, sec) != 0 || memcmp(sec, "SOMA_KILLTEST", 13) != 0) return;
+    if (!fs_initialized) vfs_init();
+    const char *names[3] = { "/workspace/k0.bin", "/workspace/k1.bin", "/workspace/k2.bin" };
+    int bad = 0, present = 0;
+    for (int f = 0; f < 3; ++f) {
+        int r = kt_check(names[f]);
+        if (r == 0) { bad++; kprint("[KV] ARCHIVO DANADO: "); kprint(names[f]); kprint("\n"); } else if (r == 1) present++;
+    }
+    int pb = vfs_fscheck();
+    kprint(bad == 0 && pb == 0 ? "[KV] OK presentes=" : "[KV] FALLO presentes="); kprint_dec((uint32_t)present); kprint("\n");
+    static char b[41000]; uint32_t seed = 1000, x = 12345;
+    for (;;) {
+        seed++; x = x * 1664525u + 1013904223u;
+        uint32_t sz = 100 + (x >> 8) % 39000; int f = (int)((x >> 4) % 3);
+        if ((x >> 20) % 5 == 0) sz = 8 + (x >> 8) % 300;                     /* tambien muchos pequenos */
+        kt_fill(b, sz, seed);
+        vfs_write(names[f], b, sz);
+        if (seed % 20 == 0) kprint("[KW] .\n");
+    }
 }

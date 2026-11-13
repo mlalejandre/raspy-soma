@@ -95,6 +95,10 @@ void panic_print_context_with(panic_read64_fn rd, uint64_t pc, uint64_t lr,
     kprint("  Resolver: python3 tools/symbolize.py <log> build/<arq>/soma.elf\n");
 }
 
+static volatile int panic_depth;
+int panic_enter(void) { int d = panic_depth; panic_depth = d + 1; return d; }
+void panic_reset(void) { panic_depth = 0; }
+
 static int mem_read64(uint64_t addr, uint64_t *out)
 {
     if ((addr & 7) != 0) return 0;

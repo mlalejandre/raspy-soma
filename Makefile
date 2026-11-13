@@ -77,7 +77,7 @@ OBJS_CORE = \
 	$(BUILD)/fm.o \
 	$(BUILD)/notepad.o \
 	$(BUILD)/memview.o $(BUILD)/js_runtime.o \
-	$(BUILD)/layout.o $(BUILD)/tex.o $(BUILD)/settings.o $(BUILD)/savedlg.o $(BUILD)/codeedit.o $(BUILD)/textfield.o $(BUILD)/coder_core.o $(BUILD)/pdf.o $(BUILD)/pdfview.o $(BUILD)/sysmon.o \
+	$(BUILD)/layout.o $(BUILD)/tex.o $(BUILD)/settings.o $(BUILD)/savedlg.o $(BUILD)/codeedit.o $(BUILD)/textfield.o $(BUILD)/coder_core.o $(BUILD)/coder_demo.o $(BUILD)/pdf.o $(BUILD)/pdfview.o $(BUILD)/sysmon.o \
 	$(BUILD)/paint.o \
 	$(BUILD)/coder_app.o \
 	$(BUILD)/vm.o \
@@ -131,7 +131,7 @@ OBJS_CORE += $(BUILD)/ssp.o
 endif
 
 # PARCHE 032: descripcion del hardware (ACPI / FDT)
-OBJS_CORE += $(BUILD)/hwinfo.o $(BUILD)/nvme_proto.o $(BUILD)/blk.o $(BUILD)/xhci_proto.o $(BUILD)/hid_proto.o $(BUILD)/msc_proto.o $(BUILD)/fat.o $(BUILD)/sd_proto.o $(BUILD)/pcie_proto.o $(BUILD)/mbox_proto.o $(BUILD)/rp1_proto.o $(BUILD)/gem_proto.o $(BUILD)/dma_pool.o $(BUILD)/gpio_proto.o $(BUILD)/sdio_proto.o $(BUILD)/crypto.o $(BUILD)/wpa.o $(BUILD)/brcm_proto.o $(BUILD)/png_enc.o
+OBJS_CORE += $(BUILD)/hwinfo.o $(BUILD)/nvme_proto.o $(BUILD)/blk.o $(BUILD)/xhci_proto.o $(BUILD)/hid_proto.o $(BUILD)/msc_proto.o $(BUILD)/fat.o $(BUILD)/sd_proto.o $(BUILD)/pcie_proto.o $(BUILD)/mbox_proto.o $(BUILD)/rp1_proto.o $(BUILD)/gem_proto.o $(BUILD)/dma_pool.o $(BUILD)/gpio_proto.o $(BUILD)/sdio_proto.o $(BUILD)/crypto.o $(BUILD)/wpa.o $(BUILD)/brcm_proto.o $(BUILD)/png_enc.o $(BUILD)/conc_test.o
 
 OBJS = $(OBJS_ARCH) $(OBJS_CORE)
 HEADERS = $(wildcard src/*.h) $(wildcard src/*/*.h) $(wildcard src/cursors/*.h) $(wildcard src/fonts/*.h) $(wildcard src/icons/*.h) $(wildcard src/arch/$(ARCH)/*.h)
@@ -265,6 +265,10 @@ test:
 	$(HOST_CC) $(TEST_CFLAGS) tests/test_srcfs.c src/fs/srcfs.c tests/stubs_common.c tests/stubs_fs.c -o build/tests/test_srcfs
 	$(HOST_CC) $(TEST_CFLAGS) tests/test_elf.c src/core/elf.c -o build/tests/test_elf
 	$(HOST_CC) $(TEST_CFLAGS) -Isrc/arch/x86_64 tests/test_uaccess.c -o build/tests/test_uaccess
+	$(HOST_CC) $(TEST_CFLAGS) -Isrc/arch/x86_64 tests/test_pic_irq.c -o build/tests/test_pic_irq
+	$(HOST_CC) $(TEST_CFLAGS) tests/test_agent_policy.c -o build/tests/test_agent_policy
+	$(HOST_CC) $(TEST_CFLAGS) tests/test_slotio.c -o build/tests/test_slotio
+	$(HOST_CC) $(TEST_CFLAGS) tests/test_spillio.c src/fs/bigfs.c -o build/tests/test_spillio
 	$(HOST_CC) $(TEST_CFLAGS) -DVMM_HOST_TEST tests/test_vmm.c tests/stubs_common.c src/arch/x86_64/vmm.c -o build/tests/test_vmm
 	$(HOST_CC) $(TEST_CFLAGS) tests/test_bigfs.c src/fs/bigfs.c -o build/tests/test_bigfs
 	$(HOST_CC) $(TEST_CFLAGS) tests/test_audio.c src/core/audio.c -o build/tests/test_audio
@@ -328,6 +332,10 @@ test:
 	./build/tests/test_panic
 	./build/tests/test_mutex
 	./build/tests/test_uaccess
+	./build/tests/test_pic_irq
+	./build/tests/test_agent_policy
+	./build/tests/test_slotio
+	./build/tests/test_spillio
 	./build/tests/test_vmm
 	./build/tests/test_elf $(wildcard build/x86_64/user/*.elf)
 	./build/tests/test_bigfs

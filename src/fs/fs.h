@@ -66,5 +66,8 @@ int  vfs_grep_all(const char *pat, int ignore_case, int list_only,
 
 int  vfs_checkpoint_save(void);
 int  vfs_checkpoint_restore(void);
+int  vfs_crash_selftest(void);   /* PARCHE 112: cortes simulados; 1 = ningun archivo a medias */
+void vfs_killtest_boot(void);    /* PARCHE 114: si el disco lleva la marca de prueba, verifica y escribe sin parar (no vuelve) */
+int  vfs_fscheck(void);          /* PARCHE 112: comprueba cabeceras y CRC en disco; devuelve los problemas */
 
 #endif

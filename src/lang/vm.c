@@ -831,7 +831,7 @@ static int vm_run_inner(struct soma_vm *vm, const uint8_t *bytecode, uint32_t le
     vm->halted = 0;
 
     while (vm->ip < vm->code_len && !vm->halted) {
-        if (++vm_steps > VM_MAX_STEPS) { /*PL1_WATCHDOG*/
+        if (++vm_steps > vm_step_limit) { /*PL1_WATCHDOG*/
             kprint("[VM ERROR] Limite de instrucciones sin pausa excedido (bucle infinito?). Usa sys.sleep() en bucles largos.\n");
             return -1;
         }
@@ -2152,6 +2152,7 @@ static int vm_run_inner(struct soma_vm *vm, const uint8_t *bytecode, uint32_t le
 }
 
 /*PL3_RUNWRAP_B*/
+uint64_t vm_step_limit = VM_MAX_STEPS;
 int vm_run(struct soma_vm *vm, const uint8_t *bytecode, uint32_t len)
 {
     struct soma_vm *prev = g_vm_cur;

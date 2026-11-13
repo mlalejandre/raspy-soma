@@ -161,6 +161,18 @@ static void test_vigilante_integrado(void)
     CHECK(strstr(host_out(), "aviso 2") != 0);
 }
 
+static void test_panico_anidado(void)
+{
+    panic_reset();
+    CHECK_EQ_INT(panic_enter(), 0);        /* primer panico: informe normal */
+    CHECK_EQ_INT(panic_enter(), 1);        /* excepcion durante el informe: nivel 1 (un aviso corto) */
+    CHECK_EQ_INT(panic_enter(), 2);        /* y las siguientes: solo detener */
+    CHECK_EQ_INT(panic_enter(), 3);
+    panic_reset();
+    CHECK_EQ_INT(panic_enter(), 0);        /* reiniciable (solo pruebas) */
+    panic_reset();
+}
+
 int main(void)
 {
     test_cadena_normal();
@@ -170,5 +182,6 @@ int main(void)
     test_impresion();
     test_vigilante_decision();
     test_vigilante_integrado();
+    test_panico_anidado();
     TEST_MAIN_END("panic");
 }
