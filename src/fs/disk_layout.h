@@ -13,6 +13,7 @@
 #define SOMA_LBA_RESULT_SECTORS 4
 #define SOMA_LBA_BOOT_GATE      24     /* LBA 24: Flag de prueba canaria */
 #define SOMA_LBA_RESUME_FLAG    25     /* LBA 25: Flag de reanudación atómica */
+#define SOMA_LBA_CKPT_INTENT    31     /* LBA 31: marca "restauracion de checkpoint en curso" (src/fs/ckptio.h); el arranque la completa */
 #define SOMA_LBA_KILLTEST       30     /* LBA 30: marca "SOMA_KILLTEST" -> el arranque ejecuta la prueba de cortes reales (tools/killtest.py) */
 
 /* Zona 2: Sistema de Archivos Persistente V2 (RamFS SOMAFS02) */

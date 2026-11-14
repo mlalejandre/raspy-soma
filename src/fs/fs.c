@@ -6,6 +6,7 @@
 #include "mem.h"
 #include "virtio_blk.h"
 #include "slotio.h"
+#include "ckptio.h"
 #include "sysinfo.h"
 #include "pmm.h"
 #include "vmm.h"
@@ -659,6 +660,11 @@ void vfs_init(void)
     fs_initialized = 1;
     kmutex_init(&vfs_mutex, "vfs_lock");
 
+    if (virtio_blk_capacity() > 0) {                              /* PARCHE 120: una restauracion de checkpoint interrumpida se completa ANTES de leer nada */
+        int cr = ckpt_recover(&fs_dev, FS_CHECKPOINT_LBA, FS_SUPER_LBA, FS_TOTAL_SECTORS, FS_CHECKPOINT_LBA - 1, SOMA_LBA_CKPT_INTENT, FS_JOURNAL_LBA);
+        if (cr == 1) kprint("VFS: se completo una restauracion de checkpoint interrumpida\n");
+        else if (cr == 2) kprint("VFS: marca de restauracion sin checkpoint valido (descartada)\n");
+    }
     struct fs_superblock sb;
     if (virtio_blk_read(FS_SUPER_LBA, &sb) == 0 &&
         memcmp(sb.magic, "SOMAFS02", 8) == 0 &&
@@ -1307,62 +1313,26 @@ int vfs_create(const char *name, const char *initial_data)
     return r;
 }
 
+/* PARCHE 120: checkpoint con CRC, barreras y restauracion reanudable (src/fs/ckptio.h) */
+static uint32_t fs_ckpt_seq;
 int vfs_checkpoint_save(void)
 {
     if (!fs_initialized) vfs_init();
     kmutex_lock(&vfs_mutex);
-    vfs_sync_unlocked();
-
-    static uint8_t c_buf[512] __attribute__((aligned(16)));
-    /* PARCHE 112: un corte a mitad de copia dejaba un punto de control valido a medias (marcador escrito primero). Ahora se
-     * INVALIDA el marcador, se copia todo y el marcador se escribe el ULTIMO: un checkpoint a medias nunca parece valido. */
-    memset(c_buf, 0, sizeof(c_buf));
-    if (virtio_blk_write(FS_CHECKPOINT_LBA - 1, c_buf) != 0) {
-        kmutex_unlock(&vfs_mutex);
-        return -1;
-    }
-
-    for (uint32_t s = 0; s < FS_TOTAL_SECTORS; ++s) {
-        if (virtio_blk_read(FS_SUPER_LBA + s, c_buf) != 0 ||
-            virtio_blk_write(FS_CHECKPOINT_LBA + s, c_buf) != 0) {
-            kmutex_unlock(&vfs_mutex);
-            return -1;
-        }
-    }
-
-    memset(c_buf, 0, sizeof(c_buf));
-    memcpy(c_buf, "MYOS_CHECKPOINT_V2", 18);
-    int rc = virtio_blk_write(FS_CHECKPOINT_LBA - 1, c_buf);
+    int rc = vfs_sync_unlocked();                                  /* antes se ignoraba el resultado */
+    if (rc == 0) rc = ckpt_save(&fs_dev, FS_SUPER_LBA, FS_CHECKPOINT_LBA, FS_TOTAL_SECTORS, FS_CHECKPOINT_LBA - 1, ++fs_ckpt_seq);
     kmutex_unlock(&vfs_mutex);
-    return rc;
+    return rc == 0 ? 0 : -1;
 }
 
 int vfs_checkpoint_restore(void)
 {
     if (!fs_initialized) vfs_init();
     kmutex_lock(&vfs_mutex);
-
-    static uint8_t c_buf[512] __attribute__((aligned(16)));
-    if (virtio_blk_read(FS_CHECKPOINT_LBA - 1, c_buf) != 0 ||
-        memcmp(c_buf, "MYOS_CHECKPOINT_V2", 18) != 0) {
-        kmutex_unlock(&vfs_mutex);
-        return -1;
-    }
-
-    for (uint32_t s = 0; s < FS_TOTAL_SECTORS; ++s) {
-        if (virtio_blk_read(FS_CHECKPOINT_LBA + s, c_buf) != 0 ||
-            virtio_blk_write(FS_SUPER_LBA + s, c_buf) != 0) {
-            kmutex_unlock(&vfs_mutex);
-            return -1;
-        }
-    }
-
-    for (int i = 0; i < FS_DISK_SLOTS; ++i) {
-        load_file_from_disk(i);
-    }
-
+    int rc = ckpt_restore(&fs_dev, FS_CHECKPOINT_LBA, FS_SUPER_LBA, FS_TOTAL_SECTORS, FS_CHECKPOINT_LBA - 1, SOMA_LBA_CKPT_INTENT, FS_JOURNAL_LBA);
+    if (rc == 0) for (int i = 0; i < FS_DISK_SLOTS; ++i) load_file_from_disk(i);
     kmutex_unlock(&vfs_mutex);
-    return 0;
+    return rc == 0 ? 0 : -1;
 }
 
 /* ================================================================== PARCHE 087: archivos de cualquier tamano */
@@ -1411,6 +1381,36 @@ int vfs_big_persist(void)
 static void ct_fill(char *b, uint32_t n, uint32_t seed) { for (uint32_t k = 0; k < n; ++k) b[k] = (char)('a' + (k * 7 + seed * 13 + (k >> 6)) % 26); }
 
 /* Simula cortes de energia en cada escritura posible de un guardado y comprueba que el archivo queda ENTERO viejo o ENTERO nuevo. */
+/* PARCHE 120: autoprueba REAL del checkpoint sobre el disco: guardar, modificar, restaurar; y un checkpoint corrupto se rechaza sin tocar el VFS vivo. */
+int vfs_checkpoint_selftest(void)
+{
+    if (!fs_initialized) vfs_init();
+    if (virtio_blk_capacity() == 0) { kprint("[CKPT] sin disco virtio: nada que probar\n"); return 1; }
+    const char *path = "/workspace/_ckpt.tmp"; int bad = 0; static char rb[64];
+    vfs_write(path, "version-1", 9);
+    if (vfs_checkpoint_save() != 0) { kprint("[CKPT] FALLO: guardar\n"); return 0; }
+    vfs_write(path, "version-2-distinta", 18);
+    if (vfs_checkpoint_restore() != 0) { kprint("[CKPT] FALLO: restaurar\n"); bad++; }
+    memset(rb, 0, sizeof rb); int n = vfs_read(path, rb, sizeof rb - 1);
+    if (n != 9 || memcmp(rb, "version-1", 9) != 0) { kprint("[CKPT] FALLO: tras restaurar el archivo no vuelve a version-1\n"); bad++; }
+    /* corrupcion: se estropea un byte de la copia, el VFS vivo no debe tocarse */
+    vfs_write(path, "version-3", 9);
+    static uint8_t sec[512] __attribute__((aligned(16)));
+    uint64_t cl = FS_CHECKPOINT_LBA + 40;
+    if (virtio_blk_read(cl, sec) == 0) {
+        uint8_t keep = sec[7]; sec[7] ^= 0x55; virtio_blk_write(cl, sec); virtio_blk_flush();
+        int r = vfs_checkpoint_restore();
+        memset(rb, 0, sizeof rb); n = vfs_read(path, rb, sizeof rb - 1);
+        if (r == 0) { kprint("[CKPT] FALLO: restauro un checkpoint corrupto\n"); bad++; }
+        if (n != 9 || memcmp(rb, "version-3", 9) != 0) { kprint("[CKPT] FALLO: un checkpoint corrupto altero el VFS vivo\n"); bad++; }
+        sec[7] = keep; virtio_blk_write(cl, sec); virtio_blk_flush();
+        if (vfs_checkpoint_restore() != 0) { kprint("[CKPT] FALLO: con la copia reparada no restaura\n"); bad++; }
+    } else bad++;
+    vfs_delete(path); vfs_checkpoint_save();
+    kprint(bad == 0 ? "[CKPT] TODO OK: guardar/restaurar y rechazo de copia corrupta\n" : "[CKPT] HAY FALLOS\n");
+    return bad == 0;
+}
+
 int vfs_crash_selftest(void)
 {
     if (!fs_initialized) vfs_init();

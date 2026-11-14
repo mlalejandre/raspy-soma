@@ -88,7 +88,7 @@ OBJS_CORE = \
 
 # SOMA_PARCHE_016_EXEC: programas de usuario (src/user/*.c) -> ELF -> objeto enlazado en el kernel (solo x86_64)
 ifeq ($(ARCH),x86_64)
-USER_PROGS = hello fault ticker sumfile wavplay ssetest fbtest      # se enlazan en el kernel y se copian a /bin/ (caben en el VFS de 16 KiB)
+USER_PROGS = hello fault ticker sumfile wavplay ssetest fbtest sysfuzz      # se enlazan en el kernel y se copian a /bin/ (caben en el VFS de 16 KiB)
 USER_PROGS_BIG = bigprog vidplay                    # SOMA_PARCHE_019_FILES: demasiado grandes para el VFS; se construyen aparte y viven en el almacen BIGFS
 USER_CFLAGS = -m64 -march=x86-64 -ffreestanding -O2 -Wall -Wextra -fno-stack-protector -fPIE -mno-red-zone -mgeneral-regs-only -nostdlib -static -Isrc/user
 OBJS_ARCH += $(BUILD)/userprogs.o
@@ -268,6 +268,7 @@ test:
 	$(HOST_CC) $(TEST_CFLAGS) -Isrc/arch/x86_64 tests/test_pic_irq.c -o build/tests/test_pic_irq
 	$(HOST_CC) $(TEST_CFLAGS) tests/test_agent_policy.c -o build/tests/test_agent_policy
 	$(HOST_CC) $(TEST_CFLAGS) tests/test_slotio.c -o build/tests/test_slotio
+	$(HOST_CC) $(TEST_CFLAGS) tests/test_ckptio.c -o build/tests/test_ckptio
 	$(HOST_CC) $(TEST_CFLAGS) tests/test_spillio.c src/fs/bigfs.c -o build/tests/test_spillio
 	$(HOST_CC) $(TEST_CFLAGS) -DVMM_HOST_TEST tests/test_vmm.c tests/stubs_common.c src/arch/x86_64/vmm.c -o build/tests/test_vmm
 	$(HOST_CC) $(TEST_CFLAGS) tests/test_bigfs.c src/fs/bigfs.c -o build/tests/test_bigfs
@@ -335,6 +336,7 @@ test:
 	./build/tests/test_pic_irq
 	./build/tests/test_agent_policy
 	./build/tests/test_slotio
+	./build/tests/test_ckptio
 	./build/tests/test_spillio
 	./build/tests/test_vmm
 	./build/tests/test_elf $(wildcard build/x86_64/user/*.elf)

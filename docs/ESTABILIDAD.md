@@ -1118,3 +1118,50 @@ nucleos a la vez, asi que se ha elegido un modelo asimetrico que no puede romper
   2) compila pero no termina, 3) un modelo que no se corrige y al que SOLO le queda la negativa a entregar. Las lecciones viven en memoria durante la demo para que cada
   ejecucion sea identica; imprime la huella (hash) del registro: dos ejecuciones dan la misma (0xD93160A9). `demo_ai vivo` usa el LLM real con las mismas pruebas.
 - QEMU: los 3 escenarios 3/3; la huella coincide en ejecuciones repetidas, tambien con el disco ya usado; el sistema sigue arrancando hasta `[SOMA ready]`.
+
+## Parche 117 — Fase 1 (seguridad), fuzzing de syscalls desde ring 3: `usfuzz`
+- Hasta ahora la frontera usuario/kernel se probaba con casos escritos a mano y con un fuzz de la logica en el host (`uaccess.h`). Faltaba lo mas realista: procesos de verdad
+  en ring 3 que atacan al kernel de verdad. Nuevo programa de usuario `/bin/sysfuzz.elf` (`src/user/sysfuzz.c`): un generador xorshift con semilla lanza miles de syscalls
+  hostiles (numeros inexistentes, punteros al kernel, bordes de la ventana de usuario, pila, desbordamientos de longitud, valores enormes) contra las 19 syscalls reales.
+- El proceso es su propio ORACULO: toda llamada cuyo puntero/longitud caiga fuera de lo que le pertenece DEBE devolver un error negativo (nunca exito) y el kernel no puede escribir
+  fuera de lo pedido (centinela y arena con relleno). El codigo (solo lectura) se comprueba al final; el codigo de salida es el numero de violaciones.
+- Comando `usfuzz [procesos] [syscalls] [semilla]` (por defecto 24 x 3000, semilla 1): lanza los procesos de 3 en 3 y comprueba despues el sistema entero: ningun proceso con violaciones,
+  excepciones ni plazos agotados; sin fuga de marcos en una segunda pasada corta en estado estable; monton del kernel consistente; PML4 del kernel sin entradas de usuario.
+- Resultado en QEMU: 24 procesos x 3000 syscalls (72.000 llamadas hostiles), semillas distintas: 0 violaciones, 0 excepciones, 0 plazos, monton consistente, sin fugas.
+- Mutacion: quitando la comprobacion de rango de `uaccess_range_ok` el kernel cae en cuanto el fuzzer lo ataca (el test detecta la ausencia de la proteccion).
+- Durante el desarrollo se corrigieron fallos DEL PROPIO ARNES (el kernel escribia legitimamente en la .bss del proceso por un puntero que el fuzzer le habia dado; la cache del
+  backbuffer de pantalla se confundia con una fuga): el oraculo desvia las escrituras legitimas a un arena y la medida de fugas se hace en estado estable.
+
+## Parche 118 — Fase 1 (memoria): carga de procesos con memoria agotada en cada punto (`oomtest`)
+- Nuevo gancho en el PMM: `pmm_inject_oom_after(n)` (las n primeras asignaciones de marco funcionan y todas las siguientes devuelven 0; -1 lo desactiva; sin coste cuando esta apagado).
+- `oomtest` recorre n = 0, 1, 2... mientras carga un proceso de usuario: cada vuelta hace fallar una asignacion distinta (marcos de codigo, pila, tablas de paginas de la PML4 del
+  proceso, crecimiento del monton). Obligaciones: ni cuelgue ni panico; el fallo devuelve error; el sistema queda EXACTAMENTE igual (mismos marcos libres, mismos bloques vivos,
+  monton consistente); y cuando n basta, el proceso arranca y termina con codigo 0.
+- QEMU: 38 puntos de fallo distintos, 38 denegaciones, 0 defectos; la primera carga completa ocurre con n = 38.
+- Mutacion: sin `free_pages` en `slot_abort` el test marca un marco perdido ya con n = 1.
+
+## Parche 119 — Fase 1 (memoria): OOM en el montón y en el sistema de archivos (`oomtest`, parte 2)
+- `kheap_largest_free()` (solo pruebas). Cada ronda pide MAS de lo que cabe en el mayor hueco libre, de modo que el montón tiene que crecer, y la repite con el PMM fallando en el
+  marco 0, k, 2k... hasta cubrir toda la peticion; la ultima vuelta va sin fallos. 4 rondas de tamano creciente (el montón no se encoge).
+- kmalloc: devuelve NULL, nunca basura; tras cada fallo no cambian los bloques vivos ni los bytes mapeados y solo puede quedar una tabla de paginas creada (se reutiliza
+  despues; la cota total es el tamano del monton / 2 MiB). QEMU: 93 peticiones denegadas, 5 servidas, 24 tablas retenidas, monton consistente.
+- vfs_write sobre un archivo existente (ruta /tmp/, sin disco): si falla, el contenido anterior sigue INTACTO; si funciona, el tamano es el pedido. QEMU: 70 escrituras
+  rechazadas con el contenido original intacto, 28 aceptadas. vfs_create: o existe entero o no existe (98 correctas; con memoria tan pequena no llega a fallar).
+- Mutacion: sin liberar los marcos en la vuelta atras de `kheap_expand` el test marca perdida de marcos ya con n = 4.
+- `oomtest` ejecuta ahora las dos partes (carga de procesos + monton/archivos).
+
+## Parche 120 — Fase 2 (persistencia): checkpoint del VFS a prueba de cortes y de corrupcion, y 3 comandos de GUI arreglados
+- Antes: `checkpoint` invalidaba el marcador, copiaba y escribia el marcador sin barreras (con una cache que reordena podia quedar el marcador durable con la copia a medias),
+  ignoraba si el guardado previo del VFS habia fallado, y `rollback` copiaba sobre el VFS vivo SIN comprobar nada: un checkpoint corrupto lo pisaba, y una restauracion
+  interrumpida lo dejaba mezclado (mitad viejo, mitad nuevo) sin que nadie lo notara.
+- `src/fs/ckptio.h` (codigo puro): guardar = marcador a cero -> barrera -> copia calculando el CRC32 -> barrera -> marcador V3 con CRC -> barrera. Restaurar = verificar el CRC
+  (si falla, el VFS vivo no se toca) -> marca de intencion (LBA 31) -> invalidar el diario del VFS (que un guardado viejo no se reaplique) -> copiar -> borrar la marca. En el
+  arranque `ckpt_recover` completa una restauracion interrumpida ANTES de leer el VFS. El formato antiguo V2 se sigue aceptando (sin CRC).
+- `tests/test_ckptio.c` (ASan/UBSan, 8.420 comprobaciones): corte tras CADA escritura del guardado y de la restauracion, con disco sin cache y con cache volatil que reordena y
+  pierde escrituras; 3.000 cortes aleatorios; bit alterado en cualquier punto del checkpoint o del marcador; formato V2. Garantias: un checkpoint valido es siempre el viejo
+  entero o el nuevo entero; tras restaurar+recuperar el VFS es el anterior o el checkpoint completo, nunca una mezcla; la recuperacion es idempotente. Dos mutaciones: sin
+  barreras se ve un checkpoint valido a medias; sin recuperacion en el arranque se ve un VFS mezclado.
+- `fscrash` ejecuta ahora tambien `vfs_checkpoint_selftest` (disco real): guardar, modificar, restaurar (vuelve a la version guardada), estropear un byte de la copia (se rechaza y el VFS vivo
+  no cambia), repararlo (restaura). QEMU: TODO OK. `checkpoint` y `rollback` informan ahora de los fallos en vez de callar.
+- GUI: `memview`, `gui_open_notepad` y `gui_open_agents` no fijaban `g_pending_app`, asi que al lanzarlos desde la shell se abria el escritorio vacio; ahora abren su ventana (como el
+  resto de los `gui_open_*`).

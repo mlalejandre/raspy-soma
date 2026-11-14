@@ -3973,7 +3973,9 @@ static void gui_open_memview__impl(void)
     current_app = APP_AGENT_MEMORY;
     agent_global_focus = 0;
     memview_init();
+    g_pending_app = APP_AGENT_MEMORY;                   /* PARCHE 120: sin esto la orden abria el escritorio sin la ventana */
     cmd_vsoma("", 0, 0);
+    g_pending_app = APP_DESKTOP;
 }
 void gui_open_memview(void)   /* PARCHE 091: el hilo del agente pide turno de pantalla */
 {
@@ -4130,7 +4132,9 @@ static void gui_open_notepad__impl(const char *path)
     agent_global_focus = 0;
     notepad_init();
     if (path && *path) notepad_load_file(path);
+    g_pending_app = APP_NOTEPAD;                        /* PARCHE 120 */
     cmd_vsoma("", 0, 0);
+    g_pending_app = APP_DESKTOP;
 }
 void gui_open_notepad(const char *path)   /* PARCHE 091: el hilo del agente pide turno de pantalla */
 {
@@ -4225,7 +4229,9 @@ static void gui_open_agents__impl(void)
     ensure_window_geom();
     current_app = APP_AGENTS;
     agent_global_focus = 0;
+    g_pending_app = APP_AGENTS;                         /* PARCHE 120 */
     cmd_vsoma("", 0, 0);
+    g_pending_app = APP_DESKTOP;
 }
 void gui_open_agents(void)   /* PARCHE 091: el hilo del agente pide turno de pantalla */
 {

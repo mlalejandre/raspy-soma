@@ -114,3 +114,7 @@
 20261113_230445 parche 114: Fase 2 persistencia: prueba de cortes reales con kill -9 (tools/killtest.py)
 20261113_232123 parche 115: Fase 2 persistencia: barreras de escritura para el diario y BIGFS, probadas con cache volatil
 20261113_234620 parche 116: Fase 3 IA: pruebas de comportamiento en el programador y demo reproducible demo_ai
+20261114_002242 parche 117: Fase 1 seguridad: fuzzing de syscalls desde ring 3 (usfuzz)
+20261114_003237 parche 118: Fase 1 memoria: inyeccion de OOM en el PMM y prueba oomtest
+20261114_010038 parche 119: Fase 1 memoria: OOM en el monton y el sistema de archivos (oomtest parte 2)
+20261114_011132 parche 120: Fase 2 persistencia: checkpoint con CRC, barreras y restauracion reanudable; GUI memview/notepad/agents

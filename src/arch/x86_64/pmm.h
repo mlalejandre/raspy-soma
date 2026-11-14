@@ -12,6 +12,10 @@ void pmm_init(uint32_t mb_magic, uint32_t mb_info_addr);
 /* Asigna un marco fisico de 4 KiB (devuelve direccion fisica o 0 si OOM) */
 uintptr_t pmm_alloc_frame(void);
 
+/* PARCHE 118: prueba de memoria agotada. pmm_inject_oom_after(n): tras n asignaciones todas fallan (0); -1 lo desactiva. hits = cuantas se denegaron. */
+void pmm_inject_oom_after(long n);
+unsigned long pmm_inject_oom_hits(void);
+
 /* Libera un marco fisico de 4 KiB */
 void pmm_free_frame(uintptr_t phys_addr);
 

@@ -85,6 +85,9 @@ int64_t usermode_run_code(const void *code, size_t len, uint32_t max_ms);
 /* Prueba integral (syscalls+CPL, #PF, #GP, plazo; despues concurrencia: preemption, aislamiento entre procesos, fallo de uno sin afectar a otro).
  * Devuelve 0 si todo se comporta como se espera. */
 int usermode_selftest(void);
+int usermode_oomtest_mem(void);   /* PARCHE 119: OOM en el monton y el sistema de archivos; 1 = todo OK */
+int usermode_oomtest(void);   /* PARCHE 118: carga de procesos con memoria agotada en cada punto; 1 = todo OK */
+int usermode_fuzz(int nproc, uint32_t iters, uint32_t seed);   /* PARCHE 117: fuzzing de syscalls desde ring 3; 1 = todo OK */
 int usermode_cpu_features(void);     /* bit0 = SMEP activo, bit1 = SMAP activo */
 
 /* Ganchos que llama el manejador de interrupciones (idt.c) */

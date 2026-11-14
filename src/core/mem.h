@@ -37,6 +37,7 @@ void  kheap_get_counters(struct kheap_counters *out);
 
 /* Recorre todo el heap: devuelve el numero de problemas (0 = sano). */
 int   kheap_check(void);
+size_t kheap_largest_free(void);   /* PARCHE 119: mayor hueco libre (pruebas de OOM) */
 
 /* Auto-test con prueba de expansion dinamica en vivo (>16 KiB) */
 int   kheap_test_self(void);

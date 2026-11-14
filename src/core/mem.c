@@ -559,6 +559,14 @@ int kheap_test_reentry(void)
     return bien;
 }
 
+/* PARCHE 119 (solo pruebas): tamano del mayor bloque libre; sirve para agotar el hueco y forzar que la siguiente peticion haga crecer el monton */
+size_t kheap_largest_free(void)
+{
+    size_t m = 0;
+    for (struct block_header *c = heap_head; c; c = c->next) if (c->is_free && c->size > m) m = c->size;
+    return m;
+}
+
 void kheap_stats(size_t *used, size_t *free_bytes)
 {
     if (!heap_initialized) kheap_init();

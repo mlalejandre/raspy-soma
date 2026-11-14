@@ -144,8 +144,18 @@ void pmm_init(uint32_t mb_magic, uint32_t mb_info_addr)
     pmm_dump_stats();
 }
 
+/* PARCHE 118: inyeccion de OOM. Con n >= 0, las n primeras asignaciones funcionan y TODAS las siguientes devuelven 0 (memoria agotada) hasta que se desactiva con -1. */
+static long pmm_inject_left = -1;
+static unsigned long pmm_inject_hits;
+void pmm_inject_oom_after(long n) { pmm_inject_left = n; pmm_inject_hits = 0; }
+unsigned long pmm_inject_oom_hits(void) { return pmm_inject_hits; }
+
 uintptr_t pmm_alloc_frame(void)
 {
+    if (pmm_inject_left >= 0) {
+        if (pmm_inject_left == 0) { pmm_inject_hits++; return 0; }
+        pmm_inject_left--;
+    }
     /* Comenzamos la busqueda por encima de los 16 MiB reservados */
     size_t start_f = PMM_RESERVED_LOWER / PMM_FRAME_SIZE;
 

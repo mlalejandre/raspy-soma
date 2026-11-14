@@ -1854,6 +1854,7 @@ static int cmd_fscrash(const char *args, char *out_buf, uint32_t max_out)
     (void)args;
     uint32_t pos = 0;
     int ok = vfs_crash_selftest();
+    ok = vfs_checkpoint_selftest() && ok;                  /* PARCHE 120 */
     fb_puts(out_buf, max_out, &pos, ok ? "fscrash: TODO OK (detalle en la consola)" : "fscrash: HAY FALLOS (detalle en la consola)");
     return 1;
 }
@@ -1864,6 +1865,32 @@ static int cmd_fscheck(const char *args, char *out_buf, uint32_t max_out)
     uint32_t pos = 0;
     int bad = vfs_fscheck();
     fb_puts(out_buf, max_out, &pos, bad == 0 ? "fscheck: disco correcto (detalle en la consola)" : "fscheck: HAY PROBLEMAS (detalle en la consola)");
+    return 1;
+}
+
+/* PARCHE 117 */
+static int cmd_usfuzz(const char *args, char *out_buf, uint32_t max_out)
+{
+    uint32_t pos = 0, v[3] = { 24, 3000, 1 }; int k = 0;
+    const char *p = args ? args : "";
+    while (*p && k < 3) {
+        while (*p == ' ') p++;
+        if (*p < '0' || *p > '9') break;
+        uint32_t x = 0; while (*p >= '0' && *p <= '9') { x = x * 10 + (uint32_t)(*p - '0'); p++; }
+        v[k++] = x;
+    }
+    int ok = usermode_fuzz((int)v[0], v[1], v[2]);
+    fb_puts(out_buf, max_out, &pos, ok == 1 ? "usfuzz: TODO OK (detalle en la consola)" : "usfuzz: HAY FALLOS (detalle en la consola)");
+    return 1;
+}
+
+/* PARCHE 118 */
+static int cmd_oomtest(const char *args, char *out_buf, uint32_t max_out)
+{
+    (void)args; uint32_t pos = 0;
+    int ok = usermode_oomtest();
+    ok = usermode_oomtest_mem() && ok;                    /* PARCHE 119 */
+    fb_puts(out_buf, max_out, &pos, ok == 1 ? "oomtest: TODO OK (detalle en la consola)" : "oomtest: HAY FALLOS (detalle en la consola)");
     return 1;
 }
 
@@ -2814,7 +2841,7 @@ static int cmd_checkpoint(const char *args, char *out_buf, uint32_t max_out)
     if (vfs_checkpoint_save() == 0) {
         kprint("[CHECKPOINT OK]\n");
         uint32_t p = 0; fb_puts(out_buf, max_out, &p, "Checkpoint OK");
-    }
+    } else { uint32_t p = 0; fb_puts(out_buf, max_out, &p, "Checkpoint: ERROR al guardar (el anterior sigue siendo el ultimo valido solo si no se llego a invalidar)"); }
     return 1;
 }
 
@@ -2824,7 +2851,7 @@ static int cmd_rollback(const char *args, char *out_buf, uint32_t max_out)
     if (vfs_checkpoint_restore() == 0) {
         kprint("[ROLLBACK OK]\n");
         uint32_t p = 0; fb_puts(out_buf, max_out, &p, "Rollback OK");
-    }
+    } else { uint32_t p = 0; fb_puts(out_buf, max_out, &p, "Rollback: no hay checkpoint valido (ausente o corrupto); el sistema de archivos no se ha tocado"); }
     return 1;
 }
 
@@ -4686,6 +4713,8 @@ static const struct command_entry cmd_table[] = {
     { "df",           cmd_df,           CMD_F_SAFE,   "Capacidad de almacenamiento y estado de RamFS" },
     { "stats",        cmd_stats,        CMD_F_SAFE,   "Estadisticas de paquetes y bytes VirtIO-NET" },
     { "heap",         cmd_heap,         CMD_F_SAFE,   "Telemetria y auto-test del KHeap dinamico" },
+    { "oomtest",      cmd_oomtest,      CMD_F_NORMAL, "DEPURACION: carga de procesos con memoria agotada en cada punto (sin fugas ni cuelgues)" },
+    { "usfuzz",       cmd_usfuzz,       CMD_F_NORMAL, "DEPURACION: fuzzing hostil de syscalls desde ring 3: usfuzz [procesos] [syscalls por proceso] [semilla]" },
     { "demo_ai",      cmd_demo_ai,      CMD_F_NORMAL, "DEMO: la IA escribe un programa, las pruebas detectan sus fallos y los corrige (demo_ai vivo = con el LLM real)" },
     { "fscrash",      cmd_fscrash,      CMD_F_NORMAL, "DEPURACION: simula cortes de energia al guardar y comprueba que ningun archivo queda a medias" },
     { "fscheck",      cmd_fscheck,      CMD_F_NORMAL, "Comprueba el disco del VFS: cabeceras y CRC de cada archivo" },
